@@ -1627,12 +1627,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         }
     };
 
-    // A notebook's display name: its local name, else its address short
-    // form (never empty — rows and the home title read this).
+    // A notebook's display name: its local name, else the 1-based default
+    // "Notebook <index+1>" (never empty — rows and the home title read
+    // this). Every notebook is created named, so the default only covers
+    // entries written before that rule; `addr_short` is the last resort
+    // for an account with no index entry at all.
     fn notebook_name(ix: &notebooks::NotebookIndex, account: u32, addr_short: &str) -> String {
-        match ix.get(account).map(|m| m.name.clone()) {
-            Some(n) if !n.trim().is_empty() => n,
-            _ => addr_short.to_string(),
+        match ix.get(account) {
+            Some(m) if !m.name.trim().is_empty() => m.name.clone(),
+            Some(m) => notebooks::default_name(m.index),
+            None => addr_short.to_string(),
         }
     }
 
@@ -4861,7 +4865,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     .map(|id| id.address(network))
                     .unwrap_or_default();
                 let short = short_addr(&addr);
-                let name = if m.name.trim().is_empty() { short.clone() } else { m.name.clone() };
+                let name = if m.name.trim().is_empty() {
+                    notebooks::default_name(m.index)
+                } else {
+                    m.name.clone()
+                };
                 rows.push(ExportNbRow {
                     index: m.index as i32,
                     name: name.into(),
@@ -4987,10 +4995,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     .find(|m| m.index as i32 == index)
                     .map(|m| {
                         if m.name.trim().is_empty() {
-                            let addr = derive_identity(&app_seed, m, &net_s)
-                                .map(|id| id.address(network))
-                                .unwrap_or_default();
-                            short_addr(&addr)
+                            notebooks::default_name(m.index)
                         } else {
                             m.name.clone()
                         }
