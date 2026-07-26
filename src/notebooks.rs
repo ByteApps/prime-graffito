@@ -19,6 +19,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The name every notebook gets unless the user typed one: **"Notebook
+/// <index+1>"** — 1-based, so the first notebook (receive index 0) reads
+/// "Notebook 1" (Sal 2026-07-26, the same rule on every platform and
+/// every creation path). Also the display fallback for entries that
+/// predate the rule.
+pub fn default_name(index: u32) -> String {
+    format!("Notebook {}", index + 1)
+}
+
 /// One notebook. `account` is the unique notebook KEY (state-file
 /// routing + UI plumbing); the identity is the BIP-86 leaf
 /// `m/86'/{coin}'/{bip_account}'/0/{index}` under rotation `seed`.
@@ -82,13 +91,18 @@ impl NotebookIndex {
     }
 
     /// Create a bip86 notebook at the next unused receive index of
-    /// (`seed`, `bip_account`), named `name`. Returns its key.
+    /// (`seed`, `bip_account`), named `name` — or, when `name` is blank,
+    /// the default `default_name(index)`. Returns its key.
     pub fn create_bip86(&mut self, seed: u32, bip_account: u32, name: &str) -> u32 {
         let account = self.next_account();
         let index = self.next_bip86_index(seed, bip_account);
+        let name = match name.trim() {
+            "" => default_name(index),
+            n => n.to_string(),
+        };
         self.notebooks.push(NotebookMeta {
             account,
-            name: name.trim().to_string(),
+            name,
             archived: false,
             seed,
             bip_account,
@@ -155,7 +169,8 @@ mod tests {
         let k0 = ix.create_bip86(0, 0, "");
         let k1 = ix.create_bip86(0, 0, "  Trips  ");
         assert_eq!((k0, k1), (0, 1));
-        assert_eq!(ix.get(0).unwrap().name, "");
+        // A blank name takes the 1-based default; a typed one is kept.
+        assert_eq!(ix.get(0).unwrap().name, "Notebook 1");
         assert_eq!(ix.get(1).unwrap().name, "Trips");
         assert_eq!(ix.notebooks[0].account, 0);
         assert_eq!(ix.next_account(), 2);
@@ -180,6 +195,8 @@ mod tests {
         let k2 = ix.create_bip86(0, 0, "");
         let k3 = ix.create_bip86(1, 0, "PostRotation");
         assert_eq!((k1, k2, k3), (0, 1, 2));
+        // The default follows the RECEIVE index, not the notebook key.
+        assert_eq!(ix.get(k2).unwrap().name, "Notebook 2");
         assert_eq!(ix.get(k1).unwrap().index, 0);
         assert_eq!(ix.get(k2).unwrap().index, 1); // same context → next index
         assert_eq!(ix.get(k3).unwrap().index, 0); // new seed → fresh indexes
@@ -189,6 +206,12 @@ mod tests {
         // After rotation to seed 1: only the seed-1 notebook.
         let vis: Vec<u32> = ix.visible(1, 0).map(|m| m.account).collect();
         assert_eq!(vis, vec![2]);
+        // Seed 1 numbers its default names off ITS own receive indexes
+        // (k3 took index 0 there), independently of seed 0's notebooks.
+        let k4 = ix.create_bip86(1, 0, "");
+        assert_eq!(k4, 3);
+        assert_eq!(ix.get(k4).unwrap().index, 1);
+        assert_eq!(ix.get(k4).unwrap().name, "Notebook 2");
     }
 
     #[test]
