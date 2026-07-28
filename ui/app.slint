@@ -1724,6 +1724,78 @@ export component AppWindow inherits Window {
             }
 
             Text {
+                text: Settings.locktime-error == "" ? "Transaction locktime" : Settings.locktime-error;
+                color: Settings.locktime-error == "" ? Theme.palette-muted : Theme.palette-danger;
+                font-family: "Montserrat";
+                font-size: 14px;
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                PillOption {
+                    label: "Chain height";
+                    selected: Settings.locktime-mode == 0;
+                    horizontal-stretch: 1;
+                    tapped => { Settings.locktime-mode = 0; Callbacks.locktime-changed(); }
+                }
+                PillOption {
+                    label: "Zero";
+                    selected: Settings.locktime-mode == 1;
+                    horizontal-stretch: 1;
+                    tapped => { Settings.locktime-mode = 1; Callbacks.locktime-changed(); }
+                }
+                PillOption {
+                    label: "Custom";
+                    selected: Settings.locktime-mode == 2;
+                    horizontal-stretch: 1;
+                    tapped => { Settings.locktime-mode = 2; Callbacks.locktime-changed(); }
+                }
+            }
+            // The height field is only meaningful for Custom — same
+            // collapse-on-Custom rule the compose screen's rate field uses.
+            if Settings.locktime-mode == 2: HorizontalLayout {
+                spacing: 8px;
+                Rectangle {
+                    height: 44px;
+                    horizontal-stretch: 1;
+                    background: Theme.palette-surface;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: locktime-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                    clip: true;
+                    locktime-input := TextInput {
+                        x: 14px;
+                        width: parent.width - 28px;
+                        height: 24px;
+                        y: (parent.height - self.height) / 2;
+                        text <=> Settings.locktime-text;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 18px;
+                        single-line: true;
+                        edited => {
+                            Settings.locktime-mode = 2;
+                            Callbacks.locktime-changed();
+                        }
+                        accepted => { self.clear-focus(); }
+                    }
+                }
+                Text {
+                    text: "height";
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 16px;
+                    vertical-alignment: center;
+                }
+            }
+            Text {
+                text: Settings.locktime-effective;
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+
+            Text {
                 text: "Chunk size caps each OP_RETURN output. Standard (100000) matches Bitcoin Core v30 relay defaults, verified on mempool.space; pick 80 if your broadcast endpoint rejects a note, then recompose it.";
                 color: Theme.palette-muted;
                 font-family: "Montserrat";

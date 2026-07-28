@@ -265,6 +265,18 @@ export global Settings {
     // the section label so the on-screen keyboard can't hide it.
     in-out property <string> chunk-error: "";
 
+    // nLockTime policy (anti-fee-sniping): 0 chain height · 1 zero ·
+    // 2 custom height. Wallet-level, like network and chunk. The height
+    // field is revealed only for custom, mirroring the compose screen's
+    // collapse-on-Custom rate field.
+    in-out property <int> locktime-mode: 0;
+    in-out property <string> locktime-text: "";
+    // Inline validation error for the height field ("" = valid).
+    in-out property <string> locktime-error: "";
+    // "Chain height 912744" / "Not synced yet — using 0" etc: what the
+    // current policy would actually put on the wire right now.
+    in-out property <string> locktime-effective: "";
+
     // Spending wallet (funding-unification): "Separate spending wallet"
     // toggle + card, scoped to the active (network, seed, account) context.
     in-out property <bool> spending-enabled: false;
@@ -434,6 +446,7 @@ export global Callbacks {
     callback sign-psbt();           // system QR scanner → sign our inputs → screen 8
     callback cycle-network();       // mainnet → testnet4 → signet → regtest → …
     callback chunk-changed();       // chunk-mode pill tapped / bytes field edited
+    callback locktime-changed();    // locktime-mode pill tapped / height field edited
     callback refresh-contacts();    // rebuild Contacts.rows from state
     callback pick-contact(string);  // "" = self; the single funnel: validate,
                                     // bump recency, set Compose.to-*, → screen 3
