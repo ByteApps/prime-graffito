@@ -161,6 +161,24 @@ grep -q 'big single-output note' <<<"$SCAN" || fail "note4 text missing"
 jq -e '[.[] | select(.height != null)] | length == 4' >/dev/null <<<"$SCAN" || fail "all notes should be confirmed"
 pass "all 4 notes recovered from bare chain data (texts, heights, visibility)"
 
+echo "== anti-fee-sniping: composed txs carry nLockTime = the bundle's tip =="
+# Every tx above was built with the DEFAULT LockTimePolicy::Tip, so each
+# one already relayed AND confirmed on a real bitcoind with a non-zero
+# locktime. Pin the value so a regression to 0 is caught here, not on
+# mainnet: compose once more against a known tip and decode the last 4
+# bytes of the raw tx (nLockTime, little-endian).
+build_bundle "$WORK/locktime.json"
+LT_TIP="$(jq -r '.tip_height' "$WORK/locktime.json")"
+LT_RAW="$("$NOTES" compose "$WORK/locktime.json" public 2.0 80 'locktime pin' | jq -r '.raw_hex')"
+LT_GOT="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex(sys.argv[1][-8:]),'little'))" "$LT_RAW")"
+[ "$LT_GOT" = "$LT_TIP" ] || fail "nLockTime $LT_GOT != bundle tip $LT_TIP"
+[ "$LT_GOT" != "0" ] || fail "nLockTime is 0 — anti-fee-sniping regressed"
+# The opt-out must still work.
+LT_ZERO="$(NOTES_LOCKTIME_POLICY=zero "$NOTES" compose "$WORK/locktime.json" public 2.0 80 'locktime zero' | jq -r '.raw_hex')"
+LT_ZGOT="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex(sys.argv[1][-8:]),'little'))" "$LT_ZERO")"
+[ "$LT_ZGOT" = "0" ] || fail "zero policy produced nLockTime $LT_ZGOT"
+pass "nLockTime = tip ($LT_GOT) by default, 0 under the zero policy"
+
 echo "== negative: a different seed cannot read the private notes =="
 WRONG="$(NOTES_APP_SEED=$(printf '99%.0s' {1..32}) "$NOTES" scan "$WORK/restore.json")"
 jq -e '[.[] | select(.private and .text != null)] | length == 0' >/dev/null <<<"$WRONG" \
