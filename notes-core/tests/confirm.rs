@@ -356,8 +356,8 @@ fn anchored_mixed_tx_round_trip_has_no_self_row() {
         &notebook_dust_spk,
         &change_spk,
         1.0,
-        || Ok([0x77u8; 32]),
-    )
+        0,
+        || Ok([0x77u8; 32]))
     .unwrap();
 
     let mut ctx = base_ctx(

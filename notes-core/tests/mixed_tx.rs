@@ -57,8 +57,8 @@ fn pure_spending_funded_self_note_shape_and_signature() {
         &notebook_dust_spk,
         &change_spk,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     // Output order: OP_RETURN, notebook dust, change.
@@ -124,8 +124,8 @@ fn pure_spending_funded_directed_note_output_order() {
         &notebook_dust_spk,
         &change_spk,
         3.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     assert_eq!(note.tx.outputs.len(), 4);
@@ -181,8 +181,8 @@ fn mixed_taproot_and_wpkh_inputs_each_sign_correctly() {
         &notebook_dust_spk,
         &change_spk,
         1.5,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     assert_eq!(note.tx.inputs.len(), 2);
@@ -267,8 +267,8 @@ fn mixed_exact_insufficient_funds_errors() {
         &notebook_dust_spk,
         &change_spk,
         1.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap_err();
     assert!(matches!(err, notes_core::Error::InsufficientFunds));
 }
@@ -322,7 +322,7 @@ fn sweep_mixed_taproot_and_wpkh_cross_check() {
     ];
     let in_value: u64 = inputs.iter().map(|i| i.utxo.value).sum();
 
-    let sweep = build_sweep_tx_mixed(&inputs, dest_spk.clone(), 2.0, || Ok(AUX)).unwrap();
+    let sweep = build_sweep_tx_mixed(&inputs, dest_spk.clone(), 2.0, 0, || Ok(AUX)).unwrap();
 
     // Single destination output, everything minus fee — no change, no
     // recipient, no OP_RETURN.
@@ -411,7 +411,7 @@ fn sweep_mixed_all_taproot_only() {
         },
     ];
     let in_value: u64 = inputs.iter().map(|i| i.utxo.value).sum();
-    let sweep = build_sweep_tx_mixed(&inputs, dest_spk.clone(), 1.0, || Ok(AUX)).unwrap();
+    let sweep = build_sweep_tx_mixed(&inputs, dest_spk.clone(), 1.0, 0, || Ok(AUX)).unwrap();
     assert_eq!(sweep.tx.inputs.len(), 2);
     assert_eq!(sweep.tx.outputs.len(), 1);
     assert_eq!(sweep.tx.outputs[0].script_pubkey, dest_spk);
@@ -449,7 +449,7 @@ fn sweep_mixed_all_wpkh_only() {
         },
     ];
     let in_value: u64 = inputs.iter().map(|i| i.utxo.value).sum();
-    let sweep = build_sweep_tx_mixed(&inputs, dest_spk.clone(), 1.0, || Ok(AUX)).unwrap();
+    let sweep = build_sweep_tx_mixed(&inputs, dest_spk.clone(), 1.0, 0, || Ok(AUX)).unwrap();
     assert_eq!(sweep.tx.inputs.len(), 2);
     assert_eq!(sweep.tx.outputs.len(), 1);
     assert_eq!(sweep.tx.outputs[0].script_pubkey, dest_spk);
@@ -465,7 +465,7 @@ fn sweep_mixed_all_wpkh_only() {
 #[test]
 fn sweep_mixed_empty_inputs_errors() {
     let dest_spk = wpkh_spk(&wpkh_seckey(26));
-    let err = build_sweep_tx_mixed(&[], dest_spk, 1.0, || Ok(AUX)).unwrap_err();
+    let err = build_sweep_tx_mixed(&[], dest_spk, 1.0, 0, || Ok(AUX)).unwrap_err();
     assert!(matches!(err, notes_core::Error::InsufficientFunds));
 }
 
@@ -481,7 +481,7 @@ fn sweep_mixed_insufficient_funds_errors() {
         kind: InputKind::P2wpkh,
         seckey: sk,
     }];
-    let err = build_sweep_tx_mixed(&inputs, dest_spk, 5.0, || Ok(AUX)).unwrap_err();
+    let err = build_sweep_tx_mixed(&inputs, dest_spk, 5.0, 0, || Ok(AUX)).unwrap_err();
     assert!(matches!(err, notes_core::Error::InsufficientFunds));
 }
 
@@ -501,9 +501,9 @@ fn build_note_tx_exact_still_works_unmodified() {
         0,
         None,
         1.0,
+        0,
         &tweaked,
-        || Ok(AUX),
-    )
+        || Ok(AUX))
     .unwrap();
     assert_eq!(note.tx.inputs.len(), 1);
 }
@@ -567,8 +567,8 @@ fn anchored_mixed_build_skips_dust_when_notebook_input_present() {
         &notebook_dust_spk,
         &change_spk,
         1.5,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     // Output order: OP_RETURN, change — NO dust-to-self output.
@@ -657,8 +657,8 @@ fn unanchored_funded_build_via_anchored_variant_keeps_dust() {
         &notebook_dust_spk,
         &change_spk,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     // Output order: OP_RETURN, notebook dust, change — the else-branch.
@@ -705,8 +705,8 @@ fn old_and_new_mixed_builders_byte_identical_when_forced_dust() {
         &notebook_dust_spk,
         &change_spk,
         2.5,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     let new = build_note_tx_mixed_exact_anchored(
         &inputs,
@@ -716,8 +716,8 @@ fn old_and_new_mixed_builders_byte_identical_when_forced_dust() {
         &notebook_dust_spk,
         &change_spk,
         2.5,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     assert_eq!(old.raw_hex, new.raw_hex);
@@ -754,12 +754,10 @@ fn mixed_multi_zero_and_one_recipient_delegates_byte_identical() {
 
     // Zero recipients (self-note shape).
     let old_self = build_note_tx_mixed_exact_anchored(
-        &inputs, &payloads, None, 0, &notebook_dust_spk, &change_spk, 2.0, || Ok(AUX),
-    )
+        &inputs, &payloads, None, 0, &notebook_dust_spk, &change_spk, 2.0, 0, || Ok(AUX))
     .unwrap();
     let new_self = build_note_tx_mixed_exact_anchored_multi(
-        &inputs, &payloads, &[], &notebook_dust_spk, &change_spk, 2.0, || Ok(AUX),
-    )
+        &inputs, &payloads, &[], &notebook_dust_spk, &change_spk, 2.0, 0, || Ok(AUX))
     .unwrap();
     assert_eq!(old_self.raw_hex, new_self.raw_hex);
     assert_eq!(old_self.tx, new_self.tx);
@@ -774,8 +772,8 @@ fn mixed_multi_zero_and_one_recipient_delegates_byte_identical() {
         &notebook_dust_spk,
         &change_spk,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     let new_one = build_note_tx_mixed_exact_anchored_multi(
         &inputs,
@@ -784,8 +782,8 @@ fn mixed_multi_zero_and_one_recipient_delegates_byte_identical() {
         &notebook_dust_spk,
         &change_spk,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     assert_eq!(old_one.raw_hex, new_one.raw_hex);
     assert_eq!(old_one.tx, new_one.tx);
@@ -846,8 +844,8 @@ fn mixed_multi_three_recipients_anchored_output_order_and_cross_check() {
         &notebook_dust_spk,
         &change_spk,
         1.5,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     // Output order: OP_RETURN, r1, r2, r3, change — no dust (anchored).
@@ -943,8 +941,8 @@ fn mixed_multi_unanchored_keeps_dust_after_recipients() {
         &notebook_dust_spk,
         &change_spk,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     assert_eq!(note.tx.outputs.len(), 5); // OP_RETURN, r1, r2, dust, change
@@ -979,8 +977,8 @@ fn mixed_multi_recipient_count_upper_bound() {
         &notebook_dust_spk,
         &change_spk,
         1.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap_err();
     assert!(matches!(err, notes_core::Error::Envelope(_)));
 }
@@ -1008,8 +1006,8 @@ fn mixed_multi_below_dust_amount_rejected() {
         &notebook_dust_spk,
         &change_spk,
         1.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap_err();
     assert!(matches!(err, notes_core::Error::Envelope(_)));
 }
