@@ -125,8 +125,8 @@ fn cost_estimator_is_exact() {
             [1, 1, 1, 1],
             max_or,
             2.0,
-            || Ok(AUX),
-        )
+            0,
+            || Ok(AUX))
         .unwrap();
         assert!(note.change > 0, "fixture should produce change");
         let n_inputs = note.tx.inputs.len();
@@ -145,8 +145,7 @@ fn cost_estimator_is_exact() {
     {
         let text: String = "y".repeat(text_len);
         let note = compose_directed_note(
-            &id, &utxos(), &text, private, [2, 2, 2, 2], recipient, 80, 2.0, || Ok(AUX),
-        )
+            &id, &utxos(), &text, private, [2, 2, 2, 2], recipient, 80, 2.0, 0, || Ok(AUX))
         .unwrap();
         assert!(note.change > 0, "fixture should produce change");
         assert_eq!(note.sent, 330);
@@ -195,8 +194,8 @@ fn cost_estimator_is_exact() {
                 None,
                 100_000, // single OP_RETURN, avoids chunk-count limits at n=255
                 2.0,
-                || Ok(AUX),
-            )
+                0,
+                || Ok(AUX))
             .unwrap();
             assert!(note.change > 0, "fixture should produce change for n={n} private={private}");
             let op_return_lens: Vec<usize> = note
@@ -222,12 +221,12 @@ fn cost_estimator_is_exact() {
 fn insufficient_funds_is_reported() {
     let id = identity();
     let poor = vec![Utxo { txid: [1; 32], vout: 0, value: 50 }];
-    let err = compose_note(&id, &poor, "hello", false, [0; 4], 80, 2.0, || Ok(AUX));
+    let err = compose_note(&id, &poor, "hello", false, [0; 4], 80, 2.0, 0, || Ok(AUX));
     assert!(err.is_err());
     // 200 sats CAN fund a minimal no-change note at 2 sat/vB (residue
     // below dust folds into the fee) — that's intended behavior.
     let tight = vec![Utxo { txid: [1; 32], vout: 0, value: 200 }];
-    let note = compose_note(&id, &tight, "hello", false, [0; 4], 80, 2.0, || Ok(AUX)).unwrap();
+    let note = compose_note(&id, &tight, "hello", false, [0; 4], 80, 2.0, 0, || Ok(AUX)).unwrap();
     assert_eq!(note.change, 0);
     assert_eq!(note.fee, 200);
 }
@@ -268,13 +267,13 @@ fn compose_scan_roundtrip_public_private_chunked() {
     let id = identity();
     let long_text = "multi-chunk note ".repeat(20); // 340 bytes → 6 chunks at 80
     let pub_note =
-        compose_note(&id, &utxos(), "public hello ₿", false, [1, 0, 0, 0], 80, 1.0, || Ok(AUX))
+        compose_note(&id, &utxos(), "public hello ₿", false, [1, 0, 0, 0], 80, 1.0, 0, || Ok(AUX))
             .unwrap();
     let priv_note =
-        compose_note(&id, &utxos(), "secret plans", true, [2, 0, 0, 0], 80, 1.0, || Ok(AUX))
+        compose_note(&id, &utxos(), "secret plans", true, [2, 0, 0, 0], 80, 1.0, 0, || Ok(AUX))
             .unwrap();
     let chunked =
-        compose_note(&id, &utxos(), &long_text, true, [3, 0, 0, 0], 80, 1.0, || Ok(AUX)).unwrap();
+        compose_note(&id, &utxos(), &long_text, true, [3, 0, 0, 0], 80, 1.0, 0, || Ok(AUX)).unwrap();
     assert!(
         chunked.tx.outputs.iter().filter(|o| o.script_pubkey.first() == Some(&0x6a)).count() > 1
     );
@@ -298,7 +297,7 @@ fn compose_scan_roundtrip_public_private_chunked() {
 fn scan_ignores_foreign_and_spoofed() {
     let id = identity();
     let note =
-        compose_note(&id, &utxos(), "mine", true, [1, 2, 3, 4], 80, 1.0, || Ok(AUX)).unwrap();
+        compose_note(&id, &utxos(), "mine", true, [1, 2, 3, 4], 80, 1.0, 0, || Ok(AUX)).unwrap();
     // Same payloads, neither spending from nor paying us → pure spoof,
     // ignored entirely (the acceptance rule stays additive).
     let spoofed = bundle_from_txs(&[(&note, false, Some(50))]);
@@ -308,7 +307,7 @@ fn scan_ignores_foreign_and_spoofed() {
     // text must be None (foreign ciphertext).
     let other = identity_b();
     let foreign =
-        compose_note(&other, &utxos(), "not yours", true, [5, 5, 5, 5], 80, 1.0, || Ok(AUX))
+        compose_note(&other, &utxos(), "not yours", true, [5, 5, 5, 5], 80, 1.0, 0, || Ok(AUX))
             .unwrap();
     let bundle = bundle_from_txs(&[(&foreign, true, Some(60))]);
     let notes = extract_notes(&bundle, &id, NET);
@@ -353,8 +352,7 @@ fn compose_directed_public_roundtrip() {
     let b = identity_b();
     let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
     let note = compose_directed_note(
-        &a, &utxos(), "hello bob, love alice", false, [1, 0, 0, 1], &to_b, 80, 1.0, || Ok(AUX),
-    )
+        &a, &utxos(), "hello bob, love alice", false, [1, 0, 0, 1], &to_b, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
 
     // B's bundle view: tx pays B but does not spend from B.
@@ -388,18 +386,16 @@ fn watch_scan_matches_keyed_scan_minus_private_text() {
     let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
 
     let pub_note =
-        compose_note(&a, &utxos(), "public hello", false, [1, 0, 0, 0], 80, 1.0, || Ok(AUX))
+        compose_note(&a, &utxos(), "public hello", false, [1, 0, 0, 0], 80, 1.0, 0, || Ok(AUX))
             .unwrap();
     let priv_note =
-        compose_note(&a, &utxos(), "secret plans", true, [2, 0, 0, 0], 80, 1.0, || Ok(AUX))
+        compose_note(&a, &utxos(), "secret plans", true, [2, 0, 0, 0], 80, 1.0, 0, || Ok(AUX))
             .unwrap();
     let sent_priv = compose_directed_note(
-        &a, &utxos(), "for bob only", true, [3, 0, 0, 0], &to_b, 80, 1.0, || Ok(AUX),
-    )
+        &a, &utxos(), "for bob only", true, [3, 0, 0, 0], &to_b, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
     let from_b = compose_directed_note(
-        &b, &utxos(), "hi alice", false, [4, 0, 0, 0], &Recipient::parse(NET, &a.address(NET)).unwrap(), 80, 1.0, || Ok(AUX),
-    )
+        &b, &utxos(), "hi alice", false, [4, 0, 0, 0], &Recipient::parse(NET, &a.address(NET)).unwrap(), 80, 1.0, 0, || Ok(AUX))
     .unwrap();
 
     // A's address history as the companion would bundle it.
@@ -447,8 +443,7 @@ fn compose_directed_private_roundtrip() {
     let b = identity_b();
     let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
     let note = compose_directed_note(
-        &a, &utxos(), "for bob's eyes only", true, [2, 0, 0, 2], &to_b, 80, 1.0, || Ok(AUX),
-    )
+        &a, &utxos(), "for bob's eyes only", true, [2, 0, 0, 2], &to_b, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
 
     let mut bundle = bundle_from_txs(&[(&note, false, Some(100))]);
@@ -488,8 +483,7 @@ fn externally_funded_directed_private_decodes_via_candidate() {
     let f = Identity::from_app_seed(&[0x11u8; 32]).unwrap(); // external funder
     let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
     let note = compose_directed_note(
-        &a, &utxos(), "paid by cold storage", true, [7, 0, 0, 7], &to_b, 80, 1.0, || Ok(AUX),
-    )
+        &a, &utxos(), "paid by cold storage", true, [7, 0, 0, 7], &to_b, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
 
     // B's view of an EXTERNALLY funded tx: pays B, does NOT spend from B, and
@@ -537,8 +531,7 @@ fn externally_funded_author_recovers_own_directed_private() {
     let f = Identity::from_app_seed(&[0x11u8; 32]).unwrap(); // funder
     let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
     let note = compose_directed_note(
-        &a, &utxos(), "my own words, externally paid", true, [4, 2, 4, 2], &to_b, 80, 1.0, || Ok(AUX),
-    )
+        &a, &utxos(), "my own words, externally paid", true, [4, 2, 4, 2], &to_b, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
 
     // A's rescan of the externally-funded tx: it pays A (dust-to-self) but does
@@ -563,8 +556,7 @@ fn directed_aad_binds_direction_and_sender() {
     let c = Identity::from_app_seed(&[8u8; 32]).unwrap();
     let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
     let note = compose_directed_note(
-        &a, &utxos(), "authentic", true, [3, 0, 0, 3], &to_b, 80, 1.0, || Ok(AUX),
-    )
+        &a, &utxos(), "authentic", true, [3, 0, 0, 3], &to_b, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
 
     let mut spoofed = bundle_from_txs(&[(&note, false, Some(100))]);
@@ -584,8 +576,7 @@ fn received_acceptance_is_additive() {
     let b = identity_b();
     let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
     let note = compose_directed_note(
-        &a, &utxos(), "delivered", false, [4, 0, 0, 4], &to_b, 80, 1.0, || Ok(AUX),
-    )
+        &a, &utxos(), "delivered", false, [4, 0, 0, 4], &to_b, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
 
     // pays_self missing (old bundle) → tx contributes nothing at B.
@@ -609,11 +600,10 @@ fn received_note_id_collision_does_not_contaminate() {
     let b = identity_b();
     let shared_id = [5, 0, 0, 5];
     let mine =
-        compose_note(&a, &utxos(), "my own words", false, shared_id, 80, 1.0, || Ok(AUX)).unwrap();
+        compose_note(&a, &utxos(), "my own words", false, shared_id, 80, 1.0, 0, || Ok(AUX)).unwrap();
     let to_a = Recipient::parse(NET, &a.address(NET)).unwrap();
     let attack = compose_directed_note(
-        &b, &utxos(), "gotcha?", false, shared_id, &to_a, 80, 1.0, || Ok(AUX),
-    )
+        &b, &utxos(), "gotcha?", false, shared_id, &to_a, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
 
     let mut bundle = bundle_from_txs(&[(&mine, true, Some(100)), (&attack, false, Some(101))]);
@@ -640,11 +630,10 @@ fn private_directed_requires_p2tr_recipient() {
         p2tr_x: None,
     };
     let err = compose_directed_note(
-        &a, &utxos(), "secret", true, [6, 0, 0, 6], &v0, 80, 1.0, || Ok(AUX),
-    );
+        &a, &utxos(), "secret", true, [6, 0, 0, 6], &v0, 80, 1.0, 0, || Ok(AUX));
     assert!(matches!(err, Err(notes_core::Error::RecipientNotTaproot)));
     // Public to a v0 address is fine.
-    compose_directed_note(&a, &utxos(), "postcard", false, [6, 0, 0, 7], &v0, 80, 1.0, || Ok(AUX))
+    compose_directed_note(&a, &utxos(), "postcard", false, [6, 0, 0, 7], &v0, 80, 1.0, 0, || Ok(AUX))
         .unwrap();
 }
 
@@ -669,7 +658,7 @@ fn decode_scanned_roundtrip() {
 fn scan_import_is_idempotent() {
     let id = identity();
     let note =
-        compose_note(&id, &utxos(), "once only", true, [7, 7, 7, 7], 80, 1.0, || Ok(AUX)).unwrap();
+        compose_note(&id, &utxos(), "once only", true, [7, 7, 7, 7], 80, 1.0, 0, || Ok(AUX)).unwrap();
     let mut bundle = bundle_from_txs(&[(&note, true, Some(10))]);
     let dup = bundle.notes_onchain[0].clone();
     bundle.notes_onchain.push(dup); // overlapping incremental import
@@ -681,8 +670,7 @@ fn scan_import_is_idempotent() {
     let b = identity_b();
     let to_me = Recipient::parse(NET, &id.address(NET)).unwrap();
     let sent = compose_directed_note(
-        &b, &utxos(), "dm once", true, [8, 8, 8, 8], &to_me, 80, 1.0, || Ok(AUX),
-    )
+        &b, &utxos(), "dm once", true, [8, 8, 8, 8], &to_me, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
     let mut rb = bundle_from_txs(&[(&sent, false, Some(11))]);
     rb.notes_onchain[0].pays_self = true;
@@ -705,8 +693,7 @@ fn directed_note_custom_gift_amount() {
 
     // Default directed note sends exactly dust to the recipient.
     let dust_note = compose_directed_note(
-        &sender, &utxos(), "hi", false, [1, 2, 3, 4], &to_recip, 80, 1.0, || Ok(AUX),
-    )
+        &sender, &utxos(), "hi", false, [1, 2, 3, 4], &to_recip, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
     assert_eq!(dust_note.sent, DUST_LIMIT, "default gift is dust");
 
@@ -715,8 +702,8 @@ fn directed_note_custom_gift_amount() {
     let gift = 50_000u64;
     let gift_note = compose_directed_note_with_change_amount(
         &sender, &utxos(), "happy birthday", false, [1, 2, 3, 5], &to_recip, gift, None, 80, 1.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     assert_eq!(gift_note.sent, gift, "gift amount reaches the recipient output");
     let inputs_total: u64 = gift_note.tx.inputs.iter().map(|i| i.value).sum();
@@ -733,8 +720,7 @@ fn directed_note_custom_gift_amount() {
     // Below dust is rejected.
     let err = compose_directed_note_with_change_amount(
         &sender, &utxos(), "too small", false, [1, 2, 3, 6], &to_recip, DUST_LIMIT - 1, None, 80,
-        1.0, || Ok(AUX),
-    );
+        1.0, 0, || Ok(AUX));
     assert!(err.is_err(), "gift below dust must be rejected");
 }
 
@@ -790,9 +776,9 @@ fn sweep_cross_check() {
         &id.output_x,
         dest.clone(),
         2.0,
+        0,
         &id.tweaked_seckey,
-        || Ok(AUX),
-    )
+        || Ok(AUX))
     .unwrap();
     assert_eq!(sweep.tx.inputs.len(), 3, "sweeps every utxo");
     assert_eq!(sweep.tx.outputs.len(), 1);
@@ -847,8 +833,8 @@ fn rust_bitcoin_cross_check() {
         [0xAB, 0xCD, 0xEF, 0x01],
         80,
         3.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     let raw = hex::decode(&note.raw_hex).unwrap();
@@ -902,8 +888,8 @@ fn directed_rust_bitcoin_cross_check() {
         &to_b,
         80,
         3.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     let raw = hex::decode(&note.raw_hex).unwrap();
@@ -949,10 +935,9 @@ fn change_can_go_to_a_custom_address() {
     .unwrap();
 
     let default_tx =
-        compose_note(&a, &utxos(), "hi", false, [1, 2, 3, 4], 80, 1.0, || Ok([0u8; 32])).unwrap();
+        compose_note(&a, &utxos(), "hi", false, [1, 2, 3, 4], 80, 1.0, 0, || Ok([0u8; 32])).unwrap();
     let custom_tx = compose_note_with_change(
-        &a, &utxos(), "hi", false, [1, 2, 3, 4], Some(&b_spk), 80, 1.0, || Ok([0u8; 32]),
-    )
+        &a, &utxos(), "hi", false, [1, 2, 3, 4], Some(&b_spk), 80, 1.0, 0, || Ok([0u8; 32]))
     .unwrap();
 
     // Same inputs, same note; only the change output's script differs.
@@ -975,20 +960,20 @@ fn exact_inputs_spends_all_given_coins() {
         Utxo { txid: [1u8; 32], vout: 0, value: 60_000 },
         Utxo { txid: [2u8; 32], vout: 0, value: 40_000 },
     ];
-    let auto = compose_note(&a, &coins, "hi", false, [1, 2, 3, 4], 80, 1.0, || Ok([0u8; 32])).unwrap();
+    let auto = compose_note(&a, &coins, "hi", false, [1, 2, 3, 4], 80, 1.0, 0, || Ok([0u8; 32])).unwrap();
     // Auto used 1 input (60k covers it); exact-with-both spends both.
     assert_eq!(auto.spent_outpoints.len(), 1);
-    let exact = compose_note_exact(&a, &coins, "hi", false, [1, 2, 3, 4], None, 80, 1.0, || Ok([0u8; 32])).unwrap();
+    let exact = compose_note_exact(&a, &coins, "hi", false, [1, 2, 3, 4], None, 80, 1.0, 0, || Ok([0u8; 32])).unwrap();
     assert_eq!(exact.spent_outpoints.len(), 2, "exact spends every provided coin");
     assert!(exact.change > auto.change, "spending both leaves more change");
 
     // Exact with just the first coin == auto (both use that one coin).
-    let one = compose_note_exact(&a, &coins[..1], "hi", false, [1, 2, 3, 4], None, 80, 1.0, || Ok([0u8; 32])).unwrap();
+    let one = compose_note_exact(&a, &coins[..1], "hi", false, [1, 2, 3, 4], None, 80, 1.0, 0, || Ok([0u8; 32])).unwrap();
     assert_eq!(one.txid_hex, auto.txid_hex);
 
     // Not enough value → InsufficientFunds.
     let tiny = vec![Utxo { txid: [3u8; 32], vout: 0, value: 10 }];
-    assert!(compose_note_exact(&a, &tiny, "hi", false, [1, 2, 3, 4], None, 80, 1.0, || Ok([0u8; 32])).is_err());
+    assert!(compose_note_exact(&a, &tiny, "hi", false, [1, 2, 3, 4], None, 80, 1.0, 0, || Ok([0u8; 32])).is_err());
 }
 
 /// Multi-source sweep (wallet-level consolidate): coins from TWO
@@ -1023,8 +1008,8 @@ fn sweep_multi_source_cross_check() {
         ],
         dest.clone(),
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     assert_eq!(sweep.tx.inputs.len(), 5, "every source coin rides");
     assert_eq!(sweep.tx.outputs.len(), 1);
@@ -1072,16 +1057,16 @@ fn sweep_multi_source_cross_check() {
         &a.output_x,
         dest.clone(),
         2.0,
+        0,
         &a.tweaked_seckey,
-        || Ok(AUX),
-    )
+        || Ok(AUX))
     .unwrap();
     let single_multi = notes_core::tx::build_sweep_tx_multi(
         &[SweepSource { utxos: &a_coins, output_x: a.output_x, tweaked_seckey: &a.tweaked_seckey }],
         dest,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     assert_eq!(single.raw_hex, single_multi.raw_hex);
 }
@@ -1112,8 +1097,7 @@ fn wpkh_spk(fill: u8) -> Vec<u8> {
 fn self_spk_set_marks_p2wpkh_funded_note_own() {
     let id = identity();
     let note = compose_note(
-        &id, &utxos(), "funded from the spending wallet", false, [1, 1, 2, 2], 80, 1.0, || Ok(AUX),
-    )
+        &id, &utxos(), "funded from the spending wallet", false, [1, 1, 2, 2], 80, 1.0, 0, || Ok(AUX))
     .unwrap();
     let funding_spk = wpkh_spk(0xab);
     let onchain = OnchainTx {
@@ -1156,8 +1140,8 @@ fn self_spk_set_leaves_non_matching_spk_scan_unchanged() {
     let sender_id = identity_b();
     let note = compose_note(
         &sender_id, &utxos(), "funded by someone else's wallet", false, [3, 3, 4, 4], 80, 1.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     let funding_spk = wpkh_spk(0xcd);
     let onchain = OnchainTx {
@@ -1201,11 +1185,10 @@ fn self_spk_set_own_received_buckets_stay_separate() {
     let funding_spk = wpkh_spk(0xee);
 
     let mine =
-        compose_note(&id, &utxos(), "my funded words", false, shared_id, 80, 1.0, || Ok(AUX))
+        compose_note(&id, &utxos(), "my funded words", false, shared_id, 80, 1.0, 0, || Ok(AUX))
             .unwrap();
     let attack = compose_note(
-        &attacker, &utxos(), "gotcha via wpkh?", false, shared_id, 80, 1.0, || Ok(AUX),
-    )
+        &attacker, &utxos(), "gotcha via wpkh?", false, shared_id, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
 
     let own_tx = OnchainTx {
@@ -1269,7 +1252,7 @@ fn self_spk_set_own_received_buckets_stay_separate() {
 fn self_spk_set_extends_spends_from_self_never_replaces() {
     let id = identity();
     let note =
-        compose_note(&id, &utxos(), "plain self note", false, [5, 5, 6, 6], 80, 1.0, || Ok(AUX))
+        compose_note(&id, &utxos(), "plain self note", false, [5, 5, 6, 6], 80, 1.0, 0, || Ok(AUX))
             .unwrap();
     let onchain = OnchainTx {
         txid: note.txid_hex.clone(),
@@ -1324,11 +1307,10 @@ fn funded_directed_private_own_note_recovers_text_and_recipient() {
     let funding_spk = wpkh_spk(0x77);
 
     let sent = compose_directed_note(
-        &a, &utxos(), "funded, for bob", true, [8, 0, 0, 8], &to_b, 80, 1.0, || Ok(AUX),
-    )
+        &a, &utxos(), "funded, for bob", true, [8, 0, 0, 8], &to_b, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
     let self_note =
-        compose_note(&a, &utxos(), "funded self", false, [9, 0, 0, 9], 80, 1.0, || Ok(AUX))
+        compose_note(&a, &utxos(), "funded self", false, [9, 0, 0, 9], 80, 1.0, 0, || Ok(AUX))
             .unwrap();
 
     let mk = |note: &notes_core::tx::NoteTx, recipient: Option<String>, h: u64| OnchainTx {
@@ -1402,8 +1384,7 @@ fn display_owner_dedup_first_notebook_input_wins() {
     let notebook_spks = vec![spk_a.clone(), spk_b.clone()];
 
     let note = compose_note(
-        &a, &utxos(), "owned by two notebooks", false, [1, 2, 3, 4], 80, 1.0, || Ok(AUX),
-    )
+        &a, &utxos(), "owned by two notebooks", false, [1, 2, 3, 4], 80, 1.0, 0, || Ok(AUX))
     .unwrap();
     let onchain = OnchainTx {
         txid: note.txid_hex.clone(),
@@ -1453,8 +1434,8 @@ fn display_owner_dedup_flips_with_input_order() {
 
     let note = compose_note(
         &a, &utxos(), "owned by two notebooks, reversed", false, [1, 1, 1, 2], 80, 1.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     let onchain = OnchainTx {
         txid: note.txid_hex.clone(),
@@ -1502,8 +1483,8 @@ fn display_owner_dedup_ignores_non_notebook_input_at_position_zero() {
 
     let note = compose_note(
         &a, &utxos(), "wallet-funded but notebook-anchored", false, [5, 5, 5, 5], 80, 1.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     let onchain = OnchainTx {
         txid: note.txid_hex.clone(),
@@ -1550,8 +1531,7 @@ fn display_owner_dedup_noop_when_no_notebook_input() {
 
     let note = compose_note(
         &a, &utxos(), "pure spending-wallet funded, dust anchor only", false, [6, 6, 6, 6], 80,
-        1.0, || Ok(AUX),
-    )
+        1.0, 0, || Ok(AUX))
     .unwrap();
     let onchain = OnchainTx {
         txid: note.txid_hex.clone(),
@@ -1592,8 +1572,7 @@ fn display_owner_dedup_empty_notebook_spks_matches_undeduped() {
     let spk_b = notebook_spk_of(&b);
 
     let note = compose_note(
-        &a, &utxos(), "identical old vs deduped-noop", false, [7, 7, 7, 7], 80, 1.0, || Ok(AUX),
-    )
+        &a, &utxos(), "identical old vs deduped-noop", false, [7, 7, 7, 7], 80, 1.0, 0, || Ok(AUX))
     .unwrap();
     let onchain = OnchainTx {
         txid: note.txid_hex.clone(),
@@ -1633,8 +1612,8 @@ fn display_owner_dedup_noop_on_legacy_empty_input_prevout_spks() {
 
     let note = compose_note(
         &a, &utxos(), "legacy bundle, no raw prevout spks", false, [8, 8, 8, 8], 80, 1.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     let onchain = OnchainTx {
         txid: note.txid_hex.clone(),

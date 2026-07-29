@@ -9,6 +9,75 @@ use crate::sighash::taproot_key_spend_sighash;
 use crate::sign::schnorr_sign;
 use crate::{Error, DUST_LIMIT};
 
+/// What `nLockTime` a newly built transaction carries.
+///
+/// Bitcoin Core, Electrum, Sparrow and BDK all default to setting
+/// `nLockTime` to the current chain height ("anti-fee-sniping"): a miner
+/// considering a re-org to steal a high-fee transaction cannot re-mine it
+/// into an *earlier* block, because the transaction is not valid there.
+/// Every input this crate builds already signals RBF (`0xfffffffd < 0xffffffff`),
+/// which is what makes `nLockTime` enforced at all.
+///
+/// The secondary benefit is anonymity-set: a transaction with
+/// `nLockTime == 0` is visibly not from a mainstream wallet.
+///
+/// This crate does NOT implement Core's extra 10%-of-the-time random
+/// height in `[tip-100, tip]`. That would need randomness inside the
+/// builders, making every build non-deterministic and every byte-exact
+/// test pin need a seeded RNG — a poor trade for a marginal gain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum LockTimePolicy {
+    /// Anti-fee-sniping: the last chain height we know about. This is the
+    /// default and matches Core/BDK.
+    ///
+    /// The Prime device is offline, so its "last known" height comes from
+    /// the most recently imported sync bundle and may be stale. A stale
+    /// height is still perfectly valid — the transaction is simply already
+    /// final — it just buys proportionally less anti-sniping protection.
+    Tip,
+    /// Always `0`: no locktime constraint. This crate's behavior before
+    /// anti-fee-sniping existed, kept as an explicit opt-out.
+    Zero,
+    /// A caller-chosen absolute height. Values at or above 500_000_000 are
+    /// interpreted by consensus as a UNIX timestamp rather than a height;
+    /// that is the caller's choice and is passed through untouched.
+    Custom { height: u32 },
+}
+
+impl Default for LockTimePolicy {
+    fn default() -> Self {
+        LockTimePolicy::Tip
+    }
+}
+
+impl LockTimePolicy {
+    /// The concrete `nLockTime` to build with. `tip` is the last chain
+    /// height the caller knows (`None` when nothing has ever been synced),
+    /// which only [`LockTimePolicy::Tip`] consults.
+    ///
+    /// A `Tip` policy with no known tip falls back to `0` rather than
+    /// guessing a height: an `nLockTime` in the FUTURE would make the
+    /// transaction non-final and get it rejected from the mempool, so
+    /// under-shooting is the only safe direction to err.
+    pub fn resolve(self, tip: Option<u32>) -> u32 {
+        match self {
+            LockTimePolicy::Tip => tip.unwrap_or(0),
+            LockTimePolicy::Zero => 0,
+            LockTimePolicy::Custom { height } => height,
+        }
+    }
+
+    /// Stable identifier for config files, log lines and UI state.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LockTimePolicy::Tip => "tip",
+            LockTimePolicy::Zero => "zero",
+            LockTimePolicy::Custom { .. } => "custom",
+        }
+    }
+}
+
 /// An unspent output of OUR notes address (all inputs are ours by
 /// construction). `txid` is internal byte order (reversed display hex).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +351,7 @@ pub fn build_sweep_tx(
     our_output_x: &[u8; 32],
     dest_spk: Vec<u8>,
     fee_rate: f64,
+    lock_time: u32,
     tweaked_seckey: &[u8; 32],
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
@@ -289,6 +359,7 @@ pub fn build_sweep_tx(
         &[SweepSource { utxos: available, output_x: *our_output_x, tweaked_seckey }],
         dest_spk,
         fee_rate,
+        lock_time,
         aux,
     )
 }
@@ -312,6 +383,7 @@ pub fn build_sweep_tx_multi(
     sources: &[SweepSource],
     dest_spk: Vec<u8>,
     fee_rate: f64,
+    lock_time: u32,
     mut aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     // Flatten inputs, remembering each input's owning source for signing.
@@ -335,7 +407,7 @@ pub fn build_sweep_tx_multi(
 
     let mut tx = Transaction {
         version: 2,
-        lock_time: 0,
+        lock_time,
         inputs,
         outputs: vec![TxOut { value: in_value - fee, script_pubkey: dest_spk }],
         witnesses: Vec::new(),
@@ -374,6 +446,7 @@ pub fn build_sweep_tx_mixed(
     inputs: &[MixedInput],
     dest_spk: Vec<u8>,
     fee_rate: f64,
+    lock_time: u32,
     mut aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     if inputs.is_empty() {
@@ -389,7 +462,7 @@ pub fn build_sweep_tx_mixed(
 
     let mut tx = Transaction {
         version: 2,
-        lock_time: 0,
+        lock_time,
         inputs: inputs.iter().map(|i| i.utxo.clone()).collect(),
         outputs: vec![TxOut { value: in_value - fee, script_pubkey: dest_spk }],
         witnesses: Vec::new(),
@@ -422,18 +495,20 @@ pub fn build_sweep_tx_mixed(
 /// from `available` until value covers fee (+ dust) at `fee_rate` sat/vB.
 /// `tweaked_seckey` is the taproot-tweaked signing key; `aux` supplies
 /// BIP340 aux randomness per input.
+#[allow(clippy::too_many_arguments)]
 pub fn build_note_tx(
     available: &[Utxo],
     output_x: &[u8; 32],
     payloads: &[Vec<u8>],
     recipient_spk: Option<&[u8]>,
     fee_rate: f64,
+    lock_time: u32,
     tweaked_seckey: &[u8; 32],
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     build_note_tx_with_change(
-        available, output_x, payloads, recipient_spk, DUST_LIMIT, None, fee_rate, tweaked_seckey,
-        aux,
+        available, output_x, payloads, recipient_spk, DUST_LIMIT, None, fee_rate, lock_time,
+        tweaked_seckey, aux,
     )
 }
 
@@ -452,6 +527,7 @@ pub fn build_note_tx_with_change(
     recipient_amount: u64,
     change_out: Option<&[u8]>,
     fee_rate: f64,
+    lock_time: u32,
     tweaked_seckey: &[u8; 32],
     mut aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
@@ -514,7 +590,7 @@ pub fn build_note_tx_with_change(
 
             let mut tx = Transaction {
                 version: 2,
-                lock_time: 0,
+                lock_time,
                 inputs: selected.clone(),
                 outputs,
                 witnesses: Vec::new(),
@@ -560,6 +636,7 @@ pub fn build_note_tx_multi_with_change(
     recipients: &[(Vec<u8>, u64)],
     change_out: Option<&[u8]>,
     fee_rate: f64,
+    lock_time: u32,
     tweaked_seckey: &[u8; 32],
     mut aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
@@ -569,7 +646,7 @@ pub fn build_note_tx_multi_with_change(
     if recipients.len() == 1 {
         let (spk, amount) = &recipients[0];
         return build_note_tx_with_change(
-            available, output_x, payloads, Some(spk), *amount, change_out, fee_rate,
+            available, output_x, payloads, Some(spk), *amount, change_out, fee_rate, lock_time,
             tweaked_seckey, aux,
         );
     }
@@ -623,7 +700,7 @@ pub fn build_note_tx_multi_with_change(
 
             let mut tx = Transaction {
                 version: 2,
-                lock_time: 0,
+                lock_time,
                 inputs: selected.clone(),
                 outputs,
                 witnesses: Vec::new(),
@@ -665,6 +742,7 @@ pub fn build_note_tx_multi_exact(
     recipients: &[(Vec<u8>, u64)],
     change_out: Option<&[u8]>,
     fee_rate: f64,
+    lock_time: u32,
     tweaked_seckey: &[u8; 32],
     mut aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
@@ -674,8 +752,8 @@ pub fn build_note_tx_multi_exact(
     if recipients.len() == 1 {
         let (spk, amount) = &recipients[0];
         return build_note_tx_exact(
-            inputs, output_x, payloads, Some(spk), *amount, change_out, fee_rate, tweaked_seckey,
-            aux,
+            inputs, output_x, payloads, Some(spk), *amount, change_out, fee_rate, lock_time,
+            tweaked_seckey, aux,
         );
     }
     if payloads.is_empty() {
@@ -721,7 +799,7 @@ pub fn build_note_tx_multi_exact(
 
         let mut tx = Transaction {
             version: 2,
-            lock_time: 0,
+            lock_time,
             inputs: inputs.to_vec(),
             outputs,
             witnesses: Vec::new(),
@@ -850,6 +928,7 @@ pub fn build_note_tx_mixed_exact(
     notebook_dust_spk: &[u8],
     change_spk: &[u8],
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     build_note_tx_mixed_exact_inner(
@@ -860,6 +939,7 @@ pub fn build_note_tx_mixed_exact(
         notebook_dust_spk,
         change_spk,
         fee_rate,
+        lock_time,
         true, // always emit the dust-to-self anchor, matching this fn's historical behavior
         aux,
     )
@@ -886,6 +966,7 @@ pub fn build_note_tx_mixed_exact_anchored(
     notebook_dust_spk: &[u8],
     change_spk: &[u8],
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     let anchored_by_input = inputs.iter().any(|i| i.prevout_spk == notebook_dust_spk);
@@ -897,6 +978,7 @@ pub fn build_note_tx_mixed_exact_anchored(
         notebook_dust_spk,
         change_spk,
         fee_rate,
+        lock_time,
         !anchored_by_input,
         aux,
     )
@@ -916,6 +998,7 @@ fn build_note_tx_mixed_exact_inner(
     notebook_dust_spk: &[u8],
     change_spk: &[u8],
     fee_rate: f64,
+    lock_time: u32,
     emit_dust: bool,
     mut aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
@@ -976,7 +1059,7 @@ fn build_note_tx_mixed_exact_inner(
 
         let mut tx = Transaction {
             version: 2,
-            lock_time: 0,
+            lock_time,
             inputs: inputs.iter().map(|i| i.utxo.clone()).collect(),
             outputs,
             witnesses: Vec::new(),
@@ -1026,6 +1109,7 @@ pub fn build_note_tx_mixed_exact_anchored_multi(
     notebook_dust_spk: &[u8],
     change_spk: &[u8],
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     if recipients.len() > 255 {
@@ -1044,6 +1128,7 @@ pub fn build_note_tx_mixed_exact_anchored_multi(
             notebook_dust_spk,
             change_spk,
             fee_rate,
+            lock_time,
             aux,
         );
     }
@@ -1055,6 +1140,7 @@ pub fn build_note_tx_mixed_exact_anchored_multi(
         notebook_dust_spk,
         change_spk,
         fee_rate,
+        lock_time,
         !anchored_by_input,
         aux,
     )
@@ -1074,6 +1160,7 @@ fn build_note_tx_mixed_exact_inner_multi(
     notebook_dust_spk: &[u8],
     change_spk: &[u8],
     fee_rate: f64,
+    lock_time: u32,
     emit_dust: bool,
     mut aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
@@ -1134,7 +1221,7 @@ fn build_note_tx_mixed_exact_inner_multi(
 
         let mut tx = Transaction {
             version: 2,
-            lock_time: 0,
+            lock_time,
             inputs: inputs.iter().map(|i| i.utxo.clone()).collect(),
             outputs,
             witnesses: Vec::new(),
@@ -1177,6 +1264,7 @@ pub fn build_note_tx_exact(
     recipient_amount: u64,
     change_out: Option<&[u8]>,
     fee_rate: f64,
+    lock_time: u32,
     tweaked_seckey: &[u8; 32],
     mut aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
@@ -1225,7 +1313,7 @@ pub fn build_note_tx_exact(
 
         let mut tx = Transaction {
             version: 2,
-            lock_time: 0,
+            lock_time,
             inputs: inputs.to_vec(),
             outputs,
             witnesses: Vec::new(),

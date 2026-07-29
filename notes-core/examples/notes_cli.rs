@@ -14,6 +14,7 @@ use notes_core::bundle::{
     Identity, SyncBundle,
 };
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
+use notes_core::tx::LockTimePolicy;
 use notes_core::Network;
 
 fn app_seed() -> [u8; 32] {
@@ -32,6 +33,25 @@ fn read_bundle(path: &str) -> SyncBundle {
         json = std::fs::read_to_string(path).unwrap();
     }
     SyncBundle::from_json(&json).expect("invalid sync bundle JSON")
+}
+
+/// The `nLockTime` this CLI builds with, mirroring what the device does:
+/// the configured [`LockTimePolicy`] resolved against the last chain height
+/// we know — which, in the device role, is the tip carried by the sync
+/// bundle we were handed.
+///
+/// `NOTES_LOCKTIME_POLICY` overrides it for tests: `tip` (default), `zero`,
+/// or a bare height for `Custom`. Defaulting to `tip` means the e2e scripts
+/// exercise a real non-zero locktime without needing new flags.
+fn locktime_for(tip: Option<u32>) -> u32 {
+    let policy = match std::env::var("NOTES_LOCKTIME_POLICY").ok().as_deref() {
+        None | Some("") | Some("tip") => LockTimePolicy::Tip,
+        Some("zero") => LockTimePolicy::Zero,
+        Some(h) => LockTimePolicy::Custom {
+            height: h.parse().expect("NOTES_LOCKTIME_POLICY: tip|zero|<height>"),
+        },
+    };
+    policy.resolve(tip)
 }
 
 fn main() {
@@ -128,9 +148,15 @@ fn main() {
                 kind: notes_core::tx::InputKind::P2wpkh,
                 seckey: key.seckey,
             };
-            let swept = notes_core::tx::build_sweep_tx_mixed(&[input], dest_spk, fee_rate, || {
-                generate_aux_rand()
-            })
+            // No bundle in this arm, so no known tip: `Tip` resolves to 0
+            // unless NOTES_LOCKTIME_POLICY overrides it.
+            let swept = notes_core::tx::build_sweep_tx_mixed(
+                &[input],
+                dest_spk,
+                fee_rate,
+                locktime_for(None),
+                || generate_aux_rand(),
+            )
             .unwrap();
             println!("{} {}", swept.txid_hex, swept.raw_hex);
         }
@@ -166,6 +192,7 @@ fn main() {
                 note_id,
                 max_or,
                 fee_rate,
+                locktime_for(Some(bundle.tip_height as u32)),
                 || generate_aux_rand(),
             )
             .unwrap();
@@ -215,6 +242,7 @@ fn main() {
                 &recipient,
                 max_or,
                 fee_rate,
+                locktime_for(Some(bundle.tip_height as u32)),
                 || generate_aux_rand(),
             )
             .unwrap();
@@ -289,6 +317,7 @@ fn main() {
                 None,
                 max_or,
                 fee_rate,
+                locktime_for(Some(bundle.tip_height as u32)),
                 || generate_aux_rand(),
             )
             .unwrap();
@@ -323,6 +352,7 @@ fn main() {
                 &identity.output_x,
                 dest_spk,
                 fee_rate,
+                locktime_for(Some(bundle.tip_height as u32)),
                 &identity.tweaked_seckey,
                 || generate_aux_rand(),
             )

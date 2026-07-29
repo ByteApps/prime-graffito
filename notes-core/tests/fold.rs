@@ -52,9 +52,9 @@ fn predict_notebook_fold_none_when_change_affordable() {
         0,
         None,
         rate,
+        0,
         &TAPROOT_SECKEY,
-        || Ok(AUX),
-    )
+        || Ok(AUX))
     .unwrap();
     assert!(built.change > 0, "a 100,000-sat coin must afford a change output");
 
@@ -83,9 +83,9 @@ fn predict_notebook_fold_matches_build_note_tx_exact() {
         0,
         None,
         rate,
+        0,
         &TAPROOT_SECKEY,
-        || Ok(AUX),
-    )
+        || Ok(AUX))
     .unwrap();
     assert_eq!(built.change, 0, "the whole 330-sat coin must force the no-change fold shape");
     assert_eq!(built.fee, DUST_LIMIT, "the whole coin goes to the fee");
@@ -148,8 +148,8 @@ fn predict_mixed_fold_matches_anchored_build() {
         &notebook_dust_spk,
         &change_spk,
         rate,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     assert_eq!(built.change, 0, "this tiny selection must fold, not leave a change output");
     // Anchored: no notebook-dust output at all, matching the input-anchored
@@ -205,8 +205,8 @@ fn predict_mixed_fold_matches_unanchored_dust_build() {
         &notebook_dust_spk,
         &change_spk,
         rate,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     assert_eq!(built.change, 0, "700 sats must be too little for change once dust+fee are paid");
     assert!(

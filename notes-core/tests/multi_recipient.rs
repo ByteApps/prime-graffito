@@ -56,9 +56,9 @@ fn multi_tx_output_order_and_single_entry_delegation() {
         &[(p2tr_script_pubkey(&b.output_x), 500)],
         None,
         2.0,
+        0,
         &sender.tweaked_seckey,
-        || Ok(AUX),
-    )
+        || Ok(AUX))
     .unwrap();
     let single_direct = build_note_tx_with_change(
         &utxos(),
@@ -68,9 +68,9 @@ fn multi_tx_output_order_and_single_entry_delegation() {
         500,
         None,
         2.0,
+        0,
         &sender.tweaked_seckey,
-        || Ok(AUX),
-    )
+        || Ok(AUX))
     .unwrap();
     assert_eq!(single_via_multi.raw_hex, single_direct.raw_hex);
     assert_eq!(single_via_multi.tx, single_direct.tx);
@@ -85,9 +85,9 @@ fn multi_tx_output_order_and_single_entry_delegation() {
         &recipients,
         None,
         2.0,
+        0,
         &sender.tweaked_seckey,
-        || Ok(AUX),
-    )
+        || Ok(AUX))
     .unwrap();
     assert_eq!(note.tx.outputs.len(), 4); // OP_RETURN, b, c, change
     assert_eq!(note.tx.outputs[0].script_pubkey[0], 0x6a);
@@ -126,9 +126,9 @@ fn multi_tx_below_dust_amount_rejected() {
         &recipients,
         None,
         2.0,
+        0,
         &sender.tweaked_seckey,
-        || Ok(AUX),
-    )
+        || Ok(AUX))
     .unwrap_err();
     assert!(matches!(err, notes_core::Error::Envelope(_)));
 }
@@ -144,9 +144,9 @@ fn multi_tx_recipient_count_bounds() {
         &[],
         None,
         2.0,
+        0,
         &sender.tweaked_seckey,
-        || Ok(AUX),
-    )
+        || Ok(AUX))
     .unwrap_err();
     assert!(matches!(err, notes_core::Error::Envelope(_)));
 }
@@ -166,9 +166,9 @@ fn multi_tx_exact_coin_control() {
         &recipients,
         None,
         2.0,
+        0,
         &sender.tweaked_seckey,
-        || Ok(AUX),
-    )
+        || Ok(AUX))
     .unwrap();
     assert_eq!(exact.tx.inputs.len(), 2, "coin control spends every provided coin");
 }
@@ -202,9 +202,9 @@ fn multi_tx_rust_bitcoin_cross_check() {
         &recipients,
         None,
         2.0,
+        0,
         &sender.tweaked_seckey,
-        || Ok(AUX),
-    )
+        || Ok(AUX))
     .unwrap();
 
     let raw = hex::decode(&note.raw_hex).unwrap();
@@ -320,8 +320,8 @@ fn compose_scan_roundtrip_private_multi() {
         None,
         80,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     // Wire check: FLAG_MULTI + FLAG_DIRECTED + FLAG_PRIVATE.
@@ -389,8 +389,8 @@ fn compose_scan_roundtrip_public_multi() {
         None,
         80,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     let output_addrs = vec![b.address(NET), c.address(NET), d.address(NET)];
 
@@ -423,12 +423,11 @@ fn single_recipient_via_multi_api_is_byte_identical_public() {
         None,
         80,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     let direct = compose_directed_note_with_change_amount(
-        &a, &utxos(), "hi", false, [1, 1, 1, 1], &recipient_of(&b), 500, None, 80, 2.0, || Ok(AUX),
-    )
+        &a, &utxos(), "hi", false, [1, 1, 1, 1], &recipient_of(&b), 500, None, 80, 2.0, 0, || Ok(AUX))
     .unwrap();
     assert_eq!(via_multi.raw_hex, direct.raw_hex);
     assert_eq!(via_multi.tx, direct.tx);
@@ -445,8 +444,8 @@ fn single_recipient_via_multi_api_is_byte_identical_public() {
         None,
         80,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     assert_eq!(deduped.raw_hex, direct.raw_hex);
 }
@@ -472,12 +471,11 @@ fn single_recipient_via_multi_api_delegates_for_private_too() {
         None,
         80,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     let direct = compose_directed_note_with_change_amount(
-        &a, &utxos(), "hi", true, [1, 1, 1, 1], &recipient_of(&b), 500, None, 80, 2.0, || Ok(AUX),
-    )
+        &a, &utxos(), "hi", true, [1, 1, 1, 1], &recipient_of(&b), 500, None, 80, 2.0, 0, || Ok(AUX))
     .unwrap();
 
     let op_return =
@@ -513,8 +511,8 @@ fn compose_directed_note_multi_exact_spends_all_given_coins() {
         None,
         80,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     assert_eq!(note.tx.inputs.len(), 2);
 }
@@ -529,8 +527,7 @@ fn multi_private_requires_taproot_recipients() {
     let b = identity(9);
     let recipients = vec![(recipient_of(&b), 400u64), (non_taproot_recipient(), 500u64)];
     let err = compose_directed_note_multi_with_change(
-        &a, &utxos(), "hi", true, [3, 3, 3, 3], &recipients, CONTENT_KEY, None, 80, 2.0, || Ok(AUX),
-    )
+        &a, &utxos(), "hi", true, [3, 3, 3, 3], &recipients, CONTENT_KEY, None, 80, 2.0, 0, || Ok(AUX))
     .unwrap_err();
     assert!(matches!(err, notes_core::Error::RecipientNotTaproot));
 }
@@ -541,8 +538,7 @@ fn multi_public_allows_non_taproot_recipients() {
     let b = identity(9);
     let recipients = vec![(recipient_of(&b), 400u64), (non_taproot_recipient(), 500u64)];
     let note = compose_directed_note_multi_with_change(
-        &a, &utxos(), "hi", false, [3, 3, 3, 3], &recipients, CONTENT_KEY, None, 80, 2.0, || Ok(AUX),
-    )
+        &a, &utxos(), "hi", false, [3, 3, 3, 3], &recipients, CONTENT_KEY, None, 80, 2.0, 0, || Ok(AUX))
     .unwrap();
     assert_eq!(note.sent, 900);
 }
@@ -708,8 +704,8 @@ fn sealed_payloads_multi_matches_composer_and_delegates() {
     ];
     let note = compose_directed_note_multi_with_change(
         &a, &utxos, "psbt-path multi", false, note_id, &recipients, key, None, 100_000, 1.0,
-        || Ok([0u8; 32]),
-    ).unwrap();
+        0,
+        || Ok([0u8; 32])).unwrap();
     let composer_payloads: Vec<Vec<u8>> = note
         .tx.outputs.iter()
         .filter_map(|o| notes_core::tx::op_return_payload(&o.script_pubkey))

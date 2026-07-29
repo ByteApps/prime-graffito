@@ -916,6 +916,7 @@ fn compose_inner(
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     let payloads = envelope::encode_chunks(note_id, flags, body, max_op_return_bytes)?;
@@ -927,6 +928,7 @@ fn compose_inner(
         recipient_amount,
         change_spk,
         fee_rate,
+        lock_time,
         &identity.tweaked_seckey,
         aux,
     )
@@ -942,10 +944,11 @@ pub fn compose_note(
     note_id: [u8; 4],
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     compose_note_with_change(
-        identity, utxos, text, private, note_id, None, max_op_return_bytes, fee_rate, aux,
+        identity, utxos, text, private, note_id, None, max_op_return_bytes, fee_rate, lock_time, aux,
     )
 }
 
@@ -960,6 +963,7 @@ pub fn compose_note_with_change(
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     let body = if private {
@@ -970,7 +974,7 @@ pub fn compose_note_with_change(
     let flags = if private { FLAG_PRIVATE } else { 0 };
     compose_inner(
         identity, utxos, note_id, flags, &body, None, crate::DUST_LIMIT, change_spk,
-        max_op_return_bytes, fee_rate, aux,
+        max_op_return_bytes, fee_rate, lock_time, aux,
     )
 }
 
@@ -990,10 +994,12 @@ pub fn compose_directed_note(
     recipient: &Recipient,
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     compose_directed_note_with_change(
-        identity, utxos, text, private, note_id, recipient, None, max_op_return_bytes, fee_rate,
+        identity, utxos, text, private, note_id, recipient, None, max_op_return_bytes,
+        fee_rate, lock_time,
         aux,
     )
 }
@@ -1010,11 +1016,12 @@ pub fn compose_directed_note_with_change(
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     compose_directed_note_with_change_amount(
         identity, utxos, text, private, note_id, recipient, crate::DUST_LIMIT, change_spk,
-        max_op_return_bytes, fee_rate, aux,
+        max_op_return_bytes, fee_rate, lock_time, aux,
     )
 }
 
@@ -1033,6 +1040,7 @@ pub fn compose_directed_note_with_change_amount(
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     let body = if private {
@@ -1059,6 +1067,7 @@ pub fn compose_directed_note_with_change_amount(
         change_spk,
         max_op_return_bytes,
         fee_rate,
+        lock_time,
         aux,
     )
 }
@@ -1075,6 +1084,7 @@ pub fn compose_note_exact(
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     let body = if private {
@@ -1092,6 +1102,7 @@ pub fn compose_note_exact(
         crate::DUST_LIMIT,
         change_spk,
         fee_rate,
+        lock_time,
         &identity.tweaked_seckey,
         aux,
     )
@@ -1109,11 +1120,12 @@ pub fn compose_directed_note_exact(
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     compose_directed_note_exact_amount(
         identity, inputs, text, private, note_id, recipient, crate::DUST_LIMIT, change_spk,
-        max_op_return_bytes, fee_rate, aux,
+        max_op_return_bytes, fee_rate, lock_time, aux,
     )
 }
 
@@ -1131,6 +1143,7 @@ pub fn compose_directed_note_exact_amount(
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     let body = if private {
@@ -1155,6 +1168,7 @@ pub fn compose_directed_note_exact_amount(
         recipient_amount,
         change_spk,
         fee_rate,
+        lock_time,
         &identity.tweaked_seckey,
         aux,
     )
@@ -1248,6 +1262,7 @@ pub fn compose_directed_note_multi_with_change(
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     let deduped = dedupe_recipients(recipients)?;
@@ -1264,6 +1279,7 @@ pub fn compose_directed_note_multi_with_change(
             change_spk,
             max_op_return_bytes,
             fee_rate,
+            lock_time,
             aux,
         );
     }
@@ -1280,6 +1296,7 @@ pub fn compose_directed_note_multi_with_change(
         &recipient_pairs,
         change_spk,
         fee_rate,
+        lock_time,
         &identity.tweaked_seckey,
         aux,
     )
@@ -1301,6 +1318,7 @@ pub fn compose_directed_note_multi_exact(
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
+    lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     let deduped = dedupe_recipients(recipients)?;
@@ -1317,6 +1335,7 @@ pub fn compose_directed_note_multi_exact(
             change_spk,
             max_op_return_bytes,
             fee_rate,
+            lock_time,
             aux,
         );
     }
@@ -1333,6 +1352,7 @@ pub fn compose_directed_note_multi_exact(
         &recipient_pairs,
         change_spk,
         fee_rate,
+        lock_time,
         &identity.tweaked_seckey,
         aux,
     )

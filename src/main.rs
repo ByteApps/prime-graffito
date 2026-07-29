@@ -17,7 +17,7 @@ use notes_core::address::p2tr_script_pubkey;
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::tx::{
     build_note_tx_mixed_exact_anchored_multi, build_sweep_tx_multi, estimate_sweep_vsize,
-    estimate_vsize_mixed, InputKind, MixedInput, NoteTx, SweepSource, Utxo,
+    estimate_vsize_mixed, InputKind, LockTimePolicy, MixedInput, NoteTx, SweepSource, Utxo,
 };
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
@@ -407,6 +407,12 @@ struct DeviceConfig {
     seed_index: u32,
     /// Active BIP-86 account — the wallet context (rev-3 parity).
     account: u32,
+    /// What `nLockTime` composed/swept transactions carry. Default `Tip`
+    /// (anti-fee-sniping, matching Core/BDK), resolved against the tip the
+    /// last imported bundle reported — this device is offline, so that
+    /// height can be stale, which is harmless: the tx is simply already
+    /// final. `Zero` restores the pre-2026-07-27 behavior.
+    lock_time: LockTimePolicy,
 }
 impl Default for DeviceConfig {
     fn default() -> Self {
@@ -415,9 +421,37 @@ impl Default for DeviceConfig {
             chunk_override: None,
             seed_index: 0,
             account: 0,
+            lock_time: LockTimePolicy::default(),
         }
     }
 }
+/// The `nLockTime` to build with: the wallet's policy resolved against the
+/// chain height the last imported bundle reported.
+///
+/// A height that does not fit in `u32` is treated as "unknown" rather than
+/// wrapped — a wrapped value could land in the FUTURE, which would make the
+/// transaction non-final and get it rejected from the mempool.
+fn resolve_locktime(policy: LockTimePolicy, tip: Option<u64>) -> u32 {
+    policy.resolve(tip.and_then(|h| u32::try_from(h).ok()))
+}
+
+/// The locktime section LABEL: names the height the current policy would
+/// actually put on the wire, since "chain height" on an offline device
+/// silently means "whatever the last bundle said". Deliberately ONE short
+/// line — it is the label itself, and a taller block pushes the settings
+/// rows below it past the bottom of the screen (which the simtap suites
+/// tap at fixed offsets).
+fn locktime_caption(policy: LockTimePolicy, tip: Option<u64>) -> String {
+    match policy {
+        LockTimePolicy::Tip => match tip {
+            Some(h) => format!("Transaction locktime · {h} (last sync)"),
+            None => "Transaction locktime · 0 until first sync".to_string(),
+        },
+        LockTimePolicy::Zero => "Transaction locktime · 0".to_string(),
+        LockTimePolicy::Custom { height } => format!("Transaction locktime · {height}"),
+    }
+}
+
 fn load_config(fs: &Fs) -> Option<DeviceConfig> {
     read_text(fs, CONFIG_PATH, Location::User)
         .ok()
@@ -1086,6 +1120,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // scope to it (legacy notebooks are context-free).
     let seed_idx: Rc<RefCell<u32>> = Rc::new(RefCell::new(device_cfg.seed_index));
     let bip_account: Rc<RefCell<u32>> = Rc::new(RefCell::new(device_cfg.account));
+    // Anti-fee-sniping policy (wallet-level, like network and chunk).
+    let lock_policy: Rc<RefCell<LockTimePolicy>> = Rc::new(RefCell::new(device_cfg.lock_time));
     let active: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
 
     // Persist the device config from the current cells (single source of
@@ -1096,6 +1132,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let device_chunk = device_chunk.clone();
         let seed_idx = seed_idx.clone();
         let bip_account = bip_account.clone();
+        let lock_policy = lock_policy.clone();
         Rc::new(move || {
             save_config(
                 &fs,
@@ -1104,6 +1141,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     chunk_override: *device_chunk.borrow(),
                     seed_index: *seed_idx.borrow(),
                     account: *bip_account.borrow(),
+                    lock_time: *lock_policy.borrow(),
                 },
             );
         })
@@ -1120,6 +1158,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let identity = identity.clone();
         let net = net.clone();
         let device_chunk = device_chunk.clone();
+        let lock_policy = lock_policy.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
@@ -1160,6 +1199,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             });
             let eff = dchunk.map(|c| c.clamp(MIN_CHUNK, DEFAULT_CHUNK)).unwrap_or(DEFAULT_CHUNK);
             settings.set_chunk_text(format!("{eff}").into());
+            let policy = *lock_policy.borrow();
+            settings.set_locktime_mode(match policy {
+                LockTimePolicy::Tip => 0,
+                LockTimePolicy::Zero => 1,
+                LockTimePolicy::Custom { .. } => 2,
+            });
+            // Mirror the height the policy would actually use, so the
+            // Custom field opens pre-filled with the current value.
+            settings.set_locktime_text(format!("{}", resolve_locktime(policy, st.tip_height)).into());
+            settings.set_locktime_effective(locktime_caption(policy, st.tip_height).into());
             log::info!(
                 "cb: home balance={} utxos={} tip={}",
                 st.balance(),
@@ -2042,6 +2091,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let active = active.clone();
         let seed_idx = seed_idx.clone();
         let bip_account = bip_account.clone();
+        let lock_policy = lock_policy.clone();
         ui.global::<Callbacks>().on_sweep_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
@@ -2055,6 +2105,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let active = active.clone();
             let seed_idx = seed_idx.clone();
             let bip_account = bip_account.clone();
+            let lock_policy = lock_policy.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
@@ -2098,7 +2149,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 tweaked_seckey: sk,
                             })
                             .collect();
-                        build_sweep_tx_multi(&sources, dest_spk, rate, generate_aux_rand)
+                        build_sweep_tx_multi(
+                            &sources,
+                            dest_spk,
+                            rate,
+                            resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                            generate_aux_rand,
+                        )
                             .map_err(|e| e.to_string())
                     });
                 ui.global::<Ui>().set_busy(false);
@@ -2681,6 +2738,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let app_seed = app_seed.clone();
         let funding_pick = funding_pick.clone();
         let change_pick = change_pick.clone();
+        let lock_policy = lock_policy.clone();
         ui.global::<Callbacks>().on_compose_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
@@ -2696,6 +2754,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let app_seed = app_seed.clone();
             let funding_pick = funding_pick.clone();
             let change_pick = change_pick.clone();
+            let lock_policy = lock_policy.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
@@ -2805,6 +2864,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     Some(&change_spk),
                                     st.effective_chunk(),
                                     rate,
+                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
                                     || generate_aux_rand(),
                                 )
                             } else {
@@ -2817,6 +2877,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     Some(&change_spk),
                                     st.effective_chunk(),
                                     rate,
+                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
                                     || generate_aux_rand(),
                                 )
                             }
@@ -2863,6 +2924,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     Some(&change_spk),
                                     st.effective_chunk(),
                                     rate,
+                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
                                     || generate_aux_rand(),
                                 )
                             } else {
@@ -2875,6 +2937,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     Some(&change_spk),
                                     st.effective_chunk(),
                                     rate,
+                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
                                     || generate_aux_rand(),
                                 )
                             }
@@ -3008,6 +3071,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 &notebook_dust_spk,
                                 &change_spk,
                                 rate,
+                                resolve_locktime(*lock_policy.borrow(), st.tip_height),
                                 || generate_aux_rand(),
                             )
                             .map_err(|e| e.to_string())?;
@@ -4548,6 +4612,44 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             // Re-price the draft immediately so the compose cost line is
             // already current when the user returns to it.
             ui.global::<Callbacks>().invoke_compose_changed();
+        });
+    }
+
+    // Transaction locktime (anti-fee-sniping). Wallet-level like the chunk
+    // size, so it lives in config.json rather than any notebook's state.
+    {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let lock_policy = lock_policy.clone();
+        let persist_config = persist_config.clone();
+        ui.global::<Callbacks>().on_locktime_changed(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let settings = ui.global::<Settings>();
+            let policy = match settings.get_locktime_mode() {
+                0 => LockTimePolicy::Tip,
+                1 => LockTimePolicy::Zero,
+                _ => match settings.get_locktime_text().trim().parse::<u32>() {
+                    // A height at or above 500_000_000 is read by consensus
+                    // as a UNIX timestamp, which is never what someone
+                    // typing a block height means — reject it here rather
+                    // than silently build an unspendable-until-2035 tx.
+                    Ok(h) if h < 500_000_000 => LockTimePolicy::Custom { height: h },
+                    _ => {
+                        let msg = "Locktime must be a block height below 500000000.".to_string();
+                        log::warn!("cb: set-locktime err={msg}");
+                        settings.set_locktime_error(msg.into());
+                        // Leave the user's text in place to fix.
+                        return;
+                    }
+                },
+            };
+            *lock_policy.borrow_mut() = policy;
+            persist_config();
+            settings.set_locktime_error("".into());
+            let tip = state.borrow().tip_height;
+            let effective = resolve_locktime(policy, tip);
+            settings.set_locktime_effective(locktime_caption(policy, tip).into());
+            log::info!("cb: set-locktime {} effective={effective} ok", policy.as_str());
         });
     }
 

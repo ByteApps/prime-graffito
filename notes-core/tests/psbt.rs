@@ -20,7 +20,7 @@ fn utxos() -> Vec<Utxo> {
 
 /// Build the unsigned PSBT for a note tx spending exactly our two UTXOs.
 fn unsigned_psbt(id: &Identity) -> (Psbt, notes_core::tx::NoteTx, Vec<u8>) {
-    let note = compose_note_exact(id, &utxos(), "psbt me maybe", false, [1, 2, 3, 4], None, 80, 2.0, || {
+    let note = compose_note_exact(id, &utxos(), "psbt me maybe", false, [1, 2, 3, 4], None, 80, 2.0, 0, || {
         Ok(AUX)
     })
     .unwrap();

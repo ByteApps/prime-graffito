@@ -68,7 +68,7 @@ fn wpkh_spk(seckey: &[u8; 32]) -> Vec<u8> {
 #[test]
 fn round_trip_plain_self_note() {
     let id = identity();
-    let note = compose_note(&id, &utxos(), "hello world", true, [1, 2, 3, 4], 80, 2.0, || Ok(AUX)).unwrap();
+    let note = compose_note(&id, &utxos(), "hello world", true, [1, 2, 3, 4], 80, 2.0, 0, || Ok(AUX)).unwrap();
 
     let segwit_bytes = note.tx.serialize_segwit();
     let decoded = decode_transaction(&segwit_bytes).unwrap();
@@ -92,8 +92,8 @@ fn round_trip_directed_note_with_gift() {
 
     let note = compose_directed_note_with_change_amount(
         &sender, &utxos(), "happy birthday", true, [5, 6, 7, 8], &to_recip, 50_000, None, 80, 2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     let decoded = decode_transaction(&note.tx.serialize_segwit()).unwrap();
@@ -118,8 +118,8 @@ fn round_trip_multi_source_sweep() {
         ],
         dest,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     let decoded = decode_transaction(&sweep.tx.serialize_segwit()).unwrap();
@@ -154,8 +154,7 @@ fn round_trip_mixed_taproot_and_wpkh() {
     ];
 
     let note = build_note_tx_mixed_exact(
-        &inputs, &payloads, None, 0, &taproot_spk, &change_spk, 1.5, || Ok(AUX),
-    )
+        &inputs, &payloads, None, 0, &taproot_spk, &change_spk, 1.5, 0, || Ok(AUX))
     .unwrap();
 
     let decoded = decode_transaction(&note.tx.serialize_segwit()).unwrap();
@@ -177,11 +176,11 @@ fn rust_bitcoin_cross_check_every_fixture() {
     let b = Identity::from_app_seed(&[11u8; 32]).unwrap();
 
     let self_note =
-        compose_note(&id, &utxos(), "hello world", true, [1, 2, 3, 4], 80, 2.0, || Ok(AUX)).unwrap();
+        compose_note(&id, &utxos(), "hello world", true, [1, 2, 3, 4], 80, 2.0, 0, || Ok(AUX)).unwrap();
     let directed = compose_directed_note_with_change_amount(
         &id, &utxos(), "happy birthday", true, [5, 6, 7, 8], &to_recip, 50_000, None, 80, 2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
     let a_coins = utxos();
     let b_coins =
@@ -194,8 +193,8 @@ fn rust_bitcoin_cross_check_every_fixture() {
         ],
         dest,
         2.0,
-        || Ok(AUX),
-    )
+        0,
+        || Ok(AUX))
     .unwrap();
 
     for raw in [self_note.raw_hex.clone(), directed.raw_hex.clone(), sweep.raw_hex.clone()] {
@@ -254,7 +253,7 @@ fn huge_claimed_counts_never_allocate_or_panic() {
     // A real tx prefix (version + 1 real input) followed by a huge claimed
     // output count with nothing behind it.
     let id = identity();
-    let note = compose_note(&id, &utxos(), "x", false, [0; 4], 80, 1.0, || Ok(AUX)).unwrap();
+    let note = compose_note(&id, &utxos(), "x", false, [0; 4], 80, 1.0, 0, || Ok(AUX)).unwrap();
     let full = note.tx.serialize_segwit();
     // version(4) + first real varint(1) + one full TxIn(41 bytes) = 46
     // bytes in, then splice a huge output-count varint with no data.
@@ -281,10 +280,9 @@ fn truncated_at_every_byte_boundary_never_panics() {
     let to_recip = Recipient::parse(NET, &recip.address(NET)).unwrap();
 
     let self_note =
-        compose_note(&id, &utxos(), "x", false, [0; 4], 80, 1.0, || Ok(AUX)).unwrap();
+        compose_note(&id, &utxos(), "x", false, [0; 4], 80, 1.0, 0, || Ok(AUX)).unwrap();
     let directed = compose_directed_note_with_change_amount(
-        &id, &utxos(), "y", true, [1; 4], &to_recip, 1_000, None, 80, 1.0, || Ok(AUX),
-    )
+        &id, &utxos(), "y", true, [1; 4], &to_recip, 1_000, None, 80, 1.0, 0, || Ok(AUX))
     .unwrap();
 
     for note in [self_note, directed] {
