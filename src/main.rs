@@ -435,25 +435,20 @@ fn resolve_locktime(policy: LockTimePolicy, tip: Option<u64>) -> u32 {
     policy.resolve(tip.and_then(|h| u32::try_from(h).ok()))
 }
 
-/// One-line explanation under the locktime pills of what the current
-/// policy would actually put on the wire right now — the device is
-/// offline, so "chain height" can silently mean "whatever the last bundle
-/// said", and that is worth showing rather than hiding.
+/// The locktime section LABEL: names the height the current policy would
+/// actually put on the wire, since "chain height" on an offline device
+/// silently means "whatever the last bundle said". Deliberately ONE short
+/// line — it is the label itself, and a taller block pushes the settings
+/// rows below it past the bottom of the screen (which the simtap suites
+/// tap at fixed offsets).
 fn locktime_caption(policy: LockTimePolicy, tip: Option<u64>) -> String {
     match policy {
         LockTimePolicy::Tip => match tip {
-            Some(h) => format!(
-                "Transactions get locktime {h}, the chain height from your last sync. \
-                 Discourages a re-org from stealing the fee."
-            ),
-            None => "No sync yet, so locktime stays 0 until a bundle arrives.".to_string(),
+            Some(h) => format!("Transaction locktime · {h} (last sync)"),
+            None => "Transaction locktime · 0 until first sync".to_string(),
         },
-        LockTimePolicy::Zero => {
-            "Transactions get locktime 0. Simplest, but stands out from most wallets.".to_string()
-        }
-        LockTimePolicy::Custom { height } => {
-            format!("Transactions get locktime {height}.")
-        }
+        LockTimePolicy::Zero => "Transaction locktime · 0".to_string(),
+        LockTimePolicy::Custom { height } => format!("Transaction locktime · {height}"),
     }
 }
 

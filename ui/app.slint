@@ -1723,8 +1723,17 @@ export component AppWindow inherits Window {
                 }
             }
 
+
             Text {
-                text: Settings.locktime-error == "" ? "Transaction locktime" : Settings.locktime-error;
+                text: "Chunk size caps each OP_RETURN output. Standard (100000) matches Bitcoin Core v30 relay defaults, verified on mempool.space; pick 80 if your broadcast endpoint rejects a note, then recompose it.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: Settings.locktime-error == "" ? Settings.locktime-effective : Settings.locktime-error;
                 color: Settings.locktime-error == "" ? Theme.palette-muted : Theme.palette-danger;
                 font-family: "Montserrat";
                 font-size: 14px;
@@ -1786,21 +1795,6 @@ export component AppWindow inherits Window {
                     font-size: 16px;
                     vertical-alignment: center;
                 }
-            }
-            Text {
-                text: Settings.locktime-effective;
-                color: Theme.palette-muted;
-                font-family: "Montserrat";
-                font-size: 13px;
-                wrap: word-wrap;
-            }
-
-            Text {
-                text: "Chunk size caps each OP_RETURN output. Standard (100000) matches Bitcoin Core v30 relay defaults, verified on mempool.space; pick 80 if your broadcast endpoint rejects a note, then recompose it.";
-                color: Theme.palette-muted;
-                font-family: "Montserrat";
-                font-size: 13px;
-                wrap: word-wrap;
             }
 
             // The wallet-context switcher (accounts) is a normal setting.
