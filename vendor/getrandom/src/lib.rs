@@ -160,6 +160,10 @@
 extern crate cfg_if;
 
 mod error;
+// Host-testable post-conditions for the KeyOS TRNG backend. Compiled on
+// every target on purpose: `xous.rs` itself is cfg(keyos)-only and can
+// never be reached by `cargo test`.
+mod trng_check;
 mod util;
 // To prevent a breaking change when targets are added, we always export the
 // register_custom_getrandom macro, so old Custom RNG crates continue to build.

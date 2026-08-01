@@ -54,6 +54,17 @@ impl Error {
     /// NodeJS does not have support for `crypto.randomFillSync`.
     pub const NODE_RANDOM_FILL_SYNC: Error = internal_error(13);
 
+    // --- KeyOS TRNG backend (`src/xous.rs`), local to this vendored copy ---
+    // Codes 64+ are ours; upstream uses 0..=13 and may claim more.
+    /// The KeyOS `trng` server could not be reached.
+    pub const KEYOS_TRNG_UNAVAILABLE: Error = internal_error(64);
+    /// A syscall in the KeyOS TRNG path (map/send/unmap) failed.
+    pub const KEYOS_TRNG_SYSCALL: Error = internal_error(65);
+    /// The KeyOS `trng` server returned without filling the lent buffer,
+    /// or filled only part of it. Returning entropy here would hand the
+    /// caller the sentinel pattern (or zeros) as a key.
+    pub const KEYOS_TRNG_UNFILLED: Error = internal_error(66);
+
     /// Codes below this point represent OS Errors (i.e. positive i32 values).
     /// Codes at or above this point, but below [`Error::CUSTOM_START`] are
     /// reserved for use by the `rand` and `getrandom` crates.
@@ -170,6 +181,9 @@ fn internal_desc(error: Error) -> Option<&'static str> {
         Error::VXWORKS_RAND_SECURE => Some("randSecure: VxWorks RNG module is not initialized"),
         Error::NODE_CRYPTO => Some("Node.js crypto module is unavailable"),
         Error::NODE_RANDOM_FILL_SYNC => Some("Node.js API crypto.randomFillSync is unavailable"),
+        Error::KEYOS_TRNG_UNAVAILABLE => Some("KeyOS: cannot connect to the trng server"),
+        Error::KEYOS_TRNG_SYSCALL => Some("KeyOS: a syscall in the TRNG path failed"),
+        Error::KEYOS_TRNG_UNFILLED => Some("KeyOS: the trng server did not fill the buffer"),
         _ => None,
     }
 }
