@@ -26,6 +26,7 @@ Stdlib only. GET  /api/health                    → {"status":"ok","regtest":bo
 """
 
 import json
+import os
 import shutil
 import signal
 import subprocess
@@ -41,6 +42,13 @@ PAGE_SIZE = 25  # esplora /txs/chain pagination size
 
 _datadir = None      # regtest datadir (managed or attached)
 _managed_proc = None  # bitcoind process if we started it
+# The managed node deliberately does NOT use bitcoind's default regtest ports.
+# 18443 is also what an SSH tunnel to a remote regtest node forwards, and what
+# any other local suite would grab, so defaulting there made a tunnel and a
+# test run mutually exclusive — the clash surfaced as a misleading "bitcoind
+# did not come up" and cost several debugging rounds. Override with
+# CN_REGTEST_RPCPORT if 18453/18454 are themselves busy.
+_rpcport = int(os.environ.get("CN_REGTEST_RPCPORT", "18453"))
 _watch_imported = set()
 
 
@@ -54,7 +62,8 @@ class TxNotFound(RuntimeError):
 
 def cli(*args):
     out = subprocess.run(
-        ["bitcoin-cli", "-regtest", f"-datadir={_datadir}", *args],
+        ["bitcoin-cli", "-regtest", f"-rpcport={_rpcport}",
+         f"-datadir={_datadir}", *args],
         capture_output=True, text=True, timeout=60,
     )
     if out.returncode != 0:
@@ -83,8 +92,11 @@ def start_managed_node():
     (Path(_datadir) / "bitcoin.conf").write_text(
         "regtest=1\nserver=1\ntxindex=1\nfallbackfee=0.0001\n"
     )
+    # -rpcport/-port on the command line apply to the selected network, so
+    # they do NOT need a [regtest] section the way bitcoin.conf entries would.
     _managed_proc = subprocess.Popen(
-        ["bitcoind", f"-datadir={_datadir}", "-regtest", "-daemon=0"],
+        ["bitcoind", f"-datadir={_datadir}", "-regtest", "-daemon=0",
+         f"-rpcport={_rpcport}", f"-port={_rpcport + 1}"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     for _ in range(60):
@@ -98,7 +110,7 @@ def start_managed_node():
     cli("createwallet", "miner")
     ensure_watch_wallet()
     mine(101)
-    print(f"regtest node up (datadir {_datadir}), 101 blocks mined")
+    print(f"regtest node up (datadir {_datadir}, rpc {_rpcport}), 101 blocks mined")
 
 
 def ensure_watch_wallet():
