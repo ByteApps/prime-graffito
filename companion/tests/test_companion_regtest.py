@@ -6,12 +6,27 @@ Flow (the page does the work — this script only clicks and types):
   upload .hex → broadcast (auto-mined) → rebuild bundle → notes_cli scan
   → note text recovered.
 
-Prereqs: companion/server.py running with regtest on :8091, and
-`cargo build -p notes-core --example notes_cli` done (target/debug).
+Prereqs: companion/server.py serving :8091, pointed at the ONE shared
+node — the Pi's persistent regtest chain, never a local throwaway one
+(PLAN-one-regtest-node.md):
+
+    ../../../ui-automation/node-env.sh regtest python3 companion/server.py 8091
+
+and `cargo build -p notes-core --example notes_cli` done (target/debug).
+
+Regtest-only by construction: every leg depends on POST .../mine
+auto-confirming a broadcast instantly, and there is no testnet4
+equivalent (mining is 409 there — see the plan's "two verbs, not one").
+If CN_NETWORK names anything other than regtest this file prints a loud
+SKIP and exits instead of quietly proving less. Each run also derives a
+FRESH NOTES_APP_SEED: the Pi's chain is shared and persistent, so a
+fixed seed would accumulate notes across runs and break the
+exact-text/exact-txid assertions below.
 """
 
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -24,6 +39,8 @@ REPO = Path(__file__).resolve().parents[2]
 NOTES_CLI = REPO / "target/debug/examples/notes_cli"
 SHOTS = Path(__file__).resolve().parent / "screenshots"
 SHOTS.mkdir(exist_ok=True)
+
+NETWORK = os.environ.get("CN_NETWORK", "regtest")
 
 NOTE_TEXT = "companion-page note: built, broadcast and rescanned through the real UI"
 VIEWER_NOTE_TEXT = "public note rendered by the viewer page"
@@ -55,6 +72,17 @@ def build_and_download(page, tmp):
 
 
 def main():
+    if NETWORK != "regtest":
+        print(f"SKIP companion-regtest-e2e (regtest-only: every leg depends on "
+              f"POST .../mine auto-confirming instantly, unavailable on {NETWORK})")
+        print("0 PASS · 1 SKIP")
+        return 0
+
+    # Per-run-fresh identity: the Pi's regtest is shared and persistent,
+    # so a fixed NOTES_APP_SEED would accumulate notes across runs and
+    # eventually break the exact-text/exact-txid assertions below.
+    os.environ["NOTES_APP_SEED"] = secrets.token_hex(32)
+
     address = cli("address", "regtest")
     print(f"notes address: {address}")
     tmp = Path(tempfile.mkdtemp(prefix="companion_e2e_"))
@@ -229,7 +257,7 @@ def main():
         browser.close()
 
         # ---- directed notes: A sends public + private to identity B ----
-        b_env = {**os.environ, "NOTES_APP_SEED": "09" * 32}
+        b_env = {**os.environ, "NOTES_APP_SEED": secrets.token_hex(32)}
         b_address = cli("address", "regtest", env=b_env)
         browser = p.chromium.launch()
         page = browser.new_page()
@@ -270,7 +298,7 @@ def main():
 
         # A third seed cannot read B's private note.
         scan_c = json.loads(cli("scan", str(bundle_b),
-                                env={**os.environ, "NOTES_APP_SEED": "08" * 32}))
+                                env={**os.environ, "NOTES_APP_SEED": secrets.token_hex(32)}))
         assert DIRECTED_PRIV_TEXT not in [n["text"] for n in scan_c], scan_c
         print("PASS wrong-seed scan leaves the directed-private note sealed")
 
