@@ -26,6 +26,15 @@ credentials for a given network and execs a command with all five of
 these exported. This file is part of a PUBLIC repo: it must never read
 ../private/ or print a credential value.
 
+CN_WATCH_WALLET (env only, no flag) overrides the bitcoind wallet this
+server watches addresses through — default "chain-notes-watch", the
+wallet shared by every suite and every run on the Pi. A harness run
+should instead pass its OWN unique per-run wallet name (see
+ui-automation/node-suite-lib.sh) so `listtransactions "*"` in
+address_txids() below stays O(this run's handful of addresses) instead of
+O(every address any suite has ever watched). The miner wallet name is
+NOT configurable — it's ours, never shared, no cost problem to fix.
+
 Stdlib only. GET  /api/health                       → {"status":"ok","network":...,"node":"host:port","regtest":bool}
              GET  /node/api/blocks/tip/height                  (alias: /regtest/api/...)
              GET  /node/api/address/A[?new=1]            → esplora-style chain_stats/mempool_stats
@@ -61,7 +70,17 @@ HERE = Path(__file__).resolve().parent
 PAGE_SIZE = 25  # esplora /txs/chain pagination size
 
 DEFAULT_PORT_BY_NETWORK = {"regtest": 18443, "testnet4": 48332}
-WATCH_WALLET = "chain-notes-watch"  # matches the wallet already on the Pi
+# The watch wallet name is configurable (CN_WATCH_WALLET) so a harness run
+# can point this server at its OWN per-run wallet instead of the shared
+# "chain-notes-watch" — see PLAN-one-regtest-node.md, "Two things now grow
+# without bound": that wallet is shared by every suite and every run
+# forever, so `listtransactions "*"` in address_txids() below is O(all
+# history ever recorded on the node), not O(this run). Measured 2026-08-03
+# at 444 entries / 6.5-6.7s per address query with no caching or
+# improvement on repeat. Defaulting to "chain-notes-watch" keeps every
+# caller that doesn't opt in (a bare `server.py --node ... --network ...`
+# with no CN_WATCH_WALLET set) byte-identical to before.
+WATCH_WALLET = os.environ.get("CN_WATCH_WALLET", "chain-notes-watch")
 MINER_WALLET = "chain-notes-miner"  # ours; NEVER touch the Pi's `testwallet`
 DEFAULT_RPC_TIMEOUT = 60
 # A first-time `importdescriptors` at timestamp:0 is a rescan from GENESIS.

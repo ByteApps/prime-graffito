@@ -65,7 +65,18 @@ CN_NODE_PORT="${CN_NODE_PORT:-$DEFAULT_PORT}"
 CLI() { bitcoin-cli "-$CN_NETWORK" "-rpcconnect=$CN_NODE_HOST" "-rpcport=$CN_NODE_PORT" \
     "-rpcuser=$CORE_RPC_USER" "-rpcpassword=$CORE_RPC_PASS" "$@"; }
 
-WATCH_WALLET="chain-notes-watch"   # matches companion/server.py's convention — reused, not reinvented
+# Default "chain-notes-watch" matches companion/server.py's default — but
+# that wallet is SHARED by every suite and every run on the Pi, forever,
+# so a wallet-wide `listtransactions` (below, and in the `bundle`
+# subcommand) is O(all history anyone has ever recorded), not O(this
+# run) — measured 2026-08-03 at 444 entries / 6.5-6.7s per query, no
+# caching, strictly growing (PLAN-one-regtest-node.md, "Two things now
+# grow without bound"). A harness run should export CN_WATCH_WALLET to
+# its OWN unique per-run name (ui-automation/node-suite-lib.sh does this
+# and this script picks it up automatically) so this script only ever
+# scans its own handful of addresses. Unset callers keep today's shared-
+# wallet behavior unchanged.
+WATCH_WALLET="${CN_WATCH_WALLET:-chain-notes-watch}"
 MINER_WALLET="chain-notes-miner"   # ours; NEVER the Pi's `testwallet`
 IMPORT_TIMEOUT=1800                # a genuinely historical importdescriptors (timestamp:0) rescans
                                     # from genesis — free on a fresh regtest, hundreds of seconds on
