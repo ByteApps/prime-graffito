@@ -83,6 +83,19 @@ DEFAULT_PORT_BY_NETWORK = {"regtest": 18443, "testnet4": 48332}
 WATCH_WALLET = os.environ.get("CN_WATCH_WALLET", "chain-notes-watch")
 MINER_WALLET = "chain-notes-miner"  # ours; NEVER touch the Pi's `testwallet`
 DEFAULT_RPC_TIMEOUT = 60
+# How far back a lazily-imported address is scanned. 0 means GENESIS, which
+# is the only correct DEFAULT — a restore/recovery flow legitimately needs
+# history older than this process. But a genesis rescan of testnet4 (146,900+
+# blocks) takes minutes, far longer than the app's 30s HTTP timeout, so ANY
+# address this shim has not seen before kills the request that triggered it.
+#
+# A harness whose addresses are all created DURING the run can therefore set
+# CN_IMPORT_TIMESTAMP to its start time and skip the rescan entirely. That is
+# strictly a test affordance: pre-registering each address one by one is
+# whack-a-mole, because the app derives addresses dynamically and the first
+# one nobody enumerated pays full price. Leave it unset in production.
+DEFAULT_IMPORT_TIMESTAMP = int(os.environ.get("CN_IMPORT_TIMESTAMP", "0"))
+
 # A first-time `importdescriptors` at timestamp:0 is a rescan from GENESIS.
 # On the Pi's ~726-block regtest that's free — which is exactly why this
 # path shipped broken in build 52 (see regtest-hides-cost-bugs /
@@ -238,7 +251,7 @@ def ensure_address_watched(address, fresh=False):
         _watch_imported.add(address)
         return
     desc = cli_json("getdescriptorinfo", f"addr({address})")["descriptor"]
-    timestamp = "now" if fresh else 0
+    timestamp = "now" if fresh else DEFAULT_IMPORT_TIMESTAMP
     wallet(
         "importdescriptors",
         json.dumps([{"desc": desc, "timestamp": timestamp}]),
