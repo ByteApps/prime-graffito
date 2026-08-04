@@ -290,6 +290,22 @@ def sats(btc_value):
     return int(round(float(btc_value) * 1e8))
 
 
+def _parent_output(parent_txid, vout):
+    """(address, value_btc) of one output of `parent_txid` — the fallback for
+    a mempool input whose prevout bitcoind declines to inline. Best-effort:
+    an unreachable parent yields (None, 0), exactly the shape the caller
+    would otherwise have produced."""
+    try:
+        parent = cli_json("getrawtransaction", parent_txid, "1")
+    except Exception:
+        return None, 0
+    outs = parent.get("vout") or []
+    if not isinstance(vout, int) or vout >= len(outs):
+        return None, 0
+    out = outs[vout]
+    return (out.get("scriptPubKey") or {}).get("address"), out.get("value", 0)
+
+
 def esplora_tx(txid, tip):
     """Map `getrawtransaction txid 2` onto the esplora tx shape the page
     consumes (only the fields it reads)."""
@@ -303,12 +319,29 @@ def esplora_tx(txid, tip):
     for i in raw.get("vin", []):
         prevout = i.get("prevout") or {}
         spk = prevout.get("scriptPubKey") or {}
+        address, value = spk.get("address"), prevout.get("value", 0)
+        if address is None and i.get("txid") is not None:
+            # `getrawtransaction verbosity=2` OMITS prevout for MEMPOOL inputs,
+            # even when the parent is perfectly well known — verified against a
+            # live node: a mempool vin has no `prevout` key at all, a confirmed
+            # one does. Without this fallback every unconfirmed tx reports
+            # `scriptpubkey_address: null` for its inputs, and a consumer that
+            # identifies ownership by input address (chain-notes-app's
+            # spending-wallet-funded self-notes) mis-files its OWN note as
+            # `received` until a block arrives.
+            #
+            # app-core's Core RPC transport already does exactly this
+            # (`CoreRpcTransport::resolve_prevout`), and real esplora returns
+            # mempool prevouts natively, so this shim was the only thing that
+            # ever saw the gap — despite chain.rs describing the two as
+            # field-for-field mirrors.
+            address, value = _parent_output(i["txid"], i.get("vout", 0))
         vin.append({
             "txid": i.get("txid"),
             "vout": i.get("vout"),
             "prevout": {
-                "scriptpubkey_address": spk.get("address"),
-                "value": sats(prevout.get("value", 0)),
+                "scriptpubkey_address": address,
+                "value": sats(value),
             },
         })
     vout = []
