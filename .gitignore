@@ -9,3 +9,7 @@ companion/tests/screenshots/
 CLAUDE.md
 DEVELOPMENT.md
 NOTES.md
+
+# Python bytecode from companion/ and its tests
+__pycache__/
+*.pyc

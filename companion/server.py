@@ -1,37 +1,66 @@
 #!/usr/bin/env python3
 """Local companion server for prime-chain-notes.
 
-Serves the static companion page AND — when regtest is enabled — exposes a
-local Bitcoin Core regtest node through a **mempool.space-shaped API** at
-/regtest/api/*. That's the improvement over the bitcoin-gift-wallet
-pattern this borrows from: the page needs no regtest special-casing beyond
-a base-URL map, because the local shim speaks the same dialect as
+Serves the static companion page AND — when a node is configured — exposes
+a **remote** Bitcoin Core node (regtest or testnet4; reached over an SSH
+tunnel or the tailnet, never spawned locally) through a **mempool.space-
+shaped API** at /node/api/*. That's the improvement over the
+bitcoin-gift-wallet pattern this borrows from: the page needs no special-
+casing beyond a base-URL map, because the shim speaks the same dialect as
 https://mempool.space/api (esplora-style endpoints + /v1/fees, /v1/prices).
 
-Usage:
-    python3 server.py [port]                # static only (page hides regtest)
-    python3 server.py [port] --regtest      # manage a throwaway regtest node
-    python3 server.py [port] --datadir DIR  # attach to an existing regtest node
+/regtest/api/* is a **permanent alias** for /node/api/* — historical name
+(this server used to manage its own throwaway regtest node), kept forever
+because it's a wire contract with index.html, chain-scan.js, viewer.html,
+note.html and every suite. Both prefixes always answer identically.
 
-Stdlib only. GET  /api/health                    → {"status":"ok","regtest":bool}
-             GET  /regtest/api/blocks/tip/height
-             GET  /regtest/api/address/A               → esplora-style chain_stats/mempool_stats
-             GET  /regtest/api/address/A/txs[/chain][?after_txid=T]
-             GET  /regtest/api/address/A/utxo
-             GET  /regtest/api/v1/fees/recommended
-             GET  /regtest/api/v1/prices
-             POST /regtest/api/tx               (auto-mines 1 block after accept)
-             POST /regtest/api/mine?blocks=N
-             POST /regtest/api/faucet           {"address": A, "amount": btc}
+Usage:
+    python3 server.py [port]                                # static only (page hides the node)
+    python3 server.py [port] --node HOST:PORT --network NET  # NET = regtest | testnet4
+
+--node/--network fall back to the CN_NODE_HOST/CN_NODE_PORT/CN_NETWORK
+environment variables when the flags are absent. CORE_RPC_USER and
+CORE_RPC_PASS are ALWAYS read from the environment, never from a flag —
+see ../../ui-automation/node-env.sh, which decrypts the Pi's RPC
+credentials for a given network and execs a command with all five of
+these exported. This file is part of a PUBLIC repo: it must never read
+../private/ or print a credential value.
+
+CN_WATCH_WALLET (env only, no flag) overrides the bitcoind wallet this
+server watches addresses through — default "chain-notes-watch", the
+wallet shared by every suite and every run on the Pi. A harness run
+should instead pass its OWN unique per-run wallet name (see
+ui-automation/node-suite-lib.sh) so `listtransactions "*"` in
+address_txids() below stays O(this run's handful of addresses) instead of
+O(every address any suite has ever watched). The miner wallet name is
+NOT configurable — it's ours, never shared, no cost problem to fix.
+
+Stdlib only. GET  /api/health                       → {"status":"ok","network":...,"node":"host:port","regtest":bool}
+             GET  /node/api/blocks/tip/height                  (alias: /regtest/api/...)
+             GET  /node/api/address/A[?new=1]            → esplora-style chain_stats/mempool_stats
+             GET  /node/api/address/A/txs[/chain][?after_txid=T][&new=1]
+             GET  /node/api/address/A/utxo[?new=1]
+             GET  /node/api/v1/fees/recommended
+             GET  /node/api/v1/prices
+             POST /node/api/tx                 (regtest: auto-mines 1 block after accept)
+             POST /node/api/mine?blocks=N      (regtest only — 409 on testnet4, you cannot mine there)
+             POST /node/api/faucet             {"address": A, "amount": btc}  (regtest only)
+
+`?new=1` on an /address route is an opt-in hint that the address has NEVER
+been used — the caller (e.g. a suite that just derived a fresh per-run
+identity) is asserting there is no history to find. It imports the watch
+descriptor at timestamp "now" instead of 0, which bitcoind treats as "no
+rescan needed" (see ensure_address_watched). Default (no `new`, or `new=0`)
+is unchanged: timestamp 0, a real rescan, because restore/recovery flows
+depend on finding genuinely historical addresses. Getting this wrong for
+an address that DOES have history silently hides it — only pass it when
+you are certain.
 """
 
 import json
 import os
-import shutil
-import signal
 import subprocess
 import sys
-import tempfile
 import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -40,16 +69,41 @@ from urllib.parse import urlparse, parse_qs
 HERE = Path(__file__).resolve().parent
 PAGE_SIZE = 25  # esplora /txs/chain pagination size
 
-_datadir = None      # regtest datadir (managed or attached)
-_managed_proc = None  # bitcoind process if we started it
-# The managed node deliberately does NOT use bitcoind's default regtest ports.
-# 18443 is also what an SSH tunnel to a remote regtest node forwards, and what
-# any other local suite would grab, so defaulting there made a tunnel and a
-# test run mutually exclusive — the clash surfaced as a misleading "bitcoind
-# did not come up" and cost several debugging rounds. Override with
-# CN_REGTEST_RPCPORT if 18453/18454 are themselves busy.
-_rpcport = int(os.environ.get("CN_REGTEST_RPCPORT", "18453"))
-_watch_imported = set()
+DEFAULT_PORT_BY_NETWORK = {"regtest": 18443, "testnet4": 48332}
+# The watch wallet name is configurable (CN_WATCH_WALLET) so a harness run
+# can point this server at its OWN per-run wallet instead of the shared
+# "chain-notes-watch" — see PLAN-one-regtest-node.md, "Two things now grow
+# without bound": that wallet is shared by every suite and every run
+# forever, so `listtransactions "*"` in address_txids() below is O(all
+# history ever recorded on the node), not O(this run). Measured 2026-08-03
+# at 444 entries / 6.5-6.7s per address query with no caching or
+# improvement on repeat. Defaulting to "chain-notes-watch" keeps every
+# caller that doesn't opt in (a bare `server.py --node ... --network ...`
+# with no CN_WATCH_WALLET set) byte-identical to before.
+WATCH_WALLET = os.environ.get("CN_WATCH_WALLET", "chain-notes-watch")
+MINER_WALLET = "chain-notes-miner"  # ours; NEVER touch the Pi's `testwallet`
+DEFAULT_RPC_TIMEOUT = 60
+# A first-time `importdescriptors` at timestamp:0 is a rescan from GENESIS.
+# On the Pi's ~726-block regtest that's free — which is exactly why this
+# path shipped broken in build 52 (see regtest-hides-cost-bugs /
+# PLAN-one-regtest-node.md "Why he's right"). On testnet4 (~146k blocks and
+# growing) the same rescan is hundreds of seconds; the default 60s RPC
+# timeout would kill it mid-flight, so the import call alone gets a much
+# longer, bounded budget.
+IMPORT_RPC_TIMEOUT = 1800
+# bitcoind's exact wording for RPC error -4 while a wallet-level rescan
+# (ours or ANOTHER consumer's — the watch wallet is shared) is in flight:
+# "Wallet is currently rescanning. Abort existing rescan or wait." Matched
+# as a substring, deliberately narrow: -4 is a generic "wallet error" code
+# (insufficient funds, keypool exhausted, ...) and only THIS specific
+# condition is safe to retry — anything else must surface immediately.
+RESCAN_ERROR = "currently rescanning"
+
+# None => static-only mode (page hides the node). Otherwise a dict with
+# host/port/user/password/network — see parse_node_config().
+_node = None
+_watch_imported = set()  # process-local fast-path cache, NOT the only guard
+_wallets_ready = set()   # wallets we've confirmed loaded this process
 
 
 class TxNotFound(RuntimeError):
@@ -60,86 +114,145 @@ class TxNotFound(RuntimeError):
     raising a plain RuntimeError -> 400, unchanged)."""
 
 
-def cli(*args):
-    out = subprocess.run(
-        ["bitcoin-cli", "-regtest", f"-rpcport={_rpcport}",
-         f"-datadir={_datadir}", *args],
-        capture_output=True, text=True, timeout=60,
-    )
-    if out.returncode != 0:
+def cli(*args, timeout=DEFAULT_RPC_TIMEOUT, retry_budget=0):
+    """retry_budget: total extra seconds to retry a RESCAN_ERROR -4 (a
+    concurrent rescan — ours or another consumer's on the shared watch
+    wallet) with backoff, instead of surfacing it. 0 (the default, used by
+    every non-wallet RPC — they're never wallet-scoped, so this condition
+    can't occur on them) means no retry. `wallet()`/`wallet_json()` pass a
+    generous default; nothing else needs to opt in."""
+    deadline = time.time() + retry_budget
+    delay = 0.5
+    while True:
+        out = subprocess.run(
+            ["bitcoin-cli", f"-{_node['network']}",
+             f"-rpcconnect={_node['host']}", f"-rpcport={_node['port']}",
+             f"-rpcuser={_node['user']}", f"-rpcpassword={_node['password']}",
+             *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip()
         err = out.stderr.strip() or out.stdout.strip()
         if "error code: -5" in err:
             raise TxNotFound(err)
+        if "error code: -4" in err and RESCAN_ERROR in err and time.time() < deadline:
+            time.sleep(delay)
+            delay = min(delay * 2, 5.0)
+            continue
         raise RuntimeError(err)
-    return out.stdout.strip()
 
 
-def cli_json(*args):
-    return json.loads(cli(*args))
+def cli_json(*args, timeout=DEFAULT_RPC_TIMEOUT, retry_budget=0):
+    return json.loads(cli(*args, timeout=timeout, retry_budget=retry_budget))
 
 
-def wallet(*args, wallet_name="cn-watch"):
-    return cli(f"-rpcwallet={wallet_name}", *args)
+def wallet(*args, wallet_name=WATCH_WALLET, timeout=DEFAULT_RPC_TIMEOUT,
+           retry_budget=IMPORT_RPC_TIMEOUT):
+    return cli(f"-rpcwallet={wallet_name}", *args, timeout=timeout, retry_budget=retry_budget)
 
 
-def wallet_json(*args, wallet_name="cn-watch"):
-    return json.loads(wallet(*args, wallet_name=wallet_name))
-
-
-def start_managed_node():
-    global _datadir, _managed_proc
-    _datadir = tempfile.mkdtemp(prefix="cn_regtest_")
-    (Path(_datadir) / "bitcoin.conf").write_text(
-        "regtest=1\nserver=1\ntxindex=1\nfallbackfee=0.0001\n"
+def wallet_json(*args, wallet_name=WATCH_WALLET, timeout=DEFAULT_RPC_TIMEOUT,
+                 retry_budget=IMPORT_RPC_TIMEOUT):
+    return json.loads(
+        wallet(*args, wallet_name=wallet_name, timeout=timeout, retry_budget=retry_budget)
     )
-    # -rpcport/-port on the command line apply to the selected network, so
-    # they do NOT need a [regtest] section the way bitcoin.conf entries would.
-    _managed_proc = subprocess.Popen(
-        ["bitcoind", f"-datadir={_datadir}", "-regtest", "-daemon=0",
-         f"-rpcport={_rpcport}", f"-port={_rpcport + 1}"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    for _ in range(60):
+
+
+def _ensure_wallet_loaded(name, *createwallet_extra_args):
+    """Idempotent create-or-load for a wallet WE own (never testwallet).
+    Handles all three states the Pi's persistent node can hand us: the
+    wallet doesn't exist yet, it exists but isn't currently loaded, or
+    it's already loaded (by us, an earlier run, or another suite).
+    Memoized per process — once confirmed ready, no further create/load
+    RPCs are issued for it this run (mine() used to pay this on EVERY
+    call)."""
+    if name in _wallets_ready:
+        return
+    try:
+        cli("createwallet", name, *createwallet_extra_args)
+    except RuntimeError as e:
+        msg = str(e)
+        if "already exists" not in msg and "already loaded" not in msg:
+            raise
         try:
-            cli("getblockchaininfo")
-            break
-        except Exception:
-            time.sleep(0.5)
-    else:
-        raise RuntimeError("bitcoind did not come up")
-    cli("createwallet", "miner")
-    ensure_watch_wallet()
-    mine(101)
-    print(f"regtest node up (datadir {_datadir}, rpc {_rpcport}), 101 blocks mined")
+            cli("loadwallet", name)
+        except RuntimeError as e2:
+            if "already loaded" not in str(e2):
+                raise
+    _wallets_ready.add(name)
 
 
 def ensure_watch_wallet():
-    try:
-        cli("createwallet", "cn-watch", "true", "true")
-    except RuntimeError as e:
-        if "already exists" not in str(e):
-            try:
-                cli("loadwallet", "cn-watch")
-            except RuntimeError as e2:
-                if "already loaded" not in str(e2):
-                    raise
+    _ensure_wallet_loaded(WATCH_WALLET, "true", "true")  # disable_private_keys, blank
 
 
-def ensure_address_watched(address):
+def ensure_miner_wallet():
+    _ensure_wallet_loaded(MINER_WALLET)
+
+
+def _wait_for_rescan(timeout=IMPORT_RPC_TIMEOUT):
+    """Block until the watch wallet's async rescan (started by a
+    timestamp:0 importdescriptors, ours or another consumer's — the
+    wallet is shared) finishes. importdescriptors at timestamp:0 RETURNS
+    before the scan completes; every wallet RPC issued while it's still
+    running gets RPC error -4 "Wallet is currently rescanning" (the
+    build-52-shaped bug this closes). Callers of ensure_address_watched
+    must never see that error — they should just observe a delay."""
+    deadline = time.time() + timeout
+    while True:
+        info = wallet_json("getwalletinfo")
+        if not info.get("scanning"):
+            return
+        if time.time() >= deadline:
+            raise RuntimeError(
+                f"rescan on wallet {WATCH_WALLET} did not finish within {timeout}s"
+            )
+        time.sleep(1)
+
+
+def ensure_address_watched(address, fresh=False):
+    """Idempotent against the NODE, not just process memory — a fresh
+    server.py process must NOT re-import (and re-rescan-from-genesis) an
+    address the watch wallet already knows about. `_watch_imported` is
+    only a fast path on top; `getaddressinfo` is the real, node-level
+    guard. Import at timestamp:0 is required by default (addresses may
+    already have history), so the cost this avoids on a repeat hit is a
+    full rescan — free on a short regtest chain, hundreds of seconds on
+    testnet4.
+
+    `fresh=True` (routes: `?new=1`) is an opt-in from a caller who KNOWS
+    the address has no history yet (e.g. a suite's just-derived per-run
+    identity): import at timestamp "now" instead of 0, which bitcoind
+    treats as needing no rescan at all — never use this for an address
+    that might already have activity, or that history goes undiscovered.
+
+    Either way, if bitcoind DOES start an async rescan (only the
+    timestamp:0 path), block here until it finishes rather than let a
+    subsequent request race it and observe RPC -4."""
     if address in _watch_imported:
         return
     ensure_watch_wallet()
+    info = wallet_json("getaddressinfo", address)
+    if info.get("ismine") or info.get("iswatchonly"):
+        _watch_imported.add(address)
+        return
     desc = cli_json("getdescriptorinfo", f"addr({address})")["descriptor"]
+    timestamp = "now" if fresh else 0
     wallet(
         "importdescriptors",
-        json.dumps([{"desc": desc, "timestamp": 0}]),
+        json.dumps([{"desc": desc, "timestamp": timestamp}]),
+        timeout=IMPORT_RPC_TIMEOUT,
     )
+    if not fresh:
+        _wait_for_rescan()
     _watch_imported.add(address)
 
 
 def mine(blocks=1):
-    addr = wallet("getnewaddress", wallet_name="miner")
-    wallet("generatetoaddress", str(blocks), addr, wallet_name="miner")
+    ensure_miner_wallet()
+    addr = wallet("getnewaddress", wallet_name=MINER_WALLET)
+    wallet("generatetoaddress", str(blocks), addr, wallet_name=MINER_WALLET)
     # Wallet block-processing is ASYNC in bitcoind (validation-interface
     # callbacks drain on the scheduler thread AFTER generatetoaddress
     # returns) — without this, a listunspent served right after a mine can
@@ -197,10 +310,17 @@ def esplora_tx(txid, tip):
     return {"txid": txid, "status": status, "vin": vin, "vout": vout}
 
 
-def address_txids(address):
+def _wants_fresh(query):
+    """Parse the `?new=1` opt-in — see the module docstring and
+    ensure_address_watched. Absent/0/false = default (possibly-historical
+    address, real rescan)."""
+    return query.get("new", ["0"])[0].lower() in ("1", "true", "yes")
+
+
+def address_txids(address, fresh=False):
     """All wallet-known txids touching `address`, newest first (mempool
     first, then by confirmations ascending)."""
-    ensure_address_watched(address)
+    ensure_address_watched(address, fresh=fresh)
     entries = wallet_json("listtransactions", "*", "10000", "0", "true")
     seen, ordered = set(), []
     for e in sorted(entries, key=lambda e: (e.get("confirmations", 0), -e.get("time", 0))):
@@ -214,25 +334,33 @@ def address_txids(address):
 def handle_api(handler, method, path, query, body):
     tip = None
     if path == "/api/health":
-        return {"status": "ok", "regtest": _datadir is not None}
-    if _datadir is None:
-        handler.send_error(404, "regtest not enabled")
+        if _node is None:
+            return {"status": "ok", "network": None, "node": None, "regtest": False}
+        return {
+            "status": "ok",
+            "network": _node["network"],
+            "node": f"{_node['host']}:{_node['port']}",
+            "regtest": _node["network"] == "regtest",
+        }
+    if _node is None:
+        handler.send_error(404, "node not configured")
         return None
 
-    if path == "/regtest/api/blocks/tip/height":
+    if path == "/node/api/blocks/tip/height":
         return tip_height()
-    if path == "/regtest/api/v1/fees/recommended":
+    if path == "/node/api/v1/fees/recommended":
         return {"fastestFee": 3, "halfHourFee": 2, "hourFee": 1, "economyFee": 1, "minimumFee": 1}
-    if path == "/regtest/api/v1/prices":
+    if path == "/node/api/v1/prices":
         return {"time": int(time.time()), "USD": 100000}
 
     parts = path.split("/")
-    # /regtest/api/address/{addr} — esplora-style aggregate stats, no
+    # /node/api/address/{addr} — esplora-style aggregate stats, no
     # trailing sub-resource segment. Must be checked BEFORE the
     # /txs|/utxo branch below (longer `parts`) so it isn't shadowed.
     if len(parts) == 5 and parts[3] == "address" and parts[4]:
         address = parts[4]
-        ensure_address_watched(address)
+        fresh = _wants_fresh(query)
+        ensure_address_watched(address, fresh=fresh)
         tip = tip_height()
         stats = {
             "chain_stats": {
@@ -247,7 +375,7 @@ def handle_api(handler, method, path, query, body):
         # address_txids is already ordered deterministically (newest
         # first); iterate that order so repeated calls with no chain/
         # mempool change produce byte-identical output.
-        for txid in address_txids(address):
+        for txid in address_txids(address, fresh=fresh):
             tx = esplora_tx(txid, tip)
             bucket = stats["chain_stats"] if tx["status"]["confirmed"] else stats["mempool_stats"]
             touches = False
@@ -266,12 +394,13 @@ def handle_api(handler, method, path, query, body):
                 bucket["tx_count"] += 1
         return stats
 
-    # /regtest/api/address/{addr}/txs[/chain]
+    # /node/api/address/{addr}/txs[/chain]
     if len(parts) >= 6 and parts[3] == "address" and parts[5] in ("txs", "utxo"):
         address = parts[4]
+        fresh = _wants_fresh(query)
         tip = tip_height()
         if parts[5] == "utxo":
-            ensure_address_watched(address)
+            ensure_address_watched(address, fresh=fresh)
             utxos = wallet_json("listunspent", "0", "9999999", json.dumps([address]))
             return [
                 {
@@ -285,7 +414,7 @@ def handle_api(handler, method, path, query, body):
                 }
                 for u in utxos
             ]
-        txids = address_txids(address)
+        txids = address_txids(address, fresh=fresh)
         chain_only = len(parts) >= 7 and parts[6] == "chain"
         after = query.get("after_txid", [None])[0]
         txs = [esplora_tx(t, tip) for t in txids]
@@ -306,14 +435,14 @@ def handle_api(handler, method, path, query, body):
             txs = txs[idx + 1:] if idx is not None else []
         return txs[:50 if not chain_only else PAGE_SIZE]
 
-    # /regtest/api/tx/{txid}[/hex] — single-tx lookup (esplora shape / raw hex),
+    # /node/api/tx/{txid}[/hex] — single-tx lookup (esplora shape / raw hex),
     # what the chain-notes-app watch-mode bump/rebroadcast path reads.
     if method == "GET" and len(parts) >= 5 and parts[3] == "tx" and parts[4]:
         if len(parts) >= 6 and parts[5] == "hex":
             return cli("getrawtransaction", parts[4])
         return esplora_tx(parts[4], tip_height())
 
-    if method == "POST" and path == "/regtest/api/tx":
+    if method == "POST" and path == "/node/api/tx":
         raw_hex = body.decode().strip()
         accept = cli_json("testmempoolaccept", json.dumps([raw_hex]))[0]
         if not accept.get("allowed"):
@@ -324,19 +453,40 @@ def handle_api(handler, method, path, query, body):
             handler.wfile.write(f"sendrawtransaction RPC error: {reason}".encode())
             return None
         txid = cli("sendrawtransaction", raw_hex)
-        mine(1)  # regtest convenience: instant confirmation
+        if _node["network"] == "regtest":
+            mine(1)  # regtest convenience: instant confirmation
+        # testnet4: a successful broadcast IS the observable — there is no
+        # "mine a block" equivalent (see PLAN-one-regtest-node.md's
+        # settle/confirm split). Leave it unconfirmed in the mempool.
         return txid
 
-    if method == "POST" and path == "/regtest/api/mine":
+    if method == "POST" and path == "/node/api/mine":
+        if _node["network"] != "regtest":
+            handler.send_response(409)
+            handler.send_header("Content-Type", "text/plain")
+            handler.end_headers()
+            handler.wfile.write(
+                f"cannot mine on {_node['network']}: mining is regtest-only".encode()
+            )
+            return None
         n = int(query.get("blocks", ["1"])[0])
         mine(n)
         return {"mined": n, "tip": tip_height()}
 
-    if method == "POST" and path == "/regtest/api/faucet":
+    if method == "POST" and path == "/node/api/faucet":
+        if _node["network"] != "regtest":
+            handler.send_response(409)
+            handler.send_header("Content-Type", "text/plain")
+            handler.end_headers()
+            handler.wfile.write(
+                f"cannot fund on {_node['network']}: faucet is regtest-only".encode()
+            )
+            return None
         req = json.loads(body or b"{}")
+        ensure_miner_wallet()
         txid = wallet(
             "sendtoaddress", req["address"], str(req.get("amount", 0.001)),
-            wallet_name="miner",
+            wallet_name=MINER_WALLET,
         )
         mine(1)
         return {"txid": txid}
@@ -354,7 +504,13 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _dispatch(self, method):
         parsed = urlparse(self.path)
-        if not (parsed.path.startswith("/api/") or parsed.path.startswith("/regtest/api/")):
+        path = parsed.path
+        # /regtest/api/* is a permanent alias for /node/api/* — see the
+        # module docstring. Normalize once, here, so every route body
+        # below is written exactly once against the canonical prefix.
+        if path == "/regtest/api" or path.startswith("/regtest/api/"):
+            path = "/node/api" + path[len("/regtest/api"):]
+        if not (path.startswith("/api/") or path.startswith("/node/api/")):
             if method == "GET":
                 return super().do_GET()
             return self.send_error(405)
@@ -363,7 +519,7 @@ class Handler(SimpleHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
         try:
-            result = handle_api(self, method, parsed.path, parse_qs(parsed.query), body)
+            result = handle_api(self, method, path, parse_qs(parsed.query), body)
         except TxNotFound:
             self.send_response(404)
             self.send_header("Content-Type", "text/plain")
@@ -394,38 +550,82 @@ class Handler(SimpleHTTPRequestHandler):
         self._dispatch("POST")
 
 
-def main():
-    global _datadir
+def parse_node_config(argv):
+    """Resolve --node/--network (+ CN_NODE_HOST/CN_NODE_PORT/CN_NETWORK env
+    fallbacks) into (port, node_config). node_config is None for static-only
+    mode — no --network flag AND no CN_NETWORK env var. CORE_RPC_USER /
+    CORE_RPC_PASS are ALWAYS read from the environment, never a flag."""
     port = 8091
-    regtest = False
-    args = sys.argv[1:]
+    node_arg = None
+    network = None
+    args = list(argv)
     while args:
         a = args.pop(0)
-        if a == "--regtest":
-            regtest = True
-        elif a == "--datadir":
-            _datadir = args.pop(0)
+        if a == "--node":
+            if not args:
+                sys.exit("server.py: --node requires HOST:PORT")
+            node_arg = args.pop(0)
+        elif a == "--network":
+            if not args:
+                sys.exit("server.py: --network requires regtest or testnet4")
+            network = args.pop(0)
         elif a.isdigit():
             port = int(a)
-    if regtest and _datadir is None:
-        start_managed_node()
-    elif _datadir:
-        ensure_watch_wallet()
-        print(f"attached to regtest node at {_datadir}")
+        else:
+            sys.exit(f"server.py: unrecognized argument {a!r}")
 
-    def shutdown(*_):
-        if _managed_proc:
-            try:
-                cli("stop")
-                _managed_proc.wait(timeout=15)
-            except Exception:
-                _managed_proc.kill()
-            shutil.rmtree(_datadir, ignore_errors=True)
-        sys.exit(0)
+    network = network or os.environ.get("CN_NETWORK")
+    if node_arg is not None and network is None:
+        sys.exit(
+            "server.py: --node was given without --network (or CN_NETWORK) — "
+            "pass --network regtest|testnet4, or drop --node for static-only mode"
+        )
+    if network is None:
+        return port, None
+    if network not in DEFAULT_PORT_BY_NETWORK:
+        sys.exit(f"server.py: --network must be regtest or testnet4, got {network!r}")
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
-    print(f"companion on http://localhost:{port}  (regtest: {'on' if _datadir else 'off'})")
+    host = None
+    node_port = None
+    if node_arg:
+        if ":" not in node_arg:
+            sys.exit("server.py: --node must be HOST:PORT")
+        host, _, port_str = node_arg.rpartition(":")
+        try:
+            node_port = int(port_str)
+        except ValueError:
+            sys.exit(f"server.py: --node port must be numeric, got {port_str!r}")
+    host = host or os.environ.get("CN_NODE_HOST") or "127.0.0.1"
+    if node_port is None:
+        env_port = os.environ.get("CN_NODE_PORT")
+        node_port = int(env_port) if env_port else DEFAULT_PORT_BY_NETWORK[network]
+
+    user = os.environ.get("CORE_RPC_USER")
+    password = os.environ.get("CORE_RPC_PASS")
+    if not user or not password:
+        sys.exit(
+            "server.py: CORE_RPC_USER and CORE_RPC_PASS must be set in the "
+            "environment (see ui-automation/node-env.sh, which supplies them "
+            "for a given network)."
+        )
+
+    return port, {
+        "host": host, "port": node_port,
+        "user": user, "password": password,
+        "network": network,
+    }
+
+
+def main():
+    global _node
+    port, _node = parse_node_config(sys.argv[1:])
+
+    if _node:
+        print(f"companion node mode: {_node['network']} @ {_node['host']}:{_node['port']}")
+    else:
+        print("companion static-only (no --network / CN_NETWORK given)")
+
+    print(f"companion on http://localhost:{port}  (node: {_node['network'] if _node else 'off'})")
     # request_queue_size: the default listen backlog (5) is too small for
     # the chain-notes-app's scan workers — each opens its own connection,
     # and a burst of queued scans can fill the backlog so a broadcast

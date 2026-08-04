@@ -1,17 +1,33 @@
 #!/usr/bin/env python3
 """Leg-2 companion verification, no camera needed:
 
-1. Build a bundle through the page (regtest server on :8091), click
-   "Show as QR" → STATIC case: decode the rendered QR image (cv2),
+1. Build a bundle through the page (server on :8091, regtest or
+   testnet4), click "Show as QR" → STATIC case: decode the rendered QR
+   image (cv2),
    strip CNB1, inflate, compare to the bundle JSON.
 2. Force the ANIMATED path (payload > threshold): collect the UR part
    strings the page generated and feed them into notes-core's ur_decode
    example — the EXACT decoder (foundation-ur) the device scanner runs —
    then strip/inflate/compare again.
 
-Prereqs: server.py 8091 --regtest running; cargo examples built.
+Prereqs: companion/server.py serving :8091, pointed at the ONE shared
+node — the Pi's persistent regtest or testnet4 chain, never a local
+throwaway one (PLAN-one-regtest-node.md):
+
+    ../../../ui-automation/node-env.sh <regtest|testnet4> python3 companion/server.py 8091
+
+and cargo examples built. This leg never faucets or mines — it only
+builds a bundle and round-trips it through the QR encoder/decoder — so
+unlike test_companion_regtest.py it genuinely runs on either network,
+selected via CN_NETWORK (default regtest). Each run still derives a
+fresh NOTES_APP_SEED: the shared chain persists across runs, and a
+growing on-chain history at a fixed address could eventually push the
+bundle past the static/animated QR size threshold and change which path
+the first click exercises.
 """
 
+import os
+import secrets
 import subprocess
 import zlib
 from pathlib import Path
@@ -24,6 +40,8 @@ NOTES_CLI = REPO / "target/debug/examples/notes_cli"
 UR_DECODE = REPO / "target/debug/examples/ur_decode"
 SHOTS = Path(__file__).resolve().parent / "screenshots"
 SHOTS.mkdir(exist_ok=True)
+
+NETWORK = os.environ.get("CN_NETWORK", "regtest")
 
 
 def inflate_cnb1(payload: bytes) -> str:
@@ -50,15 +68,19 @@ async () => {
 
 
 def main():
+    # Per-run-fresh identity — see the module docstring.
+    cli_env = {**os.environ, "NOTES_APP_SEED": secrets.token_hex(32)}
     address = subprocess.run(
-        [str(NOTES_CLI), "address", "regtest"], capture_output=True, text=True
+        [str(NOTES_CLI), "address", NETWORK], capture_output=True, text=True, env=cli_env
     ).stdout.strip()
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
         page.goto(BASE)
-        page.wait_for_function("document.querySelector('#modePill').textContent.includes('regtest')")
+        page.wait_for_function(
+            f"document.querySelector('#modePill').textContent.includes('{NETWORK}')"
+        )
         page.fill("#address", address)
         page.click("#buildBtn")
         page.wait_for_function(
