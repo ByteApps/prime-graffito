@@ -322,7 +322,7 @@ def main():
         assert "from " in shown, shown
         viewer.screenshot(path=str(SHOTS / "companion-directed.png"), full_page=True)
         # note.html permalink on the received public note still works.
-        viewer.click(f'#notes a[href*="note={send_pub["note_id"]}"]')
+        viewer.click(f'#notes a[href*="note={send_pub["txid"]}"]')
         wait_log("#note", DIRECTED_PUB_TEXT, viewer)
         viewer.close()
         print("PASS viewer at B shows received notes (from pill, sealed private, permalink)")

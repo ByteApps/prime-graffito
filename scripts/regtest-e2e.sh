@@ -29,7 +29,7 @@
 # (the notes address, and the B/C/D directed-note recipients) uses a FRESH
 # random seed each run, so no address any assertion depends on has ever
 # been touched by a previous run — the same technique
-# chain-notes-app/scripts/regtest-e2e.sh's --pi-regtest mode uses.
+# graffito/scripts/regtest-e2e.sh's --pi-regtest mode uses.
 #
 # `settle`/`confirm` two-verb split (see the plan's "Two verbs, not one"):
 #   settle  = make the chain reflect a broadcast tx. Regtest: mine 1 block
@@ -235,7 +235,7 @@ settle() { # txid (optional on regtest, ignored there)
 # --- funding: regtest spends FROM the Pi's testwallet (never created/
 # loaded/reset by us); testnet4 spends from a separate gift-wallet WIF via
 # a hand-built raw tx (no wallet import, no rescan) — see
-# chain-notes-app/scripts/testnet4-live.sh, which this mirrors. -------------
+# graffito/scripts/testnet4-live.sh, which this mirrors. -------------
 CN_FUND_SATS="${CN_FUND_SATS:-100000}"   # 0.001 BTC, matches the pre-shared-node default
 
 fund_addr() { # dest_addr sats -> echoes txid
@@ -251,7 +251,7 @@ fund_addr() { # dest_addr sats -> echoes txid
 
 fund_from_wif() { # dest_addr sats -> echoes txid  (testnet4 only)
     local dest="$1" sats="$2"
-    : "${FUND_WIF:?testnet4 funding needs FUND_WIF in the environment (never printed) — see chain-notes-app/scripts/testnet4-live.sh}"
+    : "${FUND_WIF:?testnet4 funding needs FUND_WIF in the environment (never printed) — see graffito/scripts/testnet4-live.sh}"
     local cap="${CN_FUND_SATS_CAP:-200000}"
     (( sats <= cap )) || fail "refusing to fund $sats sats > cap $cap sats (CN_FUND_SATS_CAP)"
     local fund_addr="${CN_FUND_ADDR:-tb1q2ylq48ne37ng9clds23xjcrxp8hmn707j5vpyk}"
@@ -309,7 +309,7 @@ if [[ "$CN_NETWORK" == regtest ]]; then
 fi
 
 # Fresh, never-before-touched identity every run (the node is shared and
-# persistent) — mirrors chain-notes-app/scripts/regtest-e2e.sh --pi-regtest.
+# persistent) — mirrors graffito/scripts/regtest-e2e.sh --pi-regtest.
 export NOTES_APP_SEED="$(rand32)"
 
 ADDR="$("$NOTES" address "$CN_NETWORK")"
