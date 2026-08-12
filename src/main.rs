@@ -14,7 +14,7 @@ use notes_core::bundle::{
     sealed_note_payloads, sealed_note_payloads_multi, Identity, SyncBundle,
 };
 use notes_core::address::p2tr_script_pubkey;
-use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
+use notes_core::keys::generate_aux_rand;
 use notes_core::tx::{
     build_note_tx_mixed_exact_anchored_multi, build_sweep_tx_multi, estimate_sweep_vsize,
     estimate_vsize_mixed, InputKind, LockTimePolicy, MixedInput, NoteTx, SweepSource, Utxo,
@@ -96,7 +96,11 @@ const OUTBOX_DIR: &str = "/chain-notes/outbox";
 
 #[derive(Serialize, Deserialize, Clone)]
 struct NoteRec {
-    id: String, // note_id hex
+    /// The note's id IS its txid (lowercase hex) — PLAN-pnte-redesign.md,
+    /// one note = one tx. `txid` below is now always equal to this; kept
+    /// as a separate field for back-compat with call sites/UI bindings
+    /// that read it distinctly.
+    id: String,
     text: String,
     private: bool,
     txid: String,
@@ -274,7 +278,6 @@ struct Plan {
     note: NoteTx,
     text: String,
     private: bool,
-    note_id: [u8; 4],
     chunks: u64,
     /// Every recipient of this directed note, in output/wrap order (empty
     /// for a self-note). `recipient` stays as the FIRST entry (or None) for
@@ -767,21 +770,8 @@ fn to_label_for(st: &State, address: &str) -> String {
 /// single-taproot-input vsize that helper returns.
 fn payload_lens_for(text_len: usize, private: bool, max_op_return_bytes: usize) -> Result<Vec<usize>, String> {
     let body_len = if private { text_len + notes_core::crypt::SEAL_OVERHEAD } else { text_len };
-    if body_len == 0 {
-        return Err("empty body".into());
-    }
-    if max_op_return_bytes <= notes_core::envelope::HEADER_LEN {
-        return Err("max_payload smaller than header".into());
-    }
-    let chunk_size = max_op_return_bytes - notes_core::envelope::HEADER_LEN;
-    let total = body_len.div_ceil(chunk_size);
-    if total > u8::MAX as usize {
-        return Err("too large (> 255 chunks)".into());
-    }
-    let mut payload_lens = vec![max_op_return_bytes; total - 1];
-    let tail = body_len - (total - 1) * chunk_size;
-    payload_lens.push(notes_core::envelope::HEADER_LEN + tail);
-    Ok(payload_lens)
+    notes_core::envelope::payload_lens_for(0, None, body_len, max_op_return_bytes)
+        .map_err(|e| e.to_string())
 }
 
 /// The active notebook's (rotation seed, BIP-86 account) context — the same
@@ -1005,18 +995,16 @@ fn confirm_self_spks(
 /// isn't readable here either way); no PNTE output at all returns `None`
 /// (hides the confirm screen's NOTE block).
 fn confirm_note_preview(outputs: &[notes_core::tx::TxOut]) -> Option<String> {
-    for o in outputs {
-        let Some(payload) = notes_core::tx::op_return_payload(&o.script_pubkey) else { continue };
-        let Some(chunk) = notes_core::envelope::decode(payload) else { continue };
-        if chunk.flags & notes_core::envelope::FLAG_PRIVATE != 0 {
-            return Some("Private note (encrypted)".to_string());
-        }
-        return Some(match notes_core::envelope::reassemble(&[chunk]) {
-            Ok(body) => String::from_utf8(body).unwrap_or_else(|_| "(unreadable note)".to_string()),
-            Err(_) => "(unreadable note)".to_string(),
-        });
+    let payloads: Vec<Vec<u8>> = outputs
+        .iter()
+        .filter_map(|o| notes_core::tx::op_return_payload(&o.script_pubkey))
+        .map(<[u8]>::to_vec)
+        .collect();
+    let decoded = notes_core::envelope::decode_note(&payloads)?;
+    if decoded.is_private() {
+        return Some("Private note (encrypted)".to_string());
     }
-    None
+    Some(String::from_utf8(decoded.body).unwrap_or_else(|_| "(unreadable note)".to_string()))
 }
 
 /// Populate `ConfirmSign` from notes-core's byte-truth decode of `raw_hex`
@@ -2779,11 +2767,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
                 drop(ix);
 
-                // (note_id, note, spending inputs spent, spending change addr
-                // to mark used, change went to notebook?, mandatory notebook
-                // dust output present?)
+                // (note, spending inputs spent, spending change addr to mark
+                // used, change went to notebook?, mandatory notebook dust
+                // output present?) — the note's id IS its txid
+                // (`note.txid_hex`), known only once the tx is fully built
+                // below (PLAN-pnte-redesign.md: one note = one tx).
                 type ComposeOut = (
-                    [u8; 4],
                     NoteTx,
                     Vec<(String, u32)>,
                     Option<spending::SpendingAddress>,
@@ -2795,11 +2784,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     .ok_or_else(|| "identity unavailable".to_string())
                     .and_then(|id| {
                         let rate = resolve_rate(tier, &rate_text, &st)?;
-                        let note_id = pick_unique_note_id(generate_note_id, |id| {
-                            let id_hex = hex::encode(id);
-                            st.notes.iter().any(|n| n.id == id_hex)
-                        })
-                        .map_err(|e| e.to_string())?;
                         // Full recipient list (primary + every "+ Add
                         // recipient" row), each carrying the same gift
                         // amount — order matches notes-core's own output
@@ -2858,10 +2842,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     &st.core_utxos(),
                                     &text,
                                     private,
-                                    note_id,
                                     &recipients_vec,
                                     content_key,
-                                    Some(&change_spk),
+                                    Some(change_spk.as_slice()),
                                     st.effective_chunk(),
                                     rate,
                                     resolve_locktime(*lock_policy.borrow(), st.tip_height),
@@ -2873,8 +2856,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     &st.core_utxos(),
                                     &text,
                                     private,
-                                    note_id,
-                                    Some(&change_spk),
+                                    Some(change_spk.as_slice()),
                                     st.effective_chunk(),
                                     rate,
                                     resolve_locktime(*lock_policy.borrow(), st.tip_height),
@@ -2882,7 +2864,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 )
                             }
                             .map_err(|e| e.to_string())?;
-                            Ok((note_id, note, Vec::new(), None, change_is_notebook, false))
+                            Ok((note, Vec::new(), None, change_is_notebook, false))
                         } else if !sp_participates {
                             // Notebook-only coin control (a subset was
                             // explicitly picked, or explicitly re-confirmed).
@@ -2918,10 +2900,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     &inputs,
                                     &text,
                                     private,
-                                    note_id,
                                     &recipients_vec,
                                     content_key,
-                                    Some(&change_spk),
+                                    Some(change_spk.as_slice()),
                                     st.effective_chunk(),
                                     rate,
                                     resolve_locktime(*lock_policy.borrow(), st.tip_height),
@@ -2933,8 +2914,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     &inputs,
                                     &text,
                                     private,
-                                    note_id,
-                                    Some(&change_spk),
+                                    Some(change_spk.as_slice()),
                                     st.effective_chunk(),
                                     rate,
                                     resolve_locktime(*lock_policy.borrow(), st.tip_height),
@@ -2942,7 +2922,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 )
                             }
                             .map_err(|e| e.to_string())?;
-                            Ok((note_id, note, Vec::new(), None, change_is_notebook, false))
+                            Ok((note, Vec::new(), None, change_is_notebook, false))
                         } else {
                             // Spending-wallet participates (pure spending or
                             // mixed with notebook coins) — mixed builder. The
@@ -3002,6 +2982,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             if mixed_inputs.is_empty() {
                                 return Err("Select at least one coin to pay from.".into());
                             }
+                            // The tx's FIRST input's outpoint — the mixed
+                            // builder below keeps `mixed_inputs` order
+                            // verbatim (notebook inputs first, then
+                            // spending), so `mixed_inputs[0]` IS the tx's
+                            // first input; every sealed body's AAD binds to
+                            // it (crypt.rs/dm.rs's uniform outpoint rule,
+                            // PLAN-pnte-redesign.md).
+                            let outpoint = notes_core::tx::outpoint_bytes(&mixed_inputs[0].utxo);
                             // `sealed_note_payloads_multi` has no self-note
                             // case (errors on an empty recipients slice —
                             // notes-core bundle.rs:876), so a self-note
@@ -3027,7 +3015,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                         &text,
                                         private,
                                         &recips,
-                                        note_id,
+                                        outpoint,
                                         content_key,
                                         st.effective_chunk(),
                                     )
@@ -3041,7 +3029,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                         &text,
                                         private,
                                         None,
-                                        note_id,
+                                        outpoint,
                                         st.effective_chunk(),
                                     )
                                     .map_err(|e| e.to_string())?;
@@ -3084,7 +3072,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             // wire shape.
                             let notebook_dust = !has_notebook_input;
                             Ok((
-                                note_id,
                                 note,
                                 spent_spending,
                                 change_addr,
@@ -3095,7 +3082,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     });
                 ui.global::<Ui>().set_busy(false);
                 match result {
-                    Ok((note_id, note, spending_spent, spending_change_addr, change_is_notebook, notebook_dust)) => {
+                    Ok((note, spending_spent, spending_change_addr, change_is_notebook, notebook_dust)) => {
                         let chunks = note
                             .tx
                             .outputs
@@ -3285,7 +3272,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     note,
                                     text,
                                     private,
-                                    note_id,
                                     chunks,
                                     recipients: recipients_display.clone(),
                                     spending_spent,
@@ -3589,7 +3575,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         }
 
                         let rec = NoteRec {
-                            id: hex::encode(p.note_id),
+                            id: p.note.txid_hex.clone(),
                             text: p.text.clone(),
                             private: p.private,
                             txid: p.note.txid_hex.clone(),
@@ -3622,9 +3608,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             r
                         });
                         log::info!(
-                            "cb: sign-note id={} txid={} fee={} vsize={} internal={} airlock={}",
+                            "cb: sign-note id={} fee={} vsize={} internal={} airlock={}",
                             rec.id,
-                            rec.txid,
                             rec.fee,
                             rec.vsize,
                             if internal.is_ok() { "ok" } else { "err" },
@@ -3906,12 +3891,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let mut new_notes = 0usize;
                 let mut received_notes = 0usize;
                 for r in &recovered {
-                    let id_hex = hex::encode(r.note_id);
+                    let id_hex = r.id.clone();
                     if r.received {
                         received_notes += 1;
                     }
                     // Merge keyed by (id, from): a received note can never
-                    // overwrite an own note sharing its note_id.
+                    // overwrite an own note sharing its id (its txid).
                     match st
                         .notes
                         .iter_mut()
@@ -3927,7 +3912,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         None => {
                             new_notes += 1;
                             st.notes.push(NoteRec {
-                                id: id_hex,
+                                id: id_hex.clone(),
                                 text: r.text.clone().unwrap_or_else(|| {
                                     if r.received {
                                         "(directed note — could not decrypt)".into()
@@ -3936,7 +3921,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     }
                                 }),
                                 private: r.private,
-                                txid: r.txids.first().cloned().unwrap_or_default(),
+                                txid: id_hex,
                                 raw_hex: String::new(),
                                 fee: 0,
                                 vsize: 0,
@@ -5289,20 +5274,24 @@ fn psbt_fee(p: &notes_core::psbt::Psbt) -> u64 {
 
 /// A one-line note summary decoded from the PSBT's OP_RETURN output.
 fn psbt_note_summary(p: &notes_core::psbt::Psbt) -> String {
-    for o in &p.unsigned_tx.outputs {
-        if let Some(payload) = notes_core::tx::op_return_payload(&o.script_pubkey) {
-            let Some(chunk) = notes_core::envelope::decode(payload) else { continue };
-            if chunk.flags & notes_core::envelope::FLAG_PRIVATE != 0 {
-                return "Note: encrypted".into();
-            }
-            if let Ok(body) = notes_core::envelope::reassemble(&[chunk]) {
-                if let Ok(t) = String::from_utf8(body) {
-                    let short: String = t.chars().take(40).collect();
-                    return format!("Note: {short}");
-                }
-            }
-            return "Note: (public)".into();
-        }
+    let payloads: Vec<Vec<u8>> = p
+        .unsigned_tx
+        .outputs
+        .iter()
+        .filter_map(|o| notes_core::tx::op_return_payload(&o.script_pubkey))
+        .map(<[u8]>::to_vec)
+        .collect();
+    let Some(decoded) = notes_core::envelope::decode_note(&payloads) else {
+        return "Note: (no note found)".into();
+    };
+    if decoded.is_private() {
+        return "Note: encrypted".into();
     }
-    "Note: (no note found)".into()
+    match String::from_utf8(decoded.body) {
+        Ok(t) => {
+            let short: String = t.chars().take(40).collect();
+            format!("Note: {short}")
+        }
+        Err(_) => "Note: (public)".into(),
+    }
 }

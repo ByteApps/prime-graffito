@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 // Unit test for the shipped companion/chain-scan.js (the JS port of the
-// FROZEN PNTE envelope + extract_notes): cross-transaction reassembly,
-// duplicate-chunk dedup, partial surfacing, and the directed-notes
+// FROZEN PNTE envelope + extract_notes), PLAN-pnte-redesign.md shape: one
+// note = one transaction, id = txid, multiple OP_RETURN outputs of the
+// SAME tx concatenate in vout order (header only on the first) — no more
+// cross-tx chunk reassembly, no more note_id.
+//
+// Covers: intra-tx multi-output concatenation, the directed-notes
 // acceptance rules — own notes need spends-from-self (spoof resistance),
 // pays-me PNTE txs surface as RECEIVED notes attributed to their taproot
-// input, and own/received buckets never merge even on a note_id collision.
-// Also covers the funding-unification myAddresses extension (mirrors
+// input — and the funding-unification myAddresses extension (mirrors
 // notes-core's extract_notes_multi self-spk-SET rule): additive-only, old
 // 2-arg callers byte-identical, an unrelated address never falsely OWNs.
 // And the 2026-07-18 DISPLAY-OWNER dedup (`notebookAddresses`, mirrors
@@ -32,18 +35,45 @@ const NB2 = "bcrt1pnotebooktwoaddress";     // a SIBLING notebook address (also 
 const FLAG_PRIVATE = 0x01;
 const FLAG_DIRECTED = 0x02;
 
-// OP_RETURN spk: PNTE || v1 || flags || note_id || seq || total || data
-function chunkSpk(noteId, seq, total, flags, dataUtf8) {
-  const payload = "504e544501" + flags.toString(16).padStart(2, "0") + noteId +
-    seq.toString(16).padStart(2, "0") + total.toString(16).padStart(2, "0") +
-    Buffer.from(dataUtf8, "utf8").toString("hex");
-  return "6a" + (payload.length / 2).toString(16).padStart(2, "0") + payload;
+const hexByte = (n) => n.toString(16).padStart(2, "0");
+const utf8Hex = (s) => Buffer.from(s, "utf8").toString("hex");
+
+// "PNTE" || '1' || flags(2 ASCII hex chars) || [count(2 ASCII hex chars)
+// iff multi] || ' ' (envelope.rs::build_header, PLAN-pnte-redesign.md).
+// The WHOLE header is printable ASCII, so build it as a string and hex-
+// encode once — the flags/count fields are ASCII hex DIGITS, not raw
+// binary bytes (e.g. flags=6 is the two wire bytes '0','6', not 0x06).
+function pnteHeaderHex(flags, multiCount) {
+  let s = "PNTE1" + hexByte(flags);
+  if (multiCount != null) s += hexByte(multiCount);
+  s += " ";
+  return utf8Hex(s);
 }
 
-// A tx carrying `spks` OP_RETURNs. opts: vinAddr (single prevout address),
-// vinAddrs (MULTIPLE prevout addresses, in tx order — overrides vinAddr;
-// for the DISPLAY-OWNER dedup tests), voutAddrs (non-OP_RETURN payment
-// outputs, in order).
+// OP_RETURN scriptPubKey around a hex payload (matches chain-scan.js's
+// opReturnPayload decode: <=75 direct push, 76-255 OP_PUSHDATA1).
+function opReturnSpk(payloadHex) {
+  const len = payloadHex.length / 2;
+  let pushHex;
+  if (len <= 75) pushHex = hexByte(len);
+  else if (len <= 255) pushHex = "4c" + hexByte(len);
+  else throw new Error("payload too long for this test helper");
+  return "6a" + pushHex + payloadHex;
+}
+
+// The FIRST OP_RETURN output of a note tx: header + this piece's body.
+function headSpk(flags, dataUtf8, multiCount) {
+  return opReturnSpk(pnteHeaderHex(flags, multiCount) + utf8Hex(dataUtf8));
+}
+// A LATER OP_RETURN output of the same tx: raw body bytes, no header.
+function bodySpk(dataUtf8) {
+  return opReturnSpk(utf8Hex(dataUtf8));
+}
+
+// A tx carrying `spks` OP_RETURNs (vout order = array order). opts: vinAddr
+// (single prevout address), vinAddrs (MULTIPLE prevout addresses, in tx
+// order — overrides vinAddr; for the DISPLAY-OWNER dedup tests), voutAddrs
+// (non-OP_RETURN payment outputs, in order).
 function tx(txid, spks, height, opts = {}) {
   const vinAddrs = opts.vinAddrs ?? [opts.vinAddr ?? ADDR];
   const voutAddrs = opts.voutAddrs ?? [ADDR];
@@ -64,44 +94,31 @@ function tx(txid, spks, height, opts = {}) {
 }
 
 const HISTORIES = {
-  // "hello world" own public note: seq 1 in the newer tx, seq 0 in the older.
-  cross: [
-    tx("tx_two", [chunkSpk("aabbccdd", 1, 2, 0, "world")], 102),
-    tx("tx_one", [chunkSpk("aabbccdd", 0, 2, 0, "hello ")], 101),
+  // Intra-tx multi-output concatenation (PLAN-pnte-redesign.md's
+  // replacement for the old cross-tx chunking): ONE tx, two OP_RETURN
+  // outputs — the header + "hello " on the first, raw "world" on the
+  // second — must concatenate into one note, in vout order.
+  multiOutput: [
+    tx("tx_multi", [headSpk(0, "hello "), bodySpk("world")], 101),
   ],
-  // Same note, but the tx carrying seq=1 never made it on-chain.
-  missing: [
-    tx("tx_one", [chunkSpk("aabbccdd", 0, 2, 0, "hello ")], 101),
+  // A tx with an invalid header (bad version byte) must be foreign/nonPnte,
+  // never a crash, even though it's own-spent and otherwise well formed.
+  badHeader: [
+    tx("tx_bad", [opReturnSpk(utf8Hex("PNTE2 wrong version"))], 102),
   ],
-  // Overlapping txs re-carry an identical chunk (must dedup, not error),
-  // a PRIVATE cross-tx note must reassemble but stay text:null, and a
-  // pays-me tx from a non-taproot spender reusing an OWN note_id becomes a
-  // RECEIVED note (from unknown) without contaminating the own bucket.
-  dedup: [
-    tx("tx_dup", [chunkSpk("aabbccdd", 0, 2, 0, "hello ")], 103),
-    tx("tx_two", [chunkSpk("aabbccdd", 1, 2, 0, "world")], 102),
-    tx("tx_one", [chunkSpk("aabbccdd", 0, 2, 0, "hello ")], 101),
-    tx("tx_priv2", [chunkSpk("11223344", 1, 2, FLAG_PRIVATE, "\x02\x03")], 105),
-    tx("tx_priv1", [chunkSpk("11223344", 0, 2, FLAG_PRIVATE, "\x00\x01")], 104),
-    // note_id collision from outside: pays ADDR, spends from a v0 address.
-    tx("tx_collide", [chunkSpk("aabbccdd", 0, 1, 0, "EVIL!!")], 106, { vinAddr: V0 }),
-  ],
-  // Directed notes at the RECIPIENT (ADDR): a two-tx public note and a
-  // private one from PEER; plus a non-PNTE pays-me tx and a tx that
-  // neither spends from nor pays ADDR (pure foreign).
+  // Directed notes at the RECIPIENT (ADDR): a public and a private note
+  // from PEER; plus a non-PNTE pays-me tx and a tx that neither spends
+  // from nor pays ADDR (pure foreign).
   directed: [
-    tx("tx_dm2", [chunkSpk("cafebabe", 1, 2, FLAG_DIRECTED, "you!")], 202, { vinAddr: PEER }),
-    tx("tx_dm1", [chunkSpk("cafebabe", 0, 2, FLAG_DIRECTED, "note for ")], 201, { vinAddr: PEER }),
-    tx("tx_dmp", [chunkSpk("deadf00d", 0, 1, FLAG_DIRECTED | FLAG_PRIVATE, "\x10\x20\x30")], 203,
+    tx("tx_dm", [headSpk(FLAG_DIRECTED, "note for you!")], 201, { vinAddr: PEER }),
+    tx("tx_dmp", [headSpk(FLAG_DIRECTED | FLAG_PRIVATE, "\x10\x20\x30")], 203,
        { vinAddr: PEER }),
     tx("tx_junk", ["6a04deadbeef"], 204, { vinAddr: V0 }),
-    tx("tx_foreign", [chunkSpk("00000001", 0, 1, 0, "not yours")], 205,
-       { vinAddr: V0, voutAddrs: [V0] }),
+    tx("tx_foreign", [headSpk(0, "not yours")], 205, { vinAddr: V0, voutAddrs: [V0] }),
   ],
   // Directed note at the SENDER (ADDR): own tx paying PEER + change to self.
   sent: [
-    tx("tx_sent", [chunkSpk("beefbeef", 0, 1, FLAG_DIRECTED, "dear peer")], 301,
-       { voutAddrs: [PEER, ADDR] }),
+    tx("tx_sent", [headSpk(FLAG_DIRECTED, "dear peer")], 301, { voutAddrs: [PEER, ADDR] }),
   ],
   // funding-unification: a self-note funded by an external (non-taproot)
   // wallet — spends from FUNDER, dust-pays ADDR. Without myAddresses this
@@ -110,7 +127,7 @@ const HISTORIES = {
   // myAddresses=[FUNDER] must classify it OWN — the self-spk-SET rule
   // mirrored from notes-core's extract_notes_multi.
   funded: [
-    tx("tx_funded", [chunkSpk("f0f1f2f3", 0, 1, 0, "funded by external wallet")], 401,
+    tx("tx_funded", [headSpk(0, "funded by external wallet")], 401,
        { vinAddr: FUNDER, voutAddrs: [ADDR] }),
   ],
   // DISPLAY-OWNER dedup (2026-07-18): a tx spending from TWO notebook
@@ -119,26 +136,26 @@ const HISTORIES = {
   // SAME history as both ADDR and NB2 mirrors two independent notebooks
   // scanning the identical tx.
   dual: [
-    tx("tx_dual", [chunkSpk("d0d0d0d0", 0, 1, 0, "owned by two notebooks")], 500,
+    tx("tx_dual", [headSpk(0, "owned by two notebooks")], 500,
        { vinAddrs: [ADDR, NB2], voutAddrs: [ADDR] }),
   ],
   // Same shape, notebook inputs reversed (NB2 first) — the owner must flip.
   dualFlipped: [
-    tx("tx_dual_flip", [chunkSpk("d1d1d1d1", 0, 1, 0, "owned by two notebooks, reversed")], 501,
+    tx("tx_dual_flip", [headSpk(0, "owned by two notebooks, reversed")], 501,
        { vinAddrs: [NB2, ADDR], voutAddrs: [ADDR] }),
   ],
   // A non-notebook (funding-wallet) input at position 0, the notebook
   // (ADDR) input at position 1 — the refinement: FUNDER must not steal the
   // anchor away from ADDR.
   dualWpkhFirst: [
-    tx("tx_dual_wpkh", [chunkSpk("d2d2d2d2", 0, 1, 0, "wallet-funded but notebook-anchored")],
+    tx("tx_dual_wpkh", [headSpk(0, "wallet-funded but notebook-anchored")],
        502, { vinAddrs: [FUNDER, ADDR], voutAddrs: [ADDR] }),
   ],
   // One input has no `prevout` data at all (esplora sometimes omits it) —
   // the anchor search must skip it without crashing, still finding the
   // real notebook input that follows.
   dualMissingPrevout: [
-    tx("tx_dual_missing", [chunkSpk("d3d3d3d3", 0, 1, 0, "missing prevout data on input 0")],
+    tx("tx_dual_missing", [headSpk(0, "missing prevout data on input 0")],
        503, { vinAddrs: [null, ADDR], voutAddrs: [ADDR] }),
   ],
 };
@@ -158,46 +175,22 @@ vm.runInContext(`
 (async () => {
   const assert = (cond, msg) => { if (!cond) throw new Error(msg); };
 
-  const cross = await scanAddress("stub:cross", ${JSON.stringify(ADDR)});
-  assert(cross.notes.length === 1, "cross: expected 1 note");
-  const n = cross.notes[0];
-  assert(n.text === "hello world", "cross: bad reassembly: " + n.text);
-  assert(!n.partial, "cross: must not be partial");
-  assert(n.txids.length === 2 && n.txids.includes("tx_one") && n.txids.includes("tx_two"),
-         "cross: both carrying txids must be listed: " + n.txids);
-  assert(n.height === 101, "cross: height must be FIRST confirmation, got " + n.height);
-  assert(!n.received && !n.directed, "cross: plain own note");
-  console.log("PASS cross-tx note reassembled (both txids, first-confirmation height)");
+  const multi = await scanAddress("stub:multiOutput", ${JSON.stringify(ADDR)});
+  assert(multi.notes.length === 1, "multiOutput: expected 1 note");
+  const nm = multi.notes[0];
+  assert(nm.text === "hello world", "multiOutput: bad concatenation: " + JSON.stringify(nm.text));
+  assert(nm.noteId === "tx_multi", "multiOutput: note id must be the txid: " + nm.noteId);
+  assert(nm.txids.length === 1 && nm.txids[0] === "tx_multi", "multiOutput: txids must be [txid]");
+  assert(nm.height === 101, "multiOutput: bad height " + nm.height);
+  assert(!nm.received && !nm.directed, "multiOutput: plain own note");
+  console.log("PASS intra-tx multi-output OP_RETURN concatenation (vout order, header on first only)");
 
-  const missing = await scanAddress("stub:missing", ${JSON.stringify(ADDR)});
-  const p = missing.notes[0];
-  assert(p.partial && p.partial.have === 1 && p.partial.total === 2,
-         "missing: expected partial 1/2, got " + JSON.stringify(p.partial));
-  assert(p.text === null, "missing: partial note must have no text");
-  console.log("PASS missing cross-tx chunk surfaces as partial 1/2");
-
-  const dedup = await scanAddress("stub:dedup", ${JSON.stringify(ADDR)});
-  assert(dedup.notes.length === 3, "dedup: expected 3 notes, got " + dedup.notes.length);
-  const own = dedup.notes.filter((x) => !x.received);
-  const pub = own.find((x) => !x.private);
-  assert(pub.text === "hello world" && !pub.partial,
-         "dedup: duplicate chunk must not break reassembly");
-  // Like Rust extract_notes, a tx whose chunk is an exact duplicate is
-  // skipped BEFORE its txid is recorded — only new-chunk contributors list.
-  assert(pub.txids.length === 2 && !pub.txids.includes("tx_one"),
-         "dedup: only new-chunk txids listed: " + pub.txids);
-  const priv = own.find((x) => x.private);
-  assert(priv && !priv.partial && priv.text === null && priv.bodyLen === 4,
-         "dedup: private cross-tx note must reassemble with text:null");
-  // note_id collision: the pays-me tx lands in a SEPARATE received bucket.
-  const collide = dedup.notes.find((x) => x.received);
-  assert(collide && collide.noteId === "aabbccdd" && collide.text === "EVIL!!"
-         && collide.from === null,
-         "dedup: colliding pays-me tx must be a received note from unknown");
-  assert(pub.text === "hello world", "dedup: own note must survive the collision intact");
-  assert(dedup.receivedTxs === 1 && dedup.foreign === 0,
-         "dedup: counters " + dedup.receivedTxs + "/" + dedup.foreign);
-  console.log("PASS dedup, private cross-tx, collision isolation, ordering");
+  const bad = await scanAddress("stub:badHeader", ${JSON.stringify(ADDR)});
+  assert(bad.notes.length === 0, "badHeader: an invalid header must decode to no note");
+  assert(bad.noteTxs === 1 && bad.nonPnte === 1,
+         "badHeader: still counts as an own tx, but nonPnte (not a valid note): " +
+         JSON.stringify({ noteTxs: bad.noteTxs, nonPnte: bad.nonPnte }));
+  console.log("PASS a malformed header is foreign data, not a crash");
 
   const dir = await scanAddress("stub:directed", ${JSON.stringify(ADDR)});
   assert(dir.notes.length === 2, "directed: expected 2 notes, got " + dir.notes.length);
@@ -205,11 +198,11 @@ vm.runInContext(`
   assert(dpub.received && dpub.directed && dpub.text === "note for you!"
          && dpub.from === ${JSON.stringify(PEER)},
          "directed: received public note with sender: " + JSON.stringify(dpub));
-  assert(dpub.height === 201, "directed: first confirmation across txs");
+  assert(dpub.height === 201, "directed: bad height " + dpub.height);
   const dpriv = dir.notes.find((x) => x.private);
   assert(dpriv.received && dpriv.directed && dpriv.text === null,
          "directed: received private stays sealed");
-  assert(dir.receivedTxs === 4 && dir.foreign === 1 && dir.nonPnte === 1,
+  assert(dir.receivedTxs === 3 && dir.foreign === 1 && dir.nonPnte === 1,
          "directed: counters recv=" + dir.receivedTxs + " foreign=" + dir.foreign +
          " nonPnte=" + dir.nonPnte);
   console.log("PASS received directed notes (public text + from, private sealed, foreign ignored)");
@@ -222,10 +215,10 @@ vm.runInContext(`
   console.log("PASS own directed note carries its recipient");
 
   // funding-unification: myAddresses is additive-only. Old callers passing
-  // no 4th arg (every scanAddress() call above) must be byte-identical to
-  // pre-change behavior — the funded-by-FUNDER tx stays RECEIVED (from
-  // unattributable: no taproot input) exactly like an old bundle/caller
-  // that never heard of myAddresses.
+  // no 4th arg must be byte-identical to pre-change behavior — the
+  // funded-by-FUNDER tx stays RECEIVED (from unattributable: no taproot
+  // input) exactly like an old bundle/caller that never heard of
+  // myAddresses.
   const fundedDefault = await scanAddress("stub:funded", ${JSON.stringify(ADDR)});
   const fd = fundedDefault.notes[0];
   assert(fd.received && fd.from === null && fd.text === "funded by external wallet",

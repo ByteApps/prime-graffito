@@ -121,33 +121,6 @@ pub fn enc_key_from_leaf(leaf_secret: &[u8; 32]) -> [u8; 32] {
     okm
 }
 
-/// Fresh 4-byte note id from the TRNG/OS entropy.
-pub fn generate_note_id() -> Result<[u8; 4], Error> {
-    let mut id = [0u8; 4];
-    getrandom::getrandom(&mut id).map_err(|_| Error::Entropy)?;
-    Ok(id)
-}
-
-/// Draw note ids until one is not `taken`. Scanners bucket chunks purely
-/// by note_id, so a reused id would merge two notes into one bucket and
-/// `reassemble` would drop BOTH from chain recovery — rerolling against
-/// the ids we already know makes self-collision impossible for every
-/// note this device has seen. Generic over the generator for testing.
-pub fn pick_unique_note_id(
-    mut gen: impl FnMut() -> Result<[u8; 4], Error>,
-    taken: impl Fn(&[u8; 4]) -> bool,
-) -> Result<[u8; 4], Error> {
-    // With a working TRNG even one reroll is a ~n/2^32 event; the cap
-    // only turns a broken RNG into an error instead of a spin.
-    for _ in 0..64 {
-        let id = gen()?;
-        if !taken(&id) {
-            return Ok(id);
-        }
-    }
-    Err(Error::Entropy)
-}
-
 /// Fresh 32 bytes of aux randomness for BIP340 signing.
 pub fn generate_aux_rand() -> Result<[u8; 32], Error> {
     let mut aux = [0u8; 32];

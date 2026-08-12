@@ -2,8 +2,8 @@
 //! output keys, HKDF'd into an XChaCha20-Poly1305 key.
 //!
 //! CONSENSUS-CRITICAL FOR RE-DERIVATION — FROZEN like keys.rs: the salt and
-//! info strings below, the x-only shared-secret definition, and the 68-byte
-//! AAD layout are baked into every directed note ever sealed. NEVER change
+//! info strings below, the x-only shared-secret definition, and the AAD
+//! layout are baked into every directed note ever sealed. NEVER change
 //! them.
 //!
 //! Key agreement: `shared_x = x( my_tweaked_seckey · lift_x(peer_output_x) )`.
@@ -15,8 +15,16 @@
 //! the recipient reads received ones (peer = the tx's input key).
 //!
 //! AAD binds direction and note identity: `sender_x || recipient_x ||
-//! note_id` — a sealed body replayed from a different sender address, to a
-//! different recipient, or under another note_id fails authentication.
+//! outpoint` — a sealed body replayed from a different sender address, to a
+//! different recipient, or under another outpoint fails authentication.
+//! PLAN-pnte-redesign.md (2026-08-11) rebinds this from the old `note_id(4)`
+//! (a field that no longer exists on-chain — the note id IS the txid, which
+//! can't be known before signing) to `outpoint(36)` = the tx's FIRST
+//! input's prevout, serialized exactly as it appears on the wire (txid in
+//! internal/little-endian order || vout as u32-LE): known before signing,
+//! and unique per tx (an outpoint is spent exactly once). Everything else
+//! in this module — the ECDH derivation, DM_SALT/DM_INFO, the sealing
+//! algorithm — is UNCHANGED.
 //!
 //! ---
 //!
@@ -24,10 +32,9 @@
 //! recipients) — FROZEN alongside everything above. A single 32-byte
 //! content key `K` (caller-supplied — see
 //! `bundle::compose_directed_note_multi_with_change`/`_exact`; NEVER
-//! generated, stored, or returned by this module, same convention as
-//! `note_id`) seals the note body ONCE, under
-//! `multi_body_aad(sender_x, note_id)` (36 bytes: sender_x(32) ||
-//! note_id(4) — no recipient binding, since the sealed body is identical
+//! generated, stored, or returned by this module) seals the note body ONCE,
+//! under `multi_body_aad(sender_x, outpoint)` (68 bytes: sender_x(32) ||
+//! outpoint(36) — no recipient binding, since the sealed body is identical
 //! for every recipient). `K` itself is then wrapped once PER RECIPIENT
 //! under that recipient's ordinary pairwise `dm_key`/`dm_aad` from above
 //! (`wrap_i`), each wrap exactly [`WRAP_LEN`] = 72 bytes
@@ -79,12 +86,14 @@ pub fn dm_key(shared_x: &[u8; 32]) -> [u8; 32] {
     okm
 }
 
-/// FROZEN AAD layout: sender_output_x(32) || recipient_output_x(32) || note_id(4).
-pub fn dm_aad(sender_x: &[u8; 32], recipient_x: &[u8; 32], note_id: &[u8; 4]) -> [u8; 68] {
-    let mut aad = [0u8; 68];
+/// FROZEN AAD layout: sender_output_x(32) || recipient_output_x(32) ||
+/// outpoint(36) = the tx's FIRST input's prevout (txid little-endian ||
+/// vout u32-LE, i.e. exactly how it's serialized on the wire).
+pub fn dm_aad(sender_x: &[u8; 32], recipient_x: &[u8; 32], outpoint: &[u8; 36]) -> [u8; 100] {
+    let mut aad = [0u8; 100];
     aad[..32].copy_from_slice(sender_x);
     aad[32..64].copy_from_slice(recipient_x);
-    aad[64..].copy_from_slice(note_id);
+    aad[64..].copy_from_slice(outpoint);
     aad
 }
 
@@ -97,11 +106,11 @@ pub fn seal_directed(
     my_tweaked_seckey: &[u8; 32],
     my_output_x: &[u8; 32],
     recipient_x: &[u8; 32],
-    note_id: &[u8; 4],
+    outpoint: &[u8; 36],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
     let key = key_for(my_tweaked_seckey, recipient_x)?;
-    crypt::seal_aad(&key, &dm_aad(my_output_x, recipient_x, note_id), plaintext)
+    crypt::seal_aad(&key, &dm_aad(my_output_x, recipient_x, outpoint), plaintext)
 }
 
 /// Recipient side: open a directed-private body sent to me by `sender_x`.
@@ -109,11 +118,11 @@ pub fn open_received(
     my_tweaked_seckey: &[u8; 32],
     my_output_x: &[u8; 32],
     sender_x: &[u8; 32],
-    note_id: &[u8; 4],
+    outpoint: &[u8; 36],
     blob: &[u8],
 ) -> Result<Vec<u8>, Error> {
     let key = key_for(my_tweaked_seckey, sender_x)?;
-    crypt::open_aad(&key, &dm_aad(sender_x, my_output_x, note_id), blob)
+    crypt::open_aad(&key, &dm_aad(sender_x, my_output_x, outpoint), blob)
 }
 
 /// Sender re-reading their own sent note (wipe recovery: the recipient key
@@ -122,11 +131,11 @@ pub fn open_sent(
     my_tweaked_seckey: &[u8; 32],
     my_output_x: &[u8; 32],
     recipient_x: &[u8; 32],
-    note_id: &[u8; 4],
+    outpoint: &[u8; 36],
     blob: &[u8],
 ) -> Result<Vec<u8>, Error> {
     let key = key_for(my_tweaked_seckey, recipient_x)?;
-    crypt::open_aad(&key, &dm_aad(my_output_x, recipient_x, note_id), blob)
+    crypt::open_aad(&key, &dm_aad(my_output_x, recipient_x, outpoint), blob)
 }
 
 // ---------------------------------------------------------------------
@@ -140,12 +149,12 @@ pub fn open_sent(
 pub const WRAP_LEN: usize = crypt::SEAL_OVERHEAD + 32;
 
 /// FROZEN AAD for the shared sealed body: `sender_output_x(32) ||
-/// note_id(4)` — no recipient binding (the body is identical for every
+/// outpoint(36)` — no recipient binding (the body is identical for every
 /// recipient; per-recipient binding lives in each wrap's `dm_aad`).
-pub fn multi_body_aad(sender_x: &[u8; 32], note_id: &[u8; 4]) -> [u8; 36] {
-    let mut aad = [0u8; 36];
+pub fn multi_body_aad(sender_x: &[u8; 32], outpoint: &[u8; 36]) -> [u8; 68] {
+    let mut aad = [0u8; 68];
     aad[..32].copy_from_slice(sender_x);
-    aad[32..].copy_from_slice(note_id);
+    aad[32..].copy_from_slice(outpoint);
     aad
 }
 
@@ -158,16 +167,16 @@ pub fn seal_multi(
     my_tweaked_seckey: &[u8; 32],
     my_output_x: &[u8; 32],
     recipients_x: &[[u8; 32]],
-    note_id: &[u8; 4],
+    outpoint: &[u8; 36],
     content_key: &[u8; 32],
     plaintext: &[u8],
 ) -> Result<(Vec<Vec<u8>>, Vec<u8>), Error> {
     let sealed_body =
-        crypt::seal_aad(content_key, &multi_body_aad(my_output_x, note_id), plaintext)?;
+        crypt::seal_aad(content_key, &multi_body_aad(my_output_x, outpoint), plaintext)?;
     let mut wraps = Vec::with_capacity(recipients_x.len());
     for r in recipients_x {
         let k_i = key_for(my_tweaked_seckey, r)?;
-        wraps.push(crypt::seal_aad(&k_i, &dm_aad(my_output_x, r, note_id), content_key)?);
+        wraps.push(crypt::seal_aad(&k_i, &dm_aad(my_output_x, r, outpoint), content_key)?);
     }
     Ok((wraps, sealed_body))
 }
@@ -182,13 +191,13 @@ pub fn open_received_multi(
     my_tweaked_seckey: &[u8; 32],
     my_output_x: &[u8; 32],
     sender_x: &[u8; 32],
-    note_id: &[u8; 4],
+    outpoint: &[u8; 36],
     wraps: &[Vec<u8>],
     sealed_body: &[u8],
     my_index: Option<usize>,
 ) -> Result<Vec<u8>, Error> {
     let key = key_for(my_tweaked_seckey, sender_x)?;
-    let aad = dm_aad(sender_x, my_output_x, note_id);
+    let aad = dm_aad(sender_x, my_output_x, outpoint);
     let mut order: Vec<usize> = Vec::with_capacity(wraps.len());
     if let Some(i) = my_index {
         if i < wraps.len() {
@@ -199,7 +208,7 @@ pub fn open_received_multi(
     for i in order {
         let Ok(k_bytes) = crypt::open_aad(&key, &aad, &wraps[i]) else { continue };
         let Ok(content_key) = <[u8; 32]>::try_from(k_bytes.as_slice()) else { continue };
-        if let Ok(pt) = crypt::open_aad(&content_key, &multi_body_aad(sender_x, note_id), sealed_body)
+        if let Ok(pt) = crypt::open_aad(&content_key, &multi_body_aad(sender_x, outpoint), sealed_body)
         {
             return Ok(pt);
         }
@@ -215,18 +224,18 @@ pub fn open_sent_multi(
     my_tweaked_seckey: &[u8; 32],
     my_output_x: &[u8; 32],
     recipients_x: &[[u8; 32]],
-    note_id: &[u8; 4],
+    outpoint: &[u8; 36],
     wraps: &[Vec<u8>],
     sealed_body: &[u8],
 ) -> Result<Vec<u8>, Error> {
     for (i, r) in recipients_x.iter().enumerate() {
         let Some(wrap) = wraps.get(i) else { continue };
         let Ok(key) = key_for(my_tweaked_seckey, r) else { continue };
-        let aad = dm_aad(my_output_x, r, note_id);
+        let aad = dm_aad(my_output_x, r, outpoint);
         let Ok(k_bytes) = crypt::open_aad(&key, &aad, wrap) else { continue };
         let Ok(content_key) = <[u8; 32]>::try_from(k_bytes.as_slice()) else { continue };
         if let Ok(pt) =
-            crypt::open_aad(&content_key, &multi_body_aad(my_output_x, note_id), sealed_body)
+            crypt::open_aad(&content_key, &multi_body_aad(my_output_x, outpoint), sealed_body)
         {
             return Ok(pt);
         }

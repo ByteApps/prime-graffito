@@ -240,7 +240,7 @@ confirm_txid() { # txid timeout_secs
 # --- funding: regtest spends FROM the Pi's testwallet (never created/
 # loaded/reset by us); testnet4 spends from a separate gift-wallet WIF via
 # a hand-built raw tx (no wallet import, no rescan) — mirrors
-# chain-notes-app/scripts/testnet4-live.sh. ---------------------------------
+# graffito/scripts/testnet4-live.sh. ---------------------------------
 CN_FUND_SATS="${CN_FUND_SATS:-100000}"   # 0.001 BTC, matches the pre-shared-node default
 
 fund_addr() { # dest_addr sats -> echoes txid
@@ -256,7 +256,7 @@ fund_addr() { # dest_addr sats -> echoes txid
 
 fund_from_wif() { # dest_addr sats -> echoes txid  (testnet4 only)
     local dest="$1" sats="$2"
-    : "${FUND_WIF:?testnet4 funding needs FUND_WIF in the environment (never printed) — see chain-notes-app/scripts/testnet4-live.sh}"
+    : "${FUND_WIF:?testnet4 funding needs FUND_WIF in the environment (never printed) — see graffito/scripts/testnet4-live.sh}"
     local cap="${CN_FUND_SATS_CAP:-200000}"
     (( sats <= cap )) || { echo "refusing to fund $sats sats > cap $cap sats (CN_FUND_SATS_CAP)" >&2; exit 1; }
     local fund_addr="${CN_FUND_ADDR:-tb1q2ylq48ne37ng9clds23xjcrxp8hmn707j5vpyk}"
@@ -376,7 +376,13 @@ bundle)
         # companion/index.html's output_addrs (FLAG_MULTI recipient-list
         # decode: recipients are output_addrs[0..count], preceding change).
         output_addrs="$(jq '[.vout[] | select(.scriptPubKey.type != "nulldata") | .scriptPubKey.address] | map(select(. != null))' <<<"$raw")"
-        notes_onchain="$(jq --argjson tx "{\"txid\":\"$txid\",\"height\":$height,\"blocktime\":$blocktime,\"spends_from_self\":$self,\"payloads\":$payloads,\"output_addrs\":$output_addrs}" '. + [$tx]' <<<"$notes_onchain")"
+        # The tx's FIRST input's prevout, as "<txid>:<vout>" (display-order
+        # txid — notes-core's bundle::format_outpoint convention;
+        # PLAN-pnte-redesign.md: the directed-private AAD binds this
+        # outpoint instead of the now-nonexistent note_id). A coinbase
+        # input (no .txid) yields JSON null, same as index.html's mirror.
+        first_input_outpoint="$(jq 'if ((.vin[0].txid // "") != "") then "\(.vin[0].txid):\(.vin[0].vout)" else null end' <<<"$raw")"
+        notes_onchain="$(jq --argjson tx "{\"txid\":\"$txid\",\"height\":$height,\"blocktime\":$blocktime,\"spends_from_self\":$self,\"payloads\":$payloads,\"output_addrs\":$output_addrs,\"first_input_outpoint\":$first_input_outpoint}" '. + [$tx]' <<<"$notes_onchain")"
     done
     jq -n --argjson utxos "$utxos" --argjson notes "$notes_onchain" --argjson tip "$tip" --argjson owner_used "$owner_used" --arg net "$CN_NETWORK" '{
         network: $net, full: true, tip_height: $tip,

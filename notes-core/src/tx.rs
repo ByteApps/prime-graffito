@@ -87,6 +87,102 @@ pub struct Utxo {
     pub value: u64,
 }
 
+/// `u`'s outpoint exactly as it appears on the wire: txid in
+/// internal/little-endian order (already how [`Utxo::txid`] is stored) ||
+/// vout as `u32`-LE — the directed-private AAD's `outpoint` field
+/// (dm.rs, PLAN-pnte-redesign.md).
+pub fn outpoint_bytes(u: &Utxo) -> [u8; 36] {
+    let mut out = [0u8; 36];
+    out[..32].copy_from_slice(&u.txid);
+    out[32..].copy_from_slice(&u.vout.to_le_bytes());
+    out
+}
+
+/// Select inputs for a note tx exactly the way [`build_note_tx_with_change`]
+/// does (largest-first, growing the selection until a change output OR a
+/// sub-dust no-change remainder is affordable) — but stop short of
+/// building/signing. Exists so a caller that needs to know the tx's FIRST
+/// input's outpoint BEFORE the OP_RETURN body can be produced (a
+/// directed-private note's AAD binds the outpoint — dm.rs) can select
+/// inputs, seal, then build the exact same tx via [`build_note_tx_exact`].
+///
+/// `payload_lens` and `recipient_spk_len` fully determine the fee/vsize
+/// search — the actual OP_RETURN bytes never matter to selection, only
+/// their lengths (true for any AEAD seal, since ciphertext length depends
+/// only on plaintext length, never on AAD content) — so a caller may pass
+/// lengths computed from a body it hasn't sealed yet, as long as the body
+/// it eventually seals has the identical length (guaranteed for XChaCha20-
+/// Poly1305: `crypt::SEAL_OVERHEAD` is a fixed constant).
+pub fn select_note_inputs(
+    available: &[Utxo],
+    payload_lens: &[usize],
+    recipient_spk_len: Option<usize>,
+    recipient_amount: u64,
+    fee_rate: f64,
+) -> Result<Vec<Utxo>, Error> {
+    let sent: u64 = if recipient_spk_len.is_some() { recipient_amount } else { 0 };
+    let mut candidates = available.to_vec();
+    candidates.sort_by(|a, b| b.value.cmp(&a.value));
+    let mut selected: Vec<Utxo> = Vec::new();
+    let mut in_value: u64 = 0;
+    for utxo in candidates {
+        selected.push(utxo);
+        in_value += selected.last().expect("just pushed").value;
+        for change in [true, false] {
+            let vsize = estimate_vsize(selected.len(), payload_lens, recipient_spk_len, change);
+            let fee = (vsize as f64 * fee_rate).ceil() as u64;
+            if in_value < fee + sent {
+                continue;
+            }
+            let change_value = in_value - fee - sent;
+            if change && change_value < DUST_LIMIT {
+                continue;
+            }
+            if !change && change_value > DUST_LIMIT {
+                continue;
+            }
+            return Ok(selected);
+        }
+    }
+    Err(Error::InsufficientFunds)
+}
+
+/// [`select_note_inputs`] generalized to N recipient outputs, mirroring
+/// [`build_note_tx_multi_with_change`]'s selection loop (`estimate_vsize_multi`).
+pub fn select_note_inputs_multi(
+    available: &[Utxo],
+    payload_lens: &[usize],
+    recipient_lens: &[usize],
+    sent: u64,
+    fee_rate: f64,
+) -> Result<Vec<Utxo>, Error> {
+    let mut candidates = available.to_vec();
+    candidates.sort_by(|a, b| b.value.cmp(&a.value));
+    let mut selected: Vec<Utxo> = Vec::new();
+    let mut in_value: u64 = 0;
+    for utxo in candidates {
+        selected.push(utxo);
+        in_value += selected.last().expect("just pushed").value;
+        for change in [true, false] {
+            let vsize =
+                estimate_vsize_multi(selected.len(), payload_lens, recipient_lens, change);
+            let fee = (vsize as f64 * fee_rate).ceil() as u64;
+            if in_value < fee + sent {
+                continue;
+            }
+            let change_value = in_value - fee - sent;
+            if change && change_value < DUST_LIMIT {
+                continue;
+            }
+            if !change && change_value > DUST_LIMIT {
+                continue;
+            }
+            return Ok(selected);
+        }
+    }
+    Err(Error::InsufficientFunds)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxOut {
     pub value: u64,

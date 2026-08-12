@@ -5,13 +5,19 @@
 //! deterministic-PRNG fallback silently standing in for the hardware RNG,
 //! bug 2 was a reseed where only 4 of 32 bytes reached the generator,
 //! capping it at 2^32 states. This file exercises notes-core's actual
-//! entropy consumers (`keys::generate_aux_rand`, `keys::generate_note_id`)
-//! against the shared canonical battery, plus the negative controls that
-//! prove the battery discriminates rather than being silently green.
+//! entropy consumer (`keys::generate_aux_rand`) against the shared
+//! canonical battery, plus the negative controls that prove the battery
+//! discriminates rather than being silently green.
 //!
 //! Ported from the validated reference harness
 //! (`battery-check/tests/validate.rs`, 11/11 passing against
-//! `/dev/urandom`), swapping in notes-core's own TRNG-backed generators.
+//! `/dev/urandom`), swapping in notes-core's own TRNG-backed generator.
+//!
+//! PLAN-pnte-redesign.md (2026-08-11) removed `keys::generate_note_id`/
+//! `pick_unique_note_id` entirely — the note id IS the txid now (unique by
+//! construction, no on-chain field, no TRNG draw), one fewer TRNG consumer
+//! than before. The distribution-battery/collision-guard coverage that
+//! used to live here for it is gone with the functions themselves.
 //!
 //! `keys::derive_seed_entropy` (the recovery-seed KDF) is NOT a TRNG
 //! consumer — it is HKDF-SHA256 over `GetAppSeed`, so it inherits entropy
@@ -25,8 +31,8 @@ mod battery;
 
 use battery::controls;
 use bip39::Mnemonic;
-use notes_core::keys::{self, generate_aux_rand, generate_note_id, pick_unique_note_id};
-use notes_core::{seeds, Error};
+use notes_core::keys::{self, generate_aux_rand};
+use notes_core::seeds;
 
 // =======================================================================
 // Task 1a: keys::generate_aux_rand — the primary 32-byte TRNG source
@@ -66,68 +72,6 @@ fn aux_rand_collision_free() {
     let r = battery::collision_freedom(aux_rand32);
     println!("collision test took {:?}\n{}", t.elapsed(), r.summary());
     r.assert_ok("generate_aux_rand collisions");
-}
-
-// =======================================================================
-// Task 1b: keys::generate_note_id — 4-byte ids. Distribution ONLY: a
-// 4-byte space is expected to collide over a long run (that is exactly
-// why `pick_unique_note_id` exists), so no collision/distinctness
-// assertion belongs here.
-// =======================================================================
-
-fn note_id_chunk(out: &mut [u8]) {
-    debug_assert_eq!(out.len(), 4, "note ids are 4 bytes");
-    let id = generate_note_id().expect("generate_note_id should not fail on host");
-    out.copy_from_slice(&id);
-}
-
-#[test]
-fn note_id_distribution_battery() {
-    let r = battery::battery_from(4, note_id_chunk);
-    println!("{}", r.summary());
-    r.assert_ok("keys::generate_note_id (distribution only — collisions are expected)");
-}
-
-// `pick_unique_note_id` is the actual anti-collision mechanism for note
-// ids; it must reroll past ids the caller reports as `taken`, and give up
-// with `Error::Entropy` (never spin) once its budget is exhausted.
-
-#[test]
-fn pick_unique_note_id_rerolls_past_taken() {
-    // ids 1..=4 (as returned by the generator) are reported taken; the
-    // 5th generated id is free and must be the one returned.
-    let mut calls = 0u32;
-    let gen = move || {
-        calls += 1;
-        Ok(calls.to_le_bytes())
-    };
-    let taken = |id: &[u8; 4]| u32::from_le_bytes(*id) <= 4;
-    let result = pick_unique_note_id(gen, taken);
-    assert_eq!(result, Ok(5u32.to_le_bytes()), "should reroll past every taken id");
-}
-
-#[test]
-fn pick_unique_note_id_gives_up_instead_of_spinning() {
-    // Every draw is taken, forever: pick_unique_note_id must terminate
-    // with Error::Entropy rather than loop forever.
-    let gen = || Ok([0xAAu8; 4]);
-    let result = pick_unique_note_id(gen, |_| true);
-    assert_eq!(result, Err(Error::Entropy), "must give up, not spin, once every draw is taken");
-}
-
-#[test]
-fn pick_unique_note_id_propagates_generator_errors() {
-    let gen = || Err(Error::Entropy);
-    let result = pick_unique_note_id(gen, |_| false);
-    assert_eq!(result, Err(Error::Entropy));
-}
-
-#[test]
-fn pick_unique_note_id_first_free_id_short_circuits() {
-    // Sanity: when nothing is taken, the very first draw is accepted.
-    let gen = || Ok([0x11u8; 4]);
-    let result = pick_unique_note_id(gen, |_| false);
-    assert_eq!(result, Ok([0x11u8; 4]));
 }
 
 // =======================================================================

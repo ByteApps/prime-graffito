@@ -4,6 +4,21 @@
 //!
 //! XChaCha20 is length-preserving, so sealed_len = plaintext_len + 40 —
 //! the compose screen's keystroke cost estimator depends on that constant.
+//!
+//! **Uniform AAD rule (PLAN-pnte-redesign.md, 2026-08-11 orchestrator
+//! review):** every sealed body — self-note or directed — binds the
+//! carrying tx's FIRST input's outpoint (36 bytes: txid in internal/
+//! little-endian order || vout as `u32`-LE, exactly as serialized on the
+//! wire — identical convention to dm.rs). Directed notes additionally bind
+//! the sender/recipient output-key pair (dm.rs's `dm_aad`); a self-note's
+//! AAD is the bare outpoint. Binding is not optional for self-notes
+//! either: without it, a self-note's sealed blob can be copied byte-for-
+//! byte out of its original tx into ANY new tx that merely PAYS my
+//! address — same key, same ciphertext, and an EMPTY AAD would still
+//! authenticate under that unrelated tx, surfacing my own old secret text
+//! attributed to whoever sent the new payment. Binding the outpoint means
+//! a copied blob only ever authenticates under the tx that originally
+//! sealed it.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -15,14 +30,10 @@ pub const TAG_LEN: usize = 16;
 /// Fixed size overhead of a sealed blob over its plaintext.
 pub const SEAL_OVERHEAD: usize = NONCE_LEN + TAG_LEN;
 
-/// The note_id is bound as AEAD associated data so a sealed body can't be
-/// replayed under a different note identity.
-fn aad(note_id: &[u8; 4]) -> [u8; 4] {
-    *note_id
-}
-
 /// Seal with an explicit nonce and arbitrary AAD (directed notes bind
-/// sender/recipient keys — see dm.rs; own notes bind only the note_id).
+/// sender/recipient keys + the funding outpoint — see dm.rs; own notes
+/// bind the bare outpoint — see `seal`/`open` below and the module doc's
+/// "Uniform AAD rule").
 pub(crate) fn seal_with_nonce_aad(
     key: &[u8; 32],
     aad: &[u8],
@@ -59,24 +70,29 @@ pub(crate) fn open_aad(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Result<Vec<u8
 }
 
 /// Seal with an explicit nonce (tests). Production callers use `seal`.
+/// `outpoint` is the carrying tx's FIRST input's prevout — see the module
+/// doc's "Uniform AAD rule" for why a self-note binds this too, not just
+/// directed ones.
 pub fn seal_with_nonce(
     key: &[u8; 32],
-    note_id: &[u8; 4],
+    outpoint: &[u8; 36],
     nonce: &[u8; NONCE_LEN],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    seal_with_nonce_aad(key, &aad(note_id), nonce, plaintext)
+    seal_with_nonce_aad(key, outpoint, nonce, plaintext)
 }
 
-/// Seal a note body with a fresh TRNG/OS nonce.
-pub fn seal(key: &[u8; 32], note_id: &[u8; 4], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+/// Seal a note body with a fresh TRNG/OS nonce, bound to `outpoint` (the
+/// carrying tx's first input's prevout — see the module doc).
+pub fn seal(key: &[u8; 32], outpoint: &[u8; 36], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::getrandom(&mut nonce).map_err(|_| Error::Entropy)?;
-    seal_with_nonce(key, note_id, &nonce, plaintext)
+    seal_with_nonce(key, outpoint, &nonce, plaintext)
 }
 
-/// Open a sealed blob. A failure means "not ours / corrupted" — callers
-/// treat it as a foreign payload, not a fatal error.
-pub fn open(key: &[u8; 32], note_id: &[u8; 4], blob: &[u8]) -> Result<Vec<u8>, Error> {
-    open_aad(key, &aad(note_id), blob)
+/// Open a sealed blob bound to `outpoint`. A failure means "not ours /
+/// corrupted / wrong outpoint" — callers treat it as a foreign payload,
+/// not a fatal error.
+pub fn open(key: &[u8; 32], outpoint: &[u8; 36], blob: &[u8]) -> Result<Vec<u8>, Error> {
+    open_aad(key, outpoint, blob)
 }

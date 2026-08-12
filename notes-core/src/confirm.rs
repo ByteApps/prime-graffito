@@ -20,6 +20,17 @@ use crate::envelope;
 use crate::tx::op_return_payload;
 use crate::{Error, Network};
 
+/// Same convention as `bundle.rs`'s scanner: 0x6a (OP_RETURN) marks a
+/// candidate output; whether it's actually a PNTE payload is decided by
+/// the FIRST OP_RETURN output's header (`envelope::parse_header`) — later
+/// OP_RETURN outputs of the SAME tx carry no header of their own
+/// (PLAN-pnte-redesign.md: one note = one tx, header only on the first
+/// output), so once the tx's first OP_RETURN validates, every later one is
+/// labeled as part of the same note too.
+fn op_return_payloads_in_order(outputs: &[crate::tx::TxOut]) -> Vec<&[u8]> {
+    outputs.iter().filter_map(|o| op_return_payload(&o.script_pubkey)).collect()
+}
+
 /// What we know about an input's previous output. `source` is a human
 /// wallet label, e.g. "Notebook · Alice", "Spending wallet", "ColdBox"
 /// (external), or "" if unknown.
@@ -149,6 +160,13 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
     let total_in = if any_prevout_missing { None } else { Some(sum_in) };
 
     // --- outputs --------------------------------------------------------
+    // Whether the tx's first OP_RETURN output carries a valid PNTE header —
+    // decided ONCE, since later OP_RETURN outputs of the same tx carry no
+    // header of their own (they're raw continuation bytes; see
+    // `op_return_payloads_in_order`'s doc comment).
+    let is_pnte_tx = op_return_payloads_in_order(&tx.outputs)
+        .first()
+        .is_some_and(|p| envelope::parse_header(p).is_some());
     let mut outputs = Vec::with_capacity(tx.outputs.len());
     let mut total_out: u64 = 0;
     for txout in &tx.outputs {
@@ -157,9 +175,7 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
         let spk = txout.script_pubkey.as_slice();
 
         if spk.first() == Some(&0x6a) {
-            let is_pnte = op_return_payload(spk)
-                .map(|p| p.len() >= envelope::MAGIC.len() && p[..envelope::MAGIC.len()] == envelope::MAGIC)
-                .unwrap_or(false);
+            let is_pnte = is_pnte_tx;
             outputs.push(SummaryRow {
                 title: String::new(),
                 subtitle: if is_pnte { "OP_RETURN · PNTE note".to_string() } else { "OP_RETURN · data".to_string() },
