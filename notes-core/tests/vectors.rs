@@ -187,6 +187,27 @@ fn directed_aad_seal_open_vector() {
 }
 
 /// Full `seal_multi`/open round-trip with FIXED identities and a fixed
+/// FROZEN multi-recipient AAD layout (dm.rs): `multi_body_aad` =
+/// sender_x(32) || outpoint(36), 68 bytes — pinned so a byte-layout
+/// regression is caught even though `seal_multi`/`seal_aad` use a random
+/// nonce internally (see `multi_seal_open_vector` below for a full
+/// round-trip pin). Rebound from the old `sender_x(32) || note_id(4)`,
+/// 36 bytes, by PLAN-pnte-redesign.md (2026-08-11) alongside the singular
+/// `dm_aad` above — restored here per orchestrator review: a layout vector
+/// deleted at exactly the moment the layout changes proves nothing.
+#[test]
+fn multi_body_aad_layout_vector() {
+    use notes_core::dm::multi_body_aad;
+    let sender_x = [0x11u8; 32];
+    let mut outpoint = [0u8; 36];
+    outpoint[..32].copy_from_slice(&[0xBBu8; 32]);
+    outpoint[32..].copy_from_slice(&5u32.to_le_bytes());
+    let aad = multi_body_aad(&sender_x, &outpoint);
+    assert_eq!(aad.len(), 68);
+    assert_eq!(&aad[..32], &sender_x);
+    assert_eq!(&aad[32..], &outpoint);
+}
+
 /// outpoint: pins the wrap length (`dm::WRAP_LEN` == 72 bytes, always), that
 /// the recipient side (`open_received_multi`, own-index-first and
 /// fallback-to-any-wrap) and the sender side (`open_sent_multi`,

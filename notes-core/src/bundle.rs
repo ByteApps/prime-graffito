@@ -667,9 +667,12 @@ fn extract_notes_inner(
         } else if keys.is_none() {
             None // watch-only: no decryption key on this device
         } else if !directed {
-            // Own self-note: the frozen enc_key path, byte-for-byte as v1.
+            // Own self-note: the frozen enc_key path, bound to the tx's
+            // first-input outpoint (crypt.rs's uniform AAD rule) — without
+            // it (an old/incomplete bundle missing first_input_outpoint),
+            // the note degrades to the sealed placeholder, never a panic.
             let identity = keys.expect("gated above");
-            crypt::open(&identity.enc_key, &body).ok()
+            outpoint.and_then(|outpoint| crypt::open(&identity.enc_key, &outpoint, &body).ok())
         } else if received {
             let identity = keys.expect("gated above");
             // Received directed-private. The author is the first-input address
@@ -783,10 +786,11 @@ fn extract_notes_inner(
 /// an EXTERNAL (PSBT) funder can produce byte-identical on-chain note bytes
 /// without holding the funding key. `outpoint` is the tx's FIRST input's
 /// prevout (`tx::outpoint_bytes`) — the caller already knows it (it built
-/// the inputs itself); ignored when the note isn't directed-private.
-/// Directed-private notes stay decryptable under external funding because
-/// the author key rides on a dust-to-self output (see `extract_notes`'
-/// candidate-key search).
+/// the inputs itself) — and is used UNCONDITIONALLY for any private body,
+/// self-note or directed (crypt.rs's uniform AAD rule), never just the
+/// directed case. Directed-private notes stay decryptable under external
+/// funding because the author key rides on a dust-to-self output (see
+/// `extract_notes`'s candidate-key search).
 pub fn sealed_note_payloads(
     identity: &Identity,
     text: &str,
@@ -806,7 +810,7 @@ pub fn sealed_note_payloads(
                 text.as_bytes(),
             )?
         } else {
-            crypt::seal(&identity.enc_key, text.as_bytes())?
+            crypt::seal(&identity.enc_key, &outpoint, text.as_bytes())?
         }
     } else {
         text.as_bytes().to_vec()
@@ -911,6 +915,15 @@ pub fn compose_note(
 }
 
 /// Like `compose_note`, but change goes to `change_spk` when Some.
+///
+/// PRIVATE self-notes now bind the tx's first-input outpoint too (crypt.rs's
+/// uniform AAD rule — a copied sealed blob must not authenticate under an
+/// unrelated tx that merely pays my address), which is only known once
+/// inputs are selected — so, like the directed-private path, this composes
+/// in two phases: select inputs first (by sealed-body LENGTH only — an
+/// AEAD's ciphertext length never depends on its AAD), seal with the real
+/// outpoint, then build the exact same tx via `build_note_tx_exact`. Public
+/// self-notes need no outpoint and keep the single-phase auto-select path.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_note_with_change(
     identity: &Identity,
@@ -923,11 +936,22 @@ pub fn compose_note_with_change(
     lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
-    let body = if private { crypt::seal(&identity.enc_key, text.as_bytes())? } else { text.as_bytes().to_vec() };
-    let flags = if private { FLAG_PRIVATE } else { 0 };
-    compose_inner(
-        identity, utxos, flags, &body, None, crate::DUST_LIMIT, change_spk, max_op_return_bytes,
-        fee_rate, lock_time, aux,
+    if !private {
+        return compose_inner(
+            identity, utxos, 0, text.as_bytes(), None, crate::DUST_LIMIT, change_spk,
+            max_op_return_bytes, fee_rate, lock_time, aux,
+        );
+    }
+    let flags = FLAG_PRIVATE;
+    let body_len = text.len() + crypt::SEAL_OVERHEAD;
+    let payload_lens = envelope::payload_lens_for(flags, None, body_len, max_op_return_bytes)?;
+    let selected = select_note_inputs(utxos, &payload_lens, None, 0, fee_rate)?;
+    let outpoint = outpoint_bytes(selected.first().ok_or(Error::InsufficientFunds)?);
+    let sealed = crypt::seal(&identity.enc_key, &outpoint, text.as_bytes())?;
+    let payloads = envelope::encode_outputs(flags, None, &sealed, max_op_return_bytes)?;
+    build_note_tx_exact(
+        &selected, &identity.output_x, &payloads, None, crate::DUST_LIMIT, change_spk, fee_rate,
+        lock_time, &identity.tweaked_seckey, aux,
     )
 }
 
@@ -1024,7 +1048,11 @@ pub fn compose_directed_note_with_change_amount(
 }
 
 /// Coin-control compose: spend EXACTLY `inputs` (no auto-selection).
-/// Change (self unless `change_spk`) is the leftover.
+/// Change (self unless `change_spk`) is the leftover. Coin control already
+/// knows its full, final input set up front, so — unlike the auto-select
+/// `compose_note_with_change` sibling — there's no two-phase dance:
+/// `inputs[0]` IS the tx's first input, so the outpoint (crypt.rs's
+/// uniform AAD rule) is known immediately.
 pub fn compose_note_exact(
     identity: &Identity,
     inputs: &[Utxo],
@@ -1036,7 +1064,12 @@ pub fn compose_note_exact(
     lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
-    let body = if private { crypt::seal(&identity.enc_key, text.as_bytes())? } else { text.as_bytes().to_vec() };
+    let body = if private {
+        let outpoint = outpoint_bytes(inputs.first().ok_or(Error::InsufficientFunds)?);
+        crypt::seal(&identity.enc_key, &outpoint, text.as_bytes())?
+    } else {
+        text.as_bytes().to_vec()
+    };
     let flags = if private { FLAG_PRIVATE } else { 0 };
     let payloads = envelope::encode_outputs(flags, None, &body, max_op_return_bytes)?;
     build_note_tx_exact(

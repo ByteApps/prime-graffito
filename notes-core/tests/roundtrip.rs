@@ -77,14 +77,16 @@ fn envelope_rejects_bad_shapes() {
 #[test]
 fn seal_open_roundtrip_and_auth() {
     let key = [3u8; 32];
-    let blob = crypt::seal(&key, "hola ₿".as_bytes()).unwrap();
+    let outpoint = [0x11u8; 36];
+    let blob = crypt::seal(&key, &outpoint, "hola ₿".as_bytes()).unwrap();
     assert_eq!(blob.len(), "hola ₿".len() + SEAL_OVERHEAD);
-    assert_eq!(crypt::open(&key, &blob).unwrap(), "hola ₿".as_bytes());
-    // wrong key / tampered byte both fail
-    assert!(crypt::open(&[4u8; 32], &blob).is_err());
+    assert_eq!(crypt::open(&key, &outpoint, &blob).unwrap(), "hola ₿".as_bytes());
+    // wrong key / wrong outpoint (AAD) / tampered byte all fail
+    assert!(crypt::open(&[4u8; 32], &outpoint, &blob).is_err());
+    assert!(crypt::open(&key, &[9u8; 36], &blob).is_err());
     let mut bad = blob.clone();
     bad[30] ^= 1;
-    assert!(crypt::open(&key, &bad).is_err());
+    assert!(crypt::open(&key, &outpoint, &bad).is_err());
 }
 
 #[test]
@@ -306,6 +308,64 @@ fn scan_ignores_foreign_and_spoofed() {
     let notes = extract_notes(&bundle, &id, NET);
     assert_eq!(notes.len(), 1);
     assert!(notes[0].text.is_none());
+}
+
+/// The exact spoof crypt.rs's uniform AAD rule (2026-08-11 orchestrator
+/// review) exists to close: an attacker copies the sealed OP_RETURN bytes
+/// of my own private self-note — verbatim, same key would still open it —
+/// out of the original tx into a NEW tx that merely PAYS my address, hoping
+/// my secret text surfaces attributed to them as a "received" note. Since
+/// the AAD binds the ORIGINAL tx's first-input outpoint, a copy riding on
+/// a different tx (therefore a different first input) must fail to
+/// authenticate — never decrypt, never misattribute.
+#[test]
+fn self_note_replay_into_a_pays_me_tx_does_not_spoof() {
+    let id = identity();
+    let attacker = identity_b();
+    let mine = compose_note(&id, &utxos(), "my private secret", true, 80, 1.0, 0, || Ok(AUX))
+        .unwrap();
+
+    // The legitimate scan: own note, decrypts under its real outpoint.
+    let legit = bundle_from_txs(&[(&mine, true, Some(100))]);
+    let legit_notes = extract_notes(&legit, &id, NET);
+    assert_eq!(legit_notes.len(), 1);
+    assert_eq!(legit_notes[0].text.as_deref(), Some("my private secret"));
+
+    // The attack: the SAME sealed payload bytes, riding a DIFFERENT tx that
+    // pays my address (a different first-input outpoint — different funder,
+    // different coin). Same key, same ciphertext; only the outpoint differs.
+    let copied_payloads: Vec<String> = mine
+        .tx
+        .outputs
+        .iter()
+        .filter_map(|o| op_return_payload(&o.script_pubkey))
+        .map(hex::encode)
+        .collect();
+    let spoof_tx = OnchainTx {
+        txid: "bb".repeat(32),
+        height: Some(101),
+        blocktime: Some(1_700_000_101),
+        spends_from_self: false,
+        payloads: copied_payloads,
+        pays_self: true,
+        sender: Some(attacker.address(NET)),
+        author_candidates: Vec::new(),
+        recipient: None,
+        input_prevout_spks: Vec::new(),
+        output_addrs: Vec::new(),
+        first_input_outpoint: Some(notes_core::bundle::format_outpoint(&[0x99u8; 32], 7)),
+    };
+    let spoofed = SyncBundle {
+        network: "regtest".into(),
+        notes_onchain: vec![spoof_tx],
+        ..Default::default()
+    };
+    let notes = extract_notes(&spoofed, &id, NET);
+    assert_eq!(notes.len(), 1, "still registers as SOME note (structurally valid PNTE header)");
+    assert!(
+        notes[0].text.is_none(),
+        "the copied ciphertext must NOT decrypt under the new tx's different outpoint"
+    );
 }
 
 #[test]
