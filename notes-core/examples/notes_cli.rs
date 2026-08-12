@@ -13,7 +13,7 @@ use notes_core::bundle::{
     compose_directed_note, compose_directed_note_multi_with_change, compose_note, extract_notes,
     Identity, SyncBundle,
 };
-use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
+use notes_core::keys::generate_aux_rand;
 use notes_core::tx::LockTimePolicy;
 use notes_core::Network;
 
@@ -171,25 +171,11 @@ fn main() {
             let fee_rate: f64 = args[4].parse().unwrap();
             let max_or: usize = args[5].parse().unwrap();
             let text = &args[6];
-            // Reroll against every note id already visible in the bundle
-            // (self-collision guard; foreign ids included — a wider taken
-            // set is harmless).
-            let taken: std::collections::BTreeSet<[u8; 4]> = bundle
-                .notes_onchain
-                .iter()
-                .flat_map(|t| t.payloads.iter())
-                .filter_map(|p| hex::decode(p).ok())
-                .filter_map(|p| notes_core::envelope::decode(&p))
-                .map(|c| c.note_id)
-                .collect();
-            let note_id =
-                pick_unique_note_id(generate_note_id, |id| taken.contains(id)).unwrap();
             let note = compose_note(
                 &identity,
                 &bundle.utxos(),
                 text,
                 private,
-                note_id,
                 max_or,
                 fee_rate,
                 locktime_for(Some(bundle.tip_height as u32)),
@@ -199,7 +185,6 @@ fn main() {
             println!(
                 "{}",
                 serde_json::json!({
-                    "note_id": hex::encode(note_id),
                     "txid": note.txid_hex,
                     "raw_hex": note.raw_hex,
                     "fee": note.fee,
@@ -223,22 +208,11 @@ fn main() {
             let fee_rate: f64 = args[5].parse().unwrap();
             let max_or: usize = args[6].parse().unwrap();
             let text = &args[7];
-            let taken: std::collections::BTreeSet<[u8; 4]> = bundle
-                .notes_onchain
-                .iter()
-                .flat_map(|t| t.payloads.iter())
-                .filter_map(|p| hex::decode(p).ok())
-                .filter_map(|p| notes_core::envelope::decode(&p))
-                .map(|c| c.note_id)
-                .collect();
-            let note_id =
-                pick_unique_note_id(generate_note_id, |id| taken.contains(id)).unwrap();
             let note = compose_directed_note(
                 &identity,
                 &bundle.utxos(),
                 text,
                 private,
-                note_id,
                 &recipient,
                 max_or,
                 fee_rate,
@@ -249,7 +223,6 @@ fn main() {
             println!(
                 "{}",
                 serde_json::json!({
-                    "note_id": hex::encode(note_id),
                     "txid": note.txid_hex,
                     "raw_hex": note.raw_hex,
                     "fee": note.fee,
@@ -296,22 +269,11 @@ fn main() {
                 getrandom::getrandom(&mut k).expect("OS rng");
                 k
             };
-            let taken: std::collections::BTreeSet<[u8; 4]> = bundle
-                .notes_onchain
-                .iter()
-                .flat_map(|t| t.payloads.iter())
-                .filter_map(|p| hex::decode(p).ok())
-                .filter_map(|p| notes_core::envelope::decode(&p))
-                .map(|c| c.note_id)
-                .collect();
-            let note_id =
-                pick_unique_note_id(generate_note_id, |id| taken.contains(id)).unwrap();
             let note = compose_directed_note_multi_with_change(
                 &identity,
                 &bundle.utxos(),
                 text,
                 private,
-                note_id,
                 &recipients,
                 content_key,
                 None,
@@ -324,7 +286,6 @@ fn main() {
             println!(
                 "{}",
                 serde_json::json!({
-                    "note_id": hex::encode(note_id),
                     "txid": note.txid_hex,
                     "raw_hex": note.raw_hex,
                     "fee": note.fee,
@@ -376,8 +337,8 @@ fn main() {
                 .iter()
                 .map(|n| {
                     serde_json::json!({
-                        "note_id": hex::encode(n.note_id),
-                        "txids": n.txids,
+                        "id": n.id,
+                        "txid": n.id,
                         "height": n.height,
                         "blocktime": n.blocktime,
                         "private": n.private,
