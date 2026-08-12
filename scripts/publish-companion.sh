@@ -1,25 +1,34 @@
 #!/usr/bin/env bash
-# Publish companion/ to the PUBLIC deploy-mirror repo
-# (github.com/ObjSal/chain-notes-companion → GitHub Pages).
-# Canonical source stays here; never edit the mirror directly.
+# Publish companion/ into the PUBLIC graffito repo's Pages tree
+# (github.com/ObjSal/graffito → docs/companion/ → GitHub Pages at
+# https://objsal.github.io/graffito/companion/).
+#
+# Canonical source stays HERE (prime-chain-notes/companion — its tests and
+# the Prime e2e live next to it); never edit graffito/docs/companion
+# directly. The old chain-notes-companion deploy-mirror repo is archived
+# and serves only redirects (it existed because prime-chain-notes was
+# once private; both repos are public since 2026-07-11, and the companion
+# moved under the Graffito product home 2026-08-12).
 set -euo pipefail
 
-MIRROR="${COMPANION_MIRROR:-$HOME/Projects/chain-notes-companion}"
+GRAFFITO="${GRAFFITO_REPO:-$HOME/Projects/prime/graffito}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+DEST="$GRAFFITO/docs/companion"
 
-[ -d "$MIRROR/.git" ] || { echo "mirror checkout not found at $MIRROR" >&2; exit 1; }
+[ -d "$GRAFFITO/.git" ] || { echo "graffito checkout not found at $GRAFFITO" >&2; exit 1; }
+mkdir -p "$DEST"
 cp "$HERE/companion/index.html" "$HERE/companion/viewer.html" \
    "$HERE/companion/note.html" "$HERE/companion/chain-scan.js" \
    "$HERE/companion/owner-probe.js" \
    "$HERE/companion/server.py" \
    "$HERE/companion/jsqr.js" "$HERE/companion/qrcode-gen.js" \
-   "$HERE/companion/ur.js" "$MIRROR/"
-cd "$MIRROR"
-if [ -z "$(git status --porcelain)" ]; then
-    echo "mirror already up to date"
+   "$HERE/companion/ur.js" "$DEST/"
+cd "$GRAFFITO"
+if [ -z "$(git status --porcelain docs/companion)" ]; then
+    echo "graffito docs/companion already up to date"
     exit 0
 fi
-git add index.html viewer.html note.html chain-scan.js owner-probe.js server.py jsqr.js qrcode-gen.js ur.js
-git commit -m "Sync from prime-chain-notes companion/ ($(cd "$HERE" && git rev-parse --short HEAD))"
+git add docs/companion
+git commit -m "Sync companion from prime-chain-notes ($(cd "$HERE" && git rev-parse --short HEAD))"
 git push
-echo "published — https://objsal.github.io/chain-notes-companion/"
+echo "published — https://objsal.github.io/graffito/companion/"
