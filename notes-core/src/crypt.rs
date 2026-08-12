@@ -15,14 +15,9 @@ pub const TAG_LEN: usize = 16;
 /// Fixed size overhead of a sealed blob over its plaintext.
 pub const SEAL_OVERHEAD: usize = NONCE_LEN + TAG_LEN;
 
-/// The note_id is bound as AEAD associated data so a sealed body can't be
-/// replayed under a different note identity.
-fn aad(note_id: &[u8; 4]) -> [u8; 4] {
-    *note_id
-}
-
 /// Seal with an explicit nonce and arbitrary AAD (directed notes bind
-/// sender/recipient keys — see dm.rs; own notes bind only the note_id).
+/// sender/recipient keys + the funding outpoint — see dm.rs; own notes use
+/// an empty AAD, see `seal`/`open` below).
 pub(crate) fn seal_with_nonce_aad(
     key: &[u8; 32],
     aad: &[u8],
@@ -59,24 +54,27 @@ pub(crate) fn open_aad(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Result<Vec<u8
 }
 
 /// Seal with an explicit nonce (tests). Production callers use `seal`.
+/// Self-notes carry no per-note identifier to bind (the old `note_id` AAD
+/// is gone along with the field itself — PLAN-pnte-redesign.md), so the
+/// AAD is empty; the key itself (derived per-identity from the app seed)
+/// is what scopes decryption.
 pub fn seal_with_nonce(
     key: &[u8; 32],
-    note_id: &[u8; 4],
     nonce: &[u8; NONCE_LEN],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    seal_with_nonce_aad(key, &aad(note_id), nonce, plaintext)
+    seal_with_nonce_aad(key, &[], nonce, plaintext)
 }
 
 /// Seal a note body with a fresh TRNG/OS nonce.
-pub fn seal(key: &[u8; 32], note_id: &[u8; 4], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+pub fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::getrandom(&mut nonce).map_err(|_| Error::Entropy)?;
-    seal_with_nonce(key, note_id, &nonce, plaintext)
+    seal_with_nonce(key, &nonce, plaintext)
 }
 
 /// Open a sealed blob. A failure means "not ours / corrupted" — callers
 /// treat it as a foreign payload, not a fatal error.
-pub fn open(key: &[u8; 32], note_id: &[u8; 4], blob: &[u8]) -> Result<Vec<u8>, Error> {
-    open_aad(key, &aad(note_id), blob)
+pub fn open(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, Error> {
+    open_aad(key, &[], blob)
 }
