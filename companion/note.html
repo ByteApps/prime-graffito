@@ -86,6 +86,7 @@ function log(el, msg, cls) {
   const q = new URLSearchParams(location.search);
   const network = q.get("network");
   const address = (q.get("address") || "").trim();
+  // The note id IS the txid (PLAN-pnte-redesign.md) — 64 lowercase hex chars.
   const noteId = (q.get("note") || "").trim().toLowerCase();
   // Optional &mine=<addr1,addr2,...> (comma-separated) extends OWN detection
   // to additional funding-source addresses via chain-scan.js's myAddresses
@@ -95,8 +96,8 @@ function log(el, msg, cls) {
   // DISPLAY-OWNER dedup (2026-07-18) — see viewer.html's matching comment.
   const mineAddresses = (q.get("mine") || "").split(",").map((a) => a.trim()).filter(Boolean);
   const notebookAddresses = mineAddresses.filter((a) => P2TR_RE.test(a));
-  if (!network || !API[network] || !address || !/^[0-9a-f]{8}$/.test(noteId)) {
-    return log(logEl, "Need ?address=…&network=…&note=<8-hex note id> — open a " +
+  if (!network || !API[network] || !address || !/^[0-9a-f]{64}$/.test(noteId)) {
+    return log(logEl, "Need ?address=…&network=…&note=<txid> — open a " +
       "note from the viewer to get a link.", "err");
   }
   if (network === "regtest" && !serverMode) {
@@ -110,21 +111,17 @@ function log(el, msg, cls) {
   $("allLink").href = `viewer.html?address=${encodeURIComponent(address)}&network=${network}${mineQuery}`;
 
   try {
-    log(logEl, `Scanning ${address} on ${network}…`);
-    const scan = await scanAddress(API[network].base, address,
-      (n) => log(logEl, `  …paged ${n} more confirmed txs`), mineAddresses, notebookAddresses);
-    // Own and received notes may share a note_id (separate buckets by
-    // design) — render every match.
-    const matches = scan.notes.filter((n) => n.noteId === noteId);
-    if (!matches.length) {
-      return log(logEl, `No note ${noteId} found at this address ` +
-        `(${scan.notes.length} note(s) exist — see "All notes").`, "err");
+    log(logEl, `Fetching tx ${noteId}…`);
+    // The note id IS the txid — fetch it directly instead of scanning the
+    // whole address history (PLAN-pnte-redesign.md).
+    const note = await fetchNote(API[network].base, noteId, address, mineAddresses, notebookAddresses);
+    if (!note) {
+      return log(logEl, `Tx ${noteId} is not a Chain Notes entry at this address ` +
+        `(not found, doesn't touch the address, or has no valid PNTE header).`, "err");
     }
-    for (const note of matches) {
-      $("note").appendChild(buildNoteCard(note, API[network].explorer, null));
-    }
+    $("note").appendChild(buildNoteCard(note, API[network].explorer, null));
     log(logEl, "Done.", "ok");
-    window.__cnNote = { notes: matches, note: matches[0] };
+    window.__cnNote = { notes: [note], note };
   } catch (e) {
     log(logEl, `Failed: ${e.message}`, "err");
   }

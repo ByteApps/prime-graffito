@@ -376,7 +376,13 @@ bundle)
         # companion/index.html's output_addrs (FLAG_MULTI recipient-list
         # decode: recipients are output_addrs[0..count], preceding change).
         output_addrs="$(jq '[.vout[] | select(.scriptPubKey.type != "nulldata") | .scriptPubKey.address] | map(select(. != null))' <<<"$raw")"
-        notes_onchain="$(jq --argjson tx "{\"txid\":\"$txid\",\"height\":$height,\"blocktime\":$blocktime,\"spends_from_self\":$self,\"payloads\":$payloads,\"output_addrs\":$output_addrs}" '. + [$tx]' <<<"$notes_onchain")"
+        # The tx's FIRST input's prevout, as "<txid>:<vout>" (display-order
+        # txid — notes-core's bundle::format_outpoint convention;
+        # PLAN-pnte-redesign.md: the directed-private AAD binds this
+        # outpoint instead of the now-nonexistent note_id). A coinbase
+        # input (no .txid) yields JSON null, same as index.html's mirror.
+        first_input_outpoint="$(jq 'if ((.vin[0].txid // "") != "") then "\(.vin[0].txid):\(.vin[0].vout)" else null end' <<<"$raw")"
+        notes_onchain="$(jq --argjson tx "{\"txid\":\"$txid\",\"height\":$height,\"blocktime\":$blocktime,\"spends_from_self\":$self,\"payloads\":$payloads,\"output_addrs\":$output_addrs,\"first_input_outpoint\":$first_input_outpoint}" '. + [$tx]' <<<"$notes_onchain")"
     done
     jq -n --argjson utxos "$utxos" --argjson notes "$notes_onchain" --argjson tip "$tip" --argjson owner_used "$owner_used" --arg net "$CN_NETWORK" '{
         network: $net, full: true, tip_height: $tip,

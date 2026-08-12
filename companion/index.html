@@ -337,6 +337,15 @@ $("buildBtn").addEventListener("click", async () => {
           .filter((o) => o.scriptpubkey_type !== "op_return")
           .map((o) => o.scriptpubkey_address)
           .filter(Boolean);
+        // The tx's FIRST input's prevout, as "<txid>:<vout>" (display-order
+        // txid — notes-core's bundle::format_outpoint convention). A
+        // directed-private note's AAD binds this outpoint instead of the
+        // (now nonexistent) note_id (PLAN-pnte-redesign.md); a coinbase
+        // input (no `txid`) leaves it null, same as any other tx this
+        // field can't be derived for — the device degrades that note to a
+        // sealed placeholder, never a crash.
+        const firstInputOutpoint =
+          t.vin[0] && t.vin[0].txid ? `${t.vin[0].txid}:${t.vin[0].vout}` : null;
         return {
           txid: t.txid,
           height: t.status.confirmed ? t.status.block_height : null,
@@ -348,6 +357,7 @@ $("buildBtn").addEventListener("click", async () => {
           recipient,
           input_prevout_spks: inputPrevoutSpks,
           output_addrs: outputAddrs,
+          first_input_outpoint: firstInputOutpoint,
           payloads,
         };
       })
