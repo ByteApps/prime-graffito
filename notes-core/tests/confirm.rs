@@ -31,7 +31,7 @@ fn addr_of(spk: &[u8]) -> String {
 }
 
 fn pnte_op_return(text: &str) -> Vec<u8> {
-    let payload = envelope::encode_chunks([1, 2, 3, 4], 0, text.as_bytes(), 100_000).unwrap();
+    let payload = envelope::encode_outputs(0, None, text.as_bytes(), 100_000).unwrap();
     op_return_script(&payload[0])
 }
 

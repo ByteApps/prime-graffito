@@ -126,31 +126,77 @@ fn dm_derivation_vector() {
     );
 }
 
-/// FROZEN multi-recipient AAD layout (dm.rs): `multi_body_aad` = sender_x(32)
-/// || note_id(4), 36 bytes — pinned so a byte-layout regression is caught
-/// even though `seal_multi`/`seal_aad` use a random nonce internally (see
-/// `multi_seal_open_vector` below for a full round-trip pin).
+/// FROZEN directed-note AAD layout (dm.rs, PLAN-pnte-redesign.md 2026-08-11
+/// rebinding): `dm_aad` = sender_x(32) || recipient_x(32) || outpoint(36),
+/// 100 bytes — pinned so a byte-layout regression is caught even though
+/// `seal_aad` uses a random nonce internally (see
+/// `directed_aad_seal_open_vector` below for a full round-trip pin, and
+/// `roundtrip.rs::directed_aad_binds_direction_and_sender` for the
+/// composed-tx-level proof).
 #[test]
-fn multi_body_aad_layout_vector() {
-    use notes_core::dm::multi_body_aad;
+fn dm_aad_layout_vector() {
+    use notes_core::dm::dm_aad;
     let sender_x = [0x11u8; 32];
-    let note_id = [0xAA, 0xBB, 0xCC, 0xDD];
-    let aad = multi_body_aad(&sender_x, &note_id);
-    assert_eq!(aad.len(), 36);
+    let recipient_x = [0x22u8; 32];
+    let mut outpoint = [0u8; 36];
+    outpoint[..32].copy_from_slice(&[0xAAu8; 32]);
+    outpoint[32..].copy_from_slice(&7u32.to_le_bytes());
+    let aad = dm_aad(&sender_x, &recipient_x, &outpoint);
+    assert_eq!(aad.len(), 100);
     assert_eq!(&aad[..32], &sender_x);
-    assert_eq!(&aad[32..], &note_id);
+    assert_eq!(&aad[32..64], &recipient_x);
+    assert_eq!(&aad[64..], &outpoint);
+}
+
+/// FROZEN single-recipient directed-note seal/open round-trip with a fixed
+/// outpoint: pins that `seal_directed`/`open_received`/`open_sent` all
+/// agree, and that authentication fails under a different outpoint (the
+/// AEAD-level proof that the AAD rebinding actually took — a wrong
+/// outpoint is now exactly as fatal to decryption as the old wrong
+/// note_id was).
+#[test]
+fn directed_aad_seal_open_vector() {
+    use notes_core::bundle::Identity;
+    use notes_core::dm;
+
+    let a = Identity::from_app_seed(&[7u8; 32]).unwrap(); // sender
+    let b = Identity::from_app_seed(&[9u8; 32]).unwrap(); // recipient
+    let mut outpoint = [0u8; 36];
+    outpoint[..32].copy_from_slice(&[0x77u8; 32]);
+    outpoint[32..].copy_from_slice(&3u32.to_le_bytes());
+    let plaintext = b"frozen outpoint-bound vector";
+
+    let blob =
+        dm::seal_directed(&a.tweaked_seckey, &a.output_x, &b.output_x, &outpoint, plaintext)
+            .unwrap();
+    assert_eq!(
+        dm::open_received(&b.tweaked_seckey, &b.output_x, &a.output_x, &outpoint, &blob).unwrap(),
+        plaintext
+    );
+    // Sender re-read (wipe recovery): symmetric with open_received.
+    assert_eq!(
+        dm::open_sent(&a.tweaked_seckey, &a.output_x, &b.output_x, &outpoint, &blob).unwrap(),
+        plaintext
+    );
+
+    // A different outpoint (a different funding spend) fails the AAD.
+    let mut wrong_outpoint = outpoint;
+    wrong_outpoint[32..].copy_from_slice(&4u32.to_le_bytes());
+    assert!(dm::open_received(&b.tweaked_seckey, &b.output_x, &a.output_x, &wrong_outpoint, &blob)
+        .is_err());
 }
 
 /// Full `seal_multi`/open round-trip with FIXED identities and a fixed
-/// note_id: pins the wrap length (`dm::WRAP_LEN` == 72 bytes, always), that
+/// outpoint: pins the wrap length (`dm::WRAP_LEN` == 72 bytes, always), that
 /// the recipient side (`open_received_multi`, own-index-first and
 /// fallback-to-any-wrap) and the sender side (`open_sent_multi`,
 /// index-0-first) both recover the SAME plaintext via the shared content
 /// key, and that authentication fails for a stranger, under a wrong
-/// note_id, and against a tampered wrap or a tampered sealed body (the
+/// outpoint, and against a tampered wrap or a tampered sealed body (the
 /// AEAD-level protection that actually secures the content — a tampered
-/// *count* byte is a framing-layer concern, covered by the decode-liberal
-/// tests in `multi_recipient.rs`, not an AEAD failure here).
+/// *count* byte is no longer even part of the body at all, since the
+/// recipient count now lives in the envelope header — see the
+/// decode-liberal tests in `multi_recipient.rs`).
 #[test]
 fn multi_seal_open_vector() {
     use notes_core::bundle::Identity;
@@ -159,7 +205,9 @@ fn multi_seal_open_vector() {
     let a = Identity::from_app_seed(&[7u8; 32]).unwrap(); // sender
     let b = Identity::from_app_seed(&[9u8; 32]).unwrap(); // recipient 0
     let c = Identity::from_app_seed(&[11u8; 32]).unwrap(); // recipient 1
-    let note_id = [1, 2, 3, 4];
+    let mut outpoint = [0u8; 36];
+    outpoint[..32].copy_from_slice(&[0x33u8; 32]);
+    outpoint[32..].copy_from_slice(&1u32.to_le_bytes());
     let content_key = [0x55u8; 32];
     let plaintext = b"shared secret for B and C";
 
@@ -167,7 +215,7 @@ fn multi_seal_open_vector() {
         &a.tweaked_seckey,
         &a.output_x,
         &[b.output_x, c.output_x],
-        &note_id,
+        &outpoint,
         &content_key,
         plaintext,
     )
@@ -183,7 +231,7 @@ fn multi_seal_open_vector() {
         &b.tweaked_seckey,
         &b.output_x,
         &a.output_x,
-        &note_id,
+        &outpoint,
         &wraps,
         &sealed_body,
         Some(0),
@@ -196,7 +244,7 @@ fn multi_seal_open_vector() {
         &c.tweaked_seckey,
         &c.output_x,
         &a.output_x,
-        &note_id,
+        &outpoint,
         &wraps,
         &sealed_body,
         Some(1),
@@ -209,7 +257,7 @@ fn multi_seal_open_vector() {
         &b.tweaked_seckey,
         &b.output_x,
         &a.output_x,
-        &note_id,
+        &outpoint,
         &wraps,
         &sealed_body,
         None,
@@ -222,7 +270,7 @@ fn multi_seal_open_vector() {
         &a.tweaked_seckey,
         &a.output_x,
         &[b.output_x, c.output_x],
-        &note_id,
+        &outpoint,
         &wraps,
         &sealed_body,
     )
@@ -235,20 +283,21 @@ fn multi_seal_open_vector() {
         &stranger.tweaked_seckey,
         &stranger.output_x,
         &a.output_x,
-        &note_id,
+        &outpoint,
         &wraps,
         &sealed_body,
         None,
     )
     .is_err());
 
-    // Wrong note_id: the wrap's AAD no longer matches.
-    let wrong_id = [9, 9, 9, 9];
+    // Wrong outpoint: the wrap's AAD no longer matches.
+    let mut wrong_outpoint = outpoint;
+    wrong_outpoint[32..].copy_from_slice(&9u32.to_le_bytes());
     assert!(dm::open_received_multi(
         &b.tweaked_seckey,
         &b.output_x,
         &a.output_x,
-        &wrong_id,
+        &wrong_outpoint,
         &wraps,
         &sealed_body,
         Some(0),
@@ -262,7 +311,7 @@ fn multi_seal_open_vector() {
         &b.tweaked_seckey,
         &b.output_x,
         &a.output_x,
-        &note_id,
+        &outpoint,
         &tampered_wraps,
         &sealed_body,
         Some(0),
@@ -277,7 +326,7 @@ fn multi_seal_open_vector() {
         &b.tweaked_seckey,
         &b.output_x,
         &a.output_x,
-        &note_id,
+        &outpoint,
         &wraps,
         &tampered_body,
         Some(0),

@@ -66,7 +66,7 @@ fn policy_serde_roundtrip() {
 fn locktime_reaches_the_wire_and_moves_the_txid() {
     let id = identity();
     let build = |lock_time: u32| {
-        compose_note(&id, &utxos(), "anti fee sniping", false, [1, 2, 3, 4], 80, 2.0, lock_time, || {
+        compose_note(&id, &utxos(), "anti fee sniping", false, 80, 2.0, lock_time, || {
             Ok(AUX)
         })
         .unwrap()
@@ -95,7 +95,7 @@ fn locktime_does_not_change_vsize_or_fee() {
     // change.
     let id = identity();
     let build = |lock_time: u32| {
-        compose_note(&id, &utxos(), "same size either way", false, [5, 6, 7, 8], 80, 3.0, lock_time,
+        compose_note(&id, &utxos(), "same size either way", false, 80, 3.0, lock_time,
             || Ok(AUX))
         .unwrap()
     };
@@ -132,7 +132,6 @@ fn nonzero_locktime_cross_checks_against_rust_bitcoin() {
         &inputs,
         "locktime is covered by the sighash",
         true,
-        [0xAB, 0xCD, 0xEF, 0x02],
         None,
         80,
         3.0,
@@ -199,7 +198,6 @@ fn tampering_with_locktime_breaks_the_signature() {
         &utxos(),
         "tamper me",
         false,
-        [1, 1, 2, 3],
         80,
         2.0,
         912_744,

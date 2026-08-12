@@ -268,6 +268,9 @@ fn sender_bundle(note: &notes_core::tx::NoteTx, output_addrs: &[String]) -> Sync
             recipient: None,
             input_prevout_spks: Vec::new(),
             output_addrs: output_addrs.to_vec(),
+            first_input_outpoint: note.spent_outpoints.first().map(|(txid, vout)| {
+                notes_core::bundle::format_outpoint(txid, *vout)
+            }),
         }],
         ..Default::default()
     }
@@ -298,6 +301,9 @@ fn recipient_bundle(
             recipient: None,
             input_prevout_spks: Vec::new(),
             output_addrs: output_addrs.to_vec(),
+            first_input_outpoint: note.spent_outpoints.first().map(|(txid, vout)| {
+                notes_core::bundle::format_outpoint(txid, *vout)
+            }),
         }],
         ..Default::default()
     }
@@ -314,7 +320,6 @@ fn compose_scan_roundtrip_private_multi() {
         &utxos(),
         "sealed for B and C",
         true,
-        [1, 2, 3, 4],
         &recipients,
         CONTENT_KEY,
         None,
@@ -324,12 +329,12 @@ fn compose_scan_roundtrip_private_multi() {
         || Ok(AUX))
     .unwrap();
 
-    // Wire check: FLAG_MULTI + FLAG_DIRECTED + FLAG_PRIVATE.
+    // Wire check: FLAG_MULTI + FLAG_DIRECTED + FLAG_PRIVATE, count=2 in the header.
     let op_return =
         note.tx.outputs.iter().find_map(|o| op_return_payload(&o.script_pubkey)).unwrap();
-    let chunk = envelope::decode(op_return).unwrap();
-    assert_eq!(chunk.flags, FLAG_DIRECTED | FLAG_MULTI | FLAG_PRIVATE);
-    assert!(chunk.is_multi());
+    let (flags, multi_count, _offset) = envelope::parse_header(op_return).unwrap();
+    assert_eq!(flags, FLAG_DIRECTED | FLAG_MULTI | FLAG_PRIVATE);
+    assert_eq!(multi_count, Some(2));
 
     let output_addrs = vec![b.address(NET), c.address(NET)];
 
@@ -383,7 +388,6 @@ fn compose_scan_roundtrip_public_multi() {
         &utxos(),
         "postcard to three",
         false,
-        [5, 6, 7, 8],
         &recipients,
         CONTENT_KEY,
         None,
@@ -417,7 +421,6 @@ fn single_recipient_via_multi_api_is_byte_identical_public() {
         &utxos(),
         "hi",
         false,
-        [1, 1, 1, 1],
         &[(recipient_of(&b), 500)],
         CONTENT_KEY,
         None,
@@ -427,7 +430,7 @@ fn single_recipient_via_multi_api_is_byte_identical_public() {
         || Ok(AUX))
     .unwrap();
     let direct = compose_directed_note_with_change_amount(
-        &a, &utxos(), "hi", false, [1, 1, 1, 1], &recipient_of(&b), 500, None, 80, 2.0, 0, || Ok(AUX))
+        &a, &utxos(), "hi", false, &recipient_of(&b), 500, None, 80, 2.0, 0, || Ok(AUX))
     .unwrap();
     assert_eq!(via_multi.raw_hex, direct.raw_hex);
     assert_eq!(via_multi.tx, direct.tx);
@@ -438,7 +441,6 @@ fn single_recipient_via_multi_api_is_byte_identical_public() {
         &utxos(),
         "hi",
         false,
-        [1, 1, 1, 1],
         &[(recipient_of(&b), 500), (recipient_of(&b), 500)],
         CONTENT_KEY,
         None,
@@ -465,7 +467,6 @@ fn single_recipient_via_multi_api_delegates_for_private_too() {
         &utxos(),
         "hi",
         true,
-        [1, 1, 1, 1],
         &[(recipient_of(&b), 500)],
         CONTENT_KEY,
         None,
@@ -475,13 +476,13 @@ fn single_recipient_via_multi_api_delegates_for_private_too() {
         || Ok(AUX))
     .unwrap();
     let direct = compose_directed_note_with_change_amount(
-        &a, &utxos(), "hi", true, [1, 1, 1, 1], &recipient_of(&b), 500, None, 80, 2.0, 0, || Ok(AUX))
+        &a, &utxos(), "hi", true, &recipient_of(&b), 500, None, 80, 2.0, 0, || Ok(AUX))
     .unwrap();
 
     let op_return =
         via_multi.tx.outputs.iter().find_map(|o| op_return_payload(&o.script_pubkey)).unwrap();
-    let chunk = envelope::decode(op_return).unwrap();
-    assert!(!chunk.is_multi(), "1-entry compose must never set FLAG_MULTI");
+    let (_flags, multi_count, _offset) = envelope::parse_header(op_return).unwrap();
+    assert_eq!(multi_count, None, "1-entry compose must never set FLAG_MULTI");
     assert_eq!(via_multi.tx.outputs.len(), direct.tx.outputs.len());
     assert_eq!(via_multi.sent, direct.sent);
     assert_eq!(via_multi.change, direct.change);
@@ -505,7 +506,6 @@ fn compose_directed_note_multi_exact_spends_all_given_coins() {
         &coins,
         "coin control",
         false,
-        [2, 2, 2, 2],
         &recipients,
         CONTENT_KEY,
         None,
@@ -527,7 +527,7 @@ fn multi_private_requires_taproot_recipients() {
     let b = identity(9);
     let recipients = vec![(recipient_of(&b), 400u64), (non_taproot_recipient(), 500u64)];
     let err = compose_directed_note_multi_with_change(
-        &a, &utxos(), "hi", true, [3, 3, 3, 3], &recipients, CONTENT_KEY, None, 80, 2.0, 0, || Ok(AUX))
+        &a, &utxos(), "hi", true, &recipients, CONTENT_KEY, None, 80, 2.0, 0, || Ok(AUX))
     .unwrap_err();
     assert!(matches!(err, notes_core::Error::RecipientNotTaproot));
 }
@@ -538,7 +538,7 @@ fn multi_public_allows_non_taproot_recipients() {
     let b = identity(9);
     let recipients = vec![(recipient_of(&b), 400u64), (non_taproot_recipient(), 500u64)];
     let note = compose_directed_note_multi_with_change(
-        &a, &utxos(), "hi", false, [3, 3, 3, 3], &recipients, CONTENT_KEY, None, 80, 2.0, 0, || Ok(AUX))
+        &a, &utxos(), "hi", false, &recipients, CONTENT_KEY, None, 80, 2.0, 0, || Ok(AUX))
     .unwrap();
     assert_eq!(note.sent, 900);
 }
@@ -552,12 +552,25 @@ fn multi_public_allows_non_taproot_recipients() {
 
 fn hand_crafted_bundle(
     flags: u8,
+    multi_count: Option<u8>,
     body: &[u8],
-    note_id: [u8; 4],
     output_addrs: Vec<String>,
     sender_addr: &str,
 ) -> SyncBundle {
-    let payload = envelope::encode_chunks(note_id, flags, body, 100_000).unwrap();
+    let payload = envelope::encode_outputs(flags, multi_count, body, 100_000).unwrap();
+    hand_crafted_bundle_raw(payload, output_addrs, sender_addr)
+}
+
+/// Like [`hand_crafted_bundle`], but takes already-assembled raw OP_RETURN
+/// payload bytes — for shapes `envelope::encode_outputs` refuses to build
+/// at all (validated on construction, e.g. a zero multi-count), which must
+/// therefore be hand-assembled to prove the DECODER'S liberal rejection
+/// rather than the encoder's refusal.
+fn hand_crafted_bundle_raw(
+    payloads: Vec<Vec<u8>>,
+    output_addrs: Vec<String>,
+    sender_addr: &str,
+) -> SyncBundle {
     SyncBundle {
         network: "regtest".into(),
         notes_onchain: vec![OnchainTx {
@@ -565,13 +578,14 @@ fn hand_crafted_bundle(
             height: Some(1),
             blocktime: Some(1_700_000_000),
             spends_from_self: false,
-            payloads: payload.iter().map(hex::encode).collect(),
+            payloads: payloads.iter().map(hex::encode).collect(),
             pays_self: true,
             sender: Some(sender_addr.to_string()),
             author_candidates: Vec::new(),
             recipient: None,
             input_prevout_spks: Vec::new(),
             output_addrs,
+            first_input_outpoint: None,
         }],
         ..Default::default()
     }
@@ -581,11 +595,10 @@ fn hand_crafted_bundle(
 fn decode_liberal_count_one_accepted() {
     let a = identity(7);
     let b = identity(9);
-    let mut body = vec![1u8];
-    body.extend_from_slice(b"solo via multi flag");
+    let body = b"solo via multi flag".to_vec();
     let flags = FLAG_DIRECTED | FLAG_MULTI;
     let bundle =
-        hand_crafted_bundle(flags, &body, [1, 1, 1, 1], vec![b.address(NET)], &a.address(NET));
+        hand_crafted_bundle(flags, Some(1), &body, vec![b.address(NET)], &a.address(NET));
     let notes = extract_notes(&bundle, &b, NET);
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0].text.as_deref(), Some("solo via multi flag"));
@@ -596,15 +609,19 @@ fn decode_liberal_count_one_accepted() {
 fn decode_liberal_count_zero_rejected() {
     let a = identity(7);
     let b = identity(9);
-    let mut body = vec![0u8];
-    body.extend_from_slice(b"nobody");
+    // envelope::encode_outputs refuses to build a zero multi-count header
+    // at all, so it's hand-assembled byte-for-byte: PNTE + '1' + flags(2
+    // hex) + count "00" + ' ' + body.
     let flags = FLAG_DIRECTED | FLAG_MULTI;
-    let bundle =
-        hand_crafted_bundle(flags, &body, [2, 2, 2, 2], vec![b.address(NET)], &a.address(NET));
+    let mut payload = b"PNTE1".to_vec();
+    payload.extend_from_slice(format!("{flags:02x}00 ").as_bytes());
+    payload.extend_from_slice(b"nobody");
+    let bundle = hand_crafted_bundle_raw(vec![payload], vec![b.address(NET)], &a.address(NET));
     let notes = extract_notes(&bundle, &b, NET);
-    assert_eq!(notes.len(), 1);
-    assert_eq!(notes[0].text, None, "count=0 must be undecodable, not a crash");
-    assert!(notes[0].recipients.is_empty());
+    assert!(
+        notes.is_empty(),
+        "a count=0 header is undecodable at the envelope level — the tx never registers as a note at all"
+    );
 }
 
 #[test]
@@ -612,15 +629,14 @@ fn decode_liberal_truncated_wraps_rejected() {
     let a = identity(7);
     let b = identity(9);
     let c = identity(11);
-    // Claims 2 recipients (2*72 = 144 wrap bytes expected) but the body
-    // only has room for a fraction of one wrap.
-    let mut body = vec![2u8];
-    body.extend_from_slice(&[0u8; 10]);
+    // Header claims 2 recipients (2*72 = 144 wrap bytes expected) but the
+    // body only has room for a fraction of one wrap.
+    let body = vec![0u8; 10];
     let flags = FLAG_DIRECTED | FLAG_MULTI | FLAG_PRIVATE;
     let bundle = hand_crafted_bundle(
         flags,
+        Some(2),
         &body,
-        [3, 3, 3, 3],
         vec![b.address(NET), c.address(NET)],
         &a.address(NET),
     );
@@ -639,8 +655,7 @@ fn reply_set_unit() {
     let b = identity(9);
     let c = identity(11);
     let note = RecoveredNote {
-        note_id: [1, 2, 3, 4],
-        txids: vec!["tx".into()],
+        id: "aa".repeat(32),
         height: Some(1),
         blocktime: Some(1),
         private: true,
@@ -687,14 +702,18 @@ fn sealed_payloads_multi_matches_composer_and_delegates() {
     let c = identity(11);
     let rb = Recipient::parse(NET, &b.address(NET)).unwrap();
     let rc = Recipient::parse(NET, &c.address(NET)).unwrap();
-    let note_id = [5, 5, 5, 5];
+    // Arbitrary fixed outpoint — this test seals and opens by hand (not
+    // through a real signed tx), so any 36 bytes work as long as the seal
+    // and open sides agree, matching how a real PSBT-path caller would
+    // thread its own chosen inputs' first outpoint.
+    let outpoint = [0x24u8; 36];
     let key = [0x42u8; 32];
 
     // Public 2-recipient: byte-identical to the composer's OP_RETURNs.
     let (payloads, spks) = sealed_note_payloads_multi(
         &a, "psbt-path multi", false,
         &[Recipient::parse(NET, &b.address(NET)).unwrap(), Recipient::parse(NET, &c.address(NET)).unwrap()],
-        note_id, key, 100_000,
+        outpoint, key, 100_000,
     ).unwrap();
     assert_eq!(spks, vec![rb.spk.clone(), rc.spk.clone()]);
     let utxos = vec![notes_core::tx::Utxo { txid: [3u8; 32], vout: 0, value: 1_000_000 }];
@@ -703,7 +722,7 @@ fn sealed_payloads_multi_matches_composer_and_delegates() {
         (Recipient::parse(NET, &c.address(NET)).unwrap(), notes_core::DUST_LIMIT),
     ];
     let note = compose_directed_note_multi_with_change(
-        &a, &utxos, "psbt-path multi", false, note_id, &recipients, key, None, 100_000, 1.0,
+        &a, &utxos, "psbt-path multi", false, &recipients, key, None, 100_000, 1.0,
         0,
         || Ok([0u8; 32])).unwrap();
     let composer_payloads: Vec<Vec<u8>> = note
@@ -717,20 +736,19 @@ fn sealed_payloads_multi_matches_composer_and_delegates() {
     let (ppayloads, pspks) = sealed_note_payloads_multi(
         &a, "sealed for both", true,
         &[Recipient::parse(NET, &b.address(NET)).unwrap(), Recipient::parse(NET, &c.address(NET)).unwrap()],
-        note_id, key, 100_000,
+        outpoint, key, 100_000,
     ).unwrap();
     assert_eq!(pspks.len(), 2);
-    let chunk = envelope::decode(&ppayloads[0]).unwrap();
-    assert_eq!(chunk.flags, FLAG_DIRECTED | FLAG_MULTI | FLAG_PRIVATE);
-    let body = envelope::reassemble(&ppayloads.iter().filter_map(|p| envelope::decode(p)).collect::<Vec<_>>()).unwrap();
-    let count = body[0] as usize;
-    assert_eq!(count, 2);
-    let wraps: Vec<Vec<u8>> = body[1..1 + 2 * notes_core::dm::WRAP_LEN]
+    let (flags, multi_count, _offset) = envelope::parse_header(&ppayloads[0]).unwrap();
+    assert_eq!(flags, FLAG_DIRECTED | FLAG_MULTI | FLAG_PRIVATE);
+    assert_eq!(multi_count, Some(2));
+    let decoded = envelope::decode_note(&ppayloads).unwrap();
+    let wraps: Vec<Vec<u8>> = decoded.body[..2 * notes_core::dm::WRAP_LEN]
         .chunks(notes_core::dm::WRAP_LEN).map(<[u8]>::to_vec).collect();
-    let sealed = &body[1 + 2 * notes_core::dm::WRAP_LEN..];
+    let sealed = &decoded.body[2 * notes_core::dm::WRAP_LEN..];
     for (i, reader) in [(0usize, &b), (1usize, &c)] {
         let pt = notes_core::dm::open_received_multi(
-            &reader.tweaked_seckey, &reader.output_x, &a.output_x, &note_id, &wraps, sealed, Some(i),
+            &reader.tweaked_seckey, &reader.output_x, &a.output_x, &outpoint, &wraps, sealed, Some(i),
         ).unwrap();
         assert_eq!(pt, b"sealed for both");
     }
@@ -739,9 +757,9 @@ fn sealed_payloads_multi_matches_composer_and_delegates() {
     let (single, sspks) = sealed_note_payloads_multi(
         &a, "solo", false,
         &[Recipient::parse(NET, &b.address(NET)).unwrap(), Recipient::parse(NET, &b.address(NET)).unwrap()],
-        note_id, key, 100_000,
+        outpoint, key, 100_000,
     ).unwrap();
-    let (legacy, lspk) = sealed_note_payloads(&a, "solo", false, Some(&rb), note_id, 100_000).unwrap();
+    let (legacy, lspk) = sealed_note_payloads(&a, "solo", false, Some(&rb), outpoint, 100_000).unwrap();
     assert_eq!(single, legacy);
     assert_eq!(sspks, vec![lspk.unwrap()]);
 }
