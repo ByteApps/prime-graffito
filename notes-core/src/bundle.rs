@@ -1,17 +1,22 @@
 //! Sync-bundle JSON (companion → device), note extraction (the scanner
 //! side), and the high-level compose path (device → signed tx hex).
+//!
+//! PLAN-pnte-redesign.md (2026-08-11): **one note = one transaction.** The
+//! scanner groups strictly per-tx (no more note_id×origin chunk buckets —
+//! txids are unique by construction), and a note's id IS its txid.
 
 use serde::{Deserialize, Serialize};
 
 use crate::address::{p2tr_script_pubkey, p2tr_x_of_address, taproot_address, Recipient};
 use crate::crypt;
 use crate::dm;
-use crate::envelope::{self, Chunk, FLAG_DIRECTED, FLAG_MULTI, FLAG_PRIVATE};
+use crate::envelope::{self, FLAG_DIRECTED, FLAG_MULTI, FLAG_PRIVATE};
 use crate::keys::{derive_encryption_key, derive_identity_key, xonly_pubkey};
 use crate::taproot::{taproot_tweak_pubkey, taproot_tweak_seckey};
 use crate::tx::{
     build_note_tx_exact, build_note_tx_multi_exact, build_note_tx_multi_with_change,
-    build_note_tx_with_change, NoteTx, Utxo,
+    build_note_tx_with_change, outpoint_bytes, select_note_inputs, select_note_inputs_multi,
+    NoteTx, Utxo,
 };
 use crate::{Error, Network};
 
@@ -118,7 +123,9 @@ pub struct OnchainTx {
     /// the sender-authentication rule for OWN notes; PNTE payloads in txs
     /// merely PAYING the address surface as RECEIVED notes instead.
     pub spends_from_self: bool,
-    /// OP_RETURN payloads (hex), in output order.
+    /// OP_RETURN payloads (hex), in output order — every OP_RETURN output
+    /// of the tx. The FIRST decodes the PNTE header (PLAN-pnte-redesign.md:
+    /// one note = one tx); the rest are raw body continuation bytes.
     pub payloads: Vec<String>,
     /// True when any output pays the notes address (directed-note delivery).
     #[serde(default)]
@@ -154,6 +161,18 @@ pub struct OnchainTx {
     /// too-short-body case), never a crash.
     #[serde(default)]
     pub output_addrs: Vec<String>,
+    /// The tx's FIRST input's prevout, as `"<txid>:<vout>"` (display-order
+    /// txid, `format_outpoint`'s convention — same as `confirm.rs`'s
+    /// outpoint keys). PLAN-pnte-redesign.md: a directed-private note's AAD
+    /// now binds this outpoint instead of the (now nonexistent) note_id, so
+    /// decoding one requires it. `#[serde(default)]`: absent on bundles from
+    /// a companion that hasn't been updated to report it yet, in which case
+    /// directed-private notes from that bundle simply fail to decrypt
+    /// (undecodable — the same "foreign/can't-open" fallback as any other
+    /// AEAD mismatch), never a crash. Irrelevant to public or self-private
+    /// notes, which don't bind an outpoint.
+    #[serde(default)]
+    pub first_input_outpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,11 +262,39 @@ pub fn decode_scanned(data: &[u8]) -> Result<String, Error> {
     }
 }
 
-/// A note recovered from chain data.
+/// Format a [`Utxo`]'s outpoint as `"<txid>:<vout>"` — display-order txid
+/// (reversed from the internal/wire order `Utxo::txid` stores), matching
+/// `confirm.rs`'s outpoint-key convention. The wire form of
+/// [`OnchainTx::first_input_outpoint`]; public so bundle-producer/test code
+/// can populate that field from a signed [`NoteTx`]'s `spent_outpoints[0]`.
+pub fn format_outpoint(txid_internal: &[u8; 32], vout: u32) -> String {
+    let mut display = *txid_internal;
+    display.reverse();
+    format!("{}:{vout}", hex::encode(display))
+}
+
+/// Parse `"<txid>:<vout>"` (as produced by [`format_outpoint`]) into the
+/// 36-byte wire-order outpoint `dm.rs`'s AAD binds: txid in
+/// internal/little-endian order || vout as `u32`-LE. `None` on any
+/// malformed input — liberal, never a panic.
+fn parse_outpoint(s: &str) -> Option<[u8; 36]> {
+    let (txid_hex, vout_str) = s.split_once(':')?;
+    let mut txid = [0u8; 32];
+    hex::decode_to_slice(txid_hex, &mut txid).ok()?;
+    txid.reverse(); // display order -> internal/wire order
+    let vout: u32 = vout_str.parse().ok()?;
+    let mut out = [0u8; 36];
+    out[..32].copy_from_slice(&txid);
+    out[32..].copy_from_slice(&vout.to_le_bytes());
+    Some(out)
+}
+
+/// A note recovered from chain data. `id` IS the carrying transaction's
+/// txid (display-order hex) — PLAN-pnte-redesign.md: one note = one tx, so
+/// there is no separate note_id anymore.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveredNote {
-    pub note_id: [u8; 4],
-    pub txids: Vec<String>,
+    pub id: String,
     pub height: Option<u64>,
     pub blocktime: Option<u64>,
     pub private: bool,
@@ -302,12 +349,12 @@ pub fn reply_set(note: &RecoveredNote, my_address: &str) -> Vec<String> {
 
 /// Scan a bundle's on-chain txs into notes.
 ///
-/// Acceptance: a tx that SPENDS FROM the notes address carries OWN notes
+/// Acceptance: a tx that SPENDS FROM the notes address carries an OWN note
 /// (the frozen spoof-resistance rule); a tx that only PAYS the address and
-/// carries PNTE is a RECEIVED note, attributed to its (unforgeable) input
-/// address; anything else is ignored. Chunks bucket by (note_id, origin) so
-/// a pays-me tx reusing one of our note_ids can never contaminate our own
-/// note. Import stays idempotent — output depends only on chain content.
+/// carries a valid PNTE header on its first OP_RETURN output is a RECEIVED
+/// note, attributed to its (unforgeable) input address; anything else is
+/// ignored. One tx is at most one note (its id IS the txid), so there is no
+/// cross-tx bucketing to keep separate anymore.
 pub fn extract_notes(
     bundle: &SyncBundle,
     identity: &Identity,
@@ -449,188 +496,92 @@ fn extract_notes_inner(
     notebook_spks: &[Vec<u8>],
     own_notebook_spk: &[u8],
 ) -> Vec<RecoveredNote> {
-    #[derive(PartialEq, Eq, Clone)]
-    enum Origin {
-        Own,
-        Received(Option<String>), // sender address
-    }
-    struct Pending {
-        origin: Origin,
-        chunks: Vec<Chunk>,
-        txids: Vec<String>,
-        height: Option<u64>,
-        blocktime: Option<u64>,
-        recipient: Option<String>,
-        /// Union of taproot addresses seen in the carrying tx(s) — candidate
-        /// authors for a received directed-private note (external funding).
-        author_candidates: Vec<String>,
-        /// DISPLAY-OWNER anchor (own notes only): the first-notebook-input
-        /// spk of the FIRST tx that introduced this note, per
-        /// `tx_notebook_anchor`. `None` = no notebook input found (keep,
-        /// dust-anchored shape) or not applicable (received notes, or
-        /// `notebook_spks` empty — dedup disabled).
-        notebook_anchor: Option<Vec<u8>>,
-        /// Non-OP_RETURN output addresses of the FIRST tx that introduced
-        /// this note, ascending vout order — multi-recipient decode
-        /// (FLAG_MULTI) slices `output_addrs[0..count]` as the recipient
-        /// list. Empty for old bundles (serde default) or non-multi notes,
-        /// which never read this field.
-        output_addrs: Vec<String>,
-    }
-    let mut by_id: Vec<([u8; 4], Pending)> = Vec::new();
+    let mut notes = Vec::new();
+    // Idempotent import: an overlapping/incremental bundle may repeat the
+    // same tx (e.g. two partially-overlapping scans merged by the
+    // caller) — a note's id IS its txid, so the SECOND copy of the same
+    // txid is a pure duplicate, not a second note. Keep the first.
+    let mut seen_txids: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for tx in &bundle.notes_onchain {
+        if !seen_txids.insert(tx.txid.as_str()) {
+            continue;
+        }
         // Self-spk-SET ownership rule: the producer's `spends_from_self`
         // bool (spends from the notebook address) OR any input prevout spk
         // in `self_spks`. An OR, deliberately — a pure extension, never a
-        // narrowing, of the old rule: a caller passing an empty set (e.g.
-        // `extract_notes_watch`) keeps full OWN detection even on bundles
-        // that populate `input_prevout_spks`, and spoof resistance is
-        // unchanged (a stranger's tx matches neither side).
+        // narrowing, of the old rule.
         let is_own = tx.spends_from_self
             || tx.input_prevout_spks.iter().any(|spk_hex| {
                 hex::decode(spk_hex)
                     .map(|spk| self_spks.iter().any(|s| *s == spk))
                     .unwrap_or(false)
             });
-        let origin = if is_own {
-            Origin::Own
+        let mut received = if is_own {
+            false
         } else if tx.pays_self {
-            Origin::Received(tx.sender.clone())
+            true
         } else {
             continue; // neither from nor to us — pure spoof, ignored
         };
-        for payload_hex in &tx.payloads {
-            let Ok(payload) = hex::decode(payload_hex) else { continue };
-            let Some(chunk) = envelope::decode(&payload) else { continue };
-            let entry = match by_id
-                .iter_mut()
-                .find(|(id, p)| *id == chunk.note_id && p.origin == origin)
-            {
-                Some((_, p)) => p,
-                None => {
-                    // Computed once, from the FIRST tx that introduces this
-                    // note — later txs carrying more chunks of the same
-                    // note_id/origin don't move the anchor.
-                    let notebook_anchor = if origin == Origin::Own {
-                        tx_notebook_anchor(tx, notebook_spks)
-                    } else {
-                        None
-                    };
-                    by_id.push((
-                        chunk.note_id,
-                        Pending {
-                            origin: origin.clone(),
-                            chunks: Vec::new(),
-                            txids: Vec::new(),
-                            height: None,
-                            blocktime: None,
-                            recipient: None,
-                            author_candidates: Vec::new(),
-                            notebook_anchor,
-                            output_addrs: tx.output_addrs.clone(),
-                        },
-                    ));
-                    &mut by_id.last_mut().expect("just pushed").1
-                }
-            };
-            // Drop exact duplicates (overlapping incremental bundles).
-            if entry.chunks.iter().any(|c| c.seq == chunk.seq && c.data == chunk.data) {
-                continue;
-            }
-            entry.chunks.push(chunk);
-            if !entry.txids.contains(&tx.txid) {
-                entry.txids.push(tx.txid.clone());
-            }
-            if entry.recipient.is_none() {
-                entry.recipient = tx.recipient.clone();
-            }
-            for cand in &tx.author_candidates {
-                if !entry.author_candidates.contains(cand) {
-                    entry.author_candidates.push(cand.clone());
-                }
-            }
-            // A note's height is its FIRST confirmation.
-            if entry.height.is_none() || tx.height < entry.height {
-                if tx.height.is_some() {
-                    entry.height = tx.height;
-                    entry.blocktime = tx.blocktime;
-                }
-            }
-        }
-    }
 
-    let mut notes = Vec::new();
-    for (note_id, pending) in by_id {
-        // DISPLAY-OWNER dedup: an own note anchored to a DIFFERENT notebook's
-        // input is displayed only by that notebook's scan, not this one. A
-        // `None` anchor (no notebook input, or dedup disabled via an empty
-        // `notebook_spks`) always keeps — never a narrowing of OWN-ness
-        // itself, only of which single scan renders it.
-        if pending.origin == Origin::Own {
-            if let Some(anchor) = &pending.notebook_anchor {
+        // DISPLAY-OWNER dedup (own notes only): keep this note in THIS
+        // scan only if the first notebook-spk input (if any) is our own.
+        if !received {
+            if let Some(anchor) = tx_notebook_anchor(tx, notebook_spks) {
                 if anchor.as_slice() != own_notebook_spk {
                     continue;
                 }
             }
         }
-        let Ok(body) = envelope::reassemble(&pending.chunks) else { continue };
-        let flags = pending.chunks[0].flags;
+
+        let payloads: Vec<Vec<u8>> =
+            tx.payloads.iter().filter_map(|h| hex::decode(h).ok()).collect();
+        let Some(decoded) = envelope::decode_note(&payloads) else { continue };
+        let flags = decoded.flags;
         let private = flags & FLAG_PRIVATE != 0;
         let directed = flags & FLAG_DIRECTED != 0;
-        let multi = flags & FLAG_MULTI != 0;
-        let mut received = matches!(pending.origin, Origin::Received(_));
+        let body = decoded.body;
+
         // `sender` starts as the first-input address (display default); it and
         // `recipient`/`received` are corrected below once a directed-private
         // note authenticates under a specific candidate key (external funding).
-        let mut sender = match &pending.origin {
-            Origin::Received(s) => s.clone(),
-            Origin::Own => None,
-        };
+        let mut sender = if received { tx.sender.clone() } else { None };
         // Only a DIRECTED note has a recipient (the envelope flag knows;
         // the bundle field is just "first non-self output", which for a
         // funded or custom-change SELF-note would be the change address).
-        let mut recipient =
-            if received || !directed { None } else { pending.recipient.clone() };
+        let mut recipient = if received || !directed { None } else { tx.recipient.clone() };
 
-        // Multi-recipient (FLAG_MULTI): the body's first byte is `count`;
+        // Multi-recipient (FLAG_MULTI, which implies DIRECTED — the header
+        // decoder rejects MULTI-without-DIRECTED before we ever get here):
         // `output_addrs[0..count]` are the recipients (they precede change
-        // by construction). Populated whenever `count` parses as non-zero,
-        // for BOTH own and received notes (unlike the legacy singular
-        // `recipient` above) — see `reply_set`. `count == 0` or a body too
-        // short to even carry the count byte leaves this empty and
-        // `plaintext` (below) None — liberal decoding, not a crash.
+        // by construction). Populated for BOTH own and received notes
+        // (unlike the legacy singular `recipient` below) — see `reply_set`.
         let mut recipients: Vec<String> = Vec::new();
-        let multi_count: Option<usize> =
-            if multi { body.first().map(|&c| c as usize).filter(|&c| c > 0) } else { None };
-        if let Some(count) = multi_count {
-            recipients = pending.output_addrs.iter().take(count).cloned().collect();
+        if let Some(count) = decoded.multi_count {
+            recipients = tx.output_addrs.iter().take(count as usize).cloned().collect();
         }
 
-        let plaintext = if multi {
-            match multi_count {
-                // count == 0, or empty body: undecodable, not a crash.
-                None => None,
-                Some(count) => {
-                    let rest = &body[1..];
-                    if !private {
-                        Some(rest.to_vec())
-                    } else if keys.is_none() {
-                        None // watch-only: no decryption key on this device
-                    } else if !directed {
-                        // FLAG_MULTI without FLAG_DIRECTED never comes from any
-                        // composer (see envelope.rs) — no recipient keys to
-                        // even attempt against; liberal decode = undecodable.
-                        None
-                    } else {
+        let outpoint = tx.first_input_outpoint.as_deref().and_then(parse_outpoint);
+
+        let plaintext: Option<Vec<u8>> = if let Some(count) = decoded.multi_count {
+            let count = count as usize;
+            if !private {
+                Some(body.clone())
+            } else if keys.is_none() {
+                None // watch-only: no decryption key on this device
+            } else {
+                match outpoint {
+                    None => None, // AAD can't be reconstructed without it
+                    Some(outpoint) => {
                         let identity = keys.expect("gated above");
                         let wrap_total = count * dm::WRAP_LEN;
-                        if rest.len() < wrap_total {
+                        if body.len() < wrap_total {
                             None // truncated wraps: undecodable, not a crash
                         } else {
                             let wraps: Vec<Vec<u8>> =
-                                rest[..wrap_total].chunks(dm::WRAP_LEN).map(<[u8]>::to_vec).collect();
-                            let sealed_body = &rest[wrap_total..];
+                                body[..wrap_total].chunks(dm::WRAP_LEN).map(<[u8]>::to_vec).collect();
+                            let sealed_body = &body[wrap_total..];
                             if received {
                                 // Received multi-recipient-private. Same
                                 // candidate search as the single-recipient
@@ -648,7 +599,7 @@ fn extract_notes_inner(
                                 if let Some(s) = sender.as_deref() {
                                     push_cand(s, &mut candidates);
                                 }
-                                for addr in &pending.author_candidates {
+                                for addr in &tx.author_candidates {
                                     push_cand(addr, &mut candidates);
                                 }
                                 let my_index = recipients.iter().position(|a| {
@@ -660,7 +611,7 @@ fn extract_notes_inner(
                                         &identity.tweaked_seckey,
                                         &identity.output_x,
                                         cand,
-                                        &note_id,
+                                        &outpoint,
                                         &wraps,
                                         sealed_body,
                                         my_index,
@@ -679,7 +630,7 @@ fn extract_notes_inner(
                                         &identity.tweaked_seckey,
                                         &identity.output_x,
                                         &recipients_x,
-                                        &note_id,
+                                        &outpoint,
                                         &wraps,
                                         sealed_body,
                                     ) {
@@ -701,7 +652,7 @@ fn extract_notes_inner(
                                     &identity.tweaked_seckey,
                                     &identity.output_x,
                                     &recipients_x,
-                                    &note_id,
+                                    &outpoint,
                                     &wraps,
                                     sealed_body,
                                 )
@@ -712,13 +663,13 @@ fn extract_notes_inner(
                 }
             }
         } else if !private {
-            Some(body)
+            Some(body.clone())
         } else if keys.is_none() {
             None // watch-only: no decryption key on this device
         } else if !directed {
             // Own self-note: the frozen enc_key path, byte-for-byte as v1.
             let identity = keys.expect("gated above");
-            crypt::open(&identity.enc_key, &note_id, &body).ok()
+            crypt::open(&identity.enc_key, &body).ok()
         } else if received {
             let identity = keys.expect("gated above");
             // Received directed-private. The author is the first-input address
@@ -729,87 +680,89 @@ fn extract_notes_inner(
             // AUTHOR who funded the note externally (our own tx doesn't spend
             // from us, so it looks "received"): retry each candidate as the
             // RECIPIENT via open_sent, restoring our note to our own notebook.
-            let mut candidates: Vec<[u8; 32]> = Vec::new();
-            let push_cand = |addr: &str, out: &mut Vec<[u8; 32]>| {
-                if let Some(x) = p2tr_x_of_address(network, addr) {
-                    if x != identity.output_x && !out.contains(&x) {
-                        out.push(x);
+            match outpoint {
+                None => None, // AAD can't be reconstructed without it
+                Some(outpoint) => {
+                    let mut candidates: Vec<[u8; 32]> = Vec::new();
+                    let push_cand = |addr: &str, out: &mut Vec<[u8; 32]>| {
+                        if let Some(x) = p2tr_x_of_address(network, addr) {
+                            if x != identity.output_x && !out.contains(&x) {
+                                out.push(x);
+                            }
+                        }
+                    };
+                    if let Some(s) = sender.as_deref() {
+                        push_cand(s, &mut candidates);
                     }
-                }
-            };
-            if let Some(s) = sender.as_deref() {
-                push_cand(s, &mut candidates);
-            }
-            for addr in &pending.author_candidates {
-                push_cand(addr, &mut candidates);
-            }
-            let mut recovered = None;
-            for cand in &candidates {
-                if let Ok(pt) = dm::open_received(
-                    &identity.tweaked_seckey,
-                    &identity.output_x,
-                    cand,
-                    &note_id,
-                    &body,
-                ) {
-                    // Attribute the note to the authenticated author.
-                    sender = Some(taproot_address(network, cand));
-                    recovered = Some(pt);
-                    break;
-                }
-            }
-            if recovered.is_none() {
-                for cand in &candidates {
-                    if let Ok(pt) = dm::open_sent(
-                        &identity.tweaked_seckey,
-                        &identity.output_x,
-                        cand,
-                        &note_id,
-                        &body,
-                    ) {
-                        // Our own externally-funded note — not received.
-                        received = false;
-                        sender = None;
-                        recipient = Some(taproot_address(network, cand));
-                        recovered = Some(pt);
-                        break;
+                    for addr in &tx.author_candidates {
+                        push_cand(addr, &mut candidates);
                     }
+                    let mut recovered = None;
+                    for cand in &candidates {
+                        if let Ok(pt) = dm::open_received(
+                            &identity.tweaked_seckey,
+                            &identity.output_x,
+                            cand,
+                            &outpoint,
+                            &body,
+                        ) {
+                            // Attribute the note to the authenticated author.
+                            sender = Some(taproot_address(network, cand));
+                            recovered = Some(pt);
+                            break;
+                        }
+                    }
+                    if recovered.is_none() {
+                        for cand in &candidates {
+                            if let Ok(pt) = dm::open_sent(
+                                &identity.tweaked_seckey,
+                                &identity.output_x,
+                                cand,
+                                &outpoint,
+                                &body,
+                            ) {
+                                // Our own externally-funded note — not received.
+                                received = false;
+                                sender = None;
+                                recipient = Some(taproot_address(network, cand));
+                                recovered = Some(pt);
+                                break;
+                            }
+                        }
+                    }
+                    recovered
                 }
             }
-            recovered
         } else {
             // Own sent directed-private (self-funded): re-derive via the
             // dust-output recipient key.
             let identity = keys.expect("gated above");
-            recipient
-                .as_deref()
-                .and_then(|r| p2tr_x_of_address(network, r))
-                .and_then(|recipient_x| {
-                    dm::open_sent(
-                        &identity.tweaked_seckey,
-                        &identity.output_x,
-                        &recipient_x,
-                        &note_id,
-                        &body,
-                    )
-                    .ok()
-                })
+            match (recipient.as_deref().and_then(|r| p2tr_x_of_address(network, r)), outpoint) {
+                (Some(recipient_x), Some(outpoint)) => dm::open_sent(
+                    &identity.tweaked_seckey,
+                    &identity.output_x,
+                    &recipient_x,
+                    &outpoint,
+                    &body,
+                )
+                .ok(),
+                _ => None,
+            }
         };
         // Legacy singular `recipient` field, kept populated with the FIRST
         // recipient for compatibility with single-recipient callers — same
         // own-only gating as the single-recipient path above (`received` is
         // now settled to its final value, including the externally-funded
         // fallback that can flip it inside the match above).
-        if multi && !received && directed {
+        if decoded.multi_count.is_some() && !received && directed {
             recipient = recipients.first().cloned();
         }
         let text = plaintext.and_then(|pt| String::from_utf8(pt).ok());
 
         notes.push(RecoveredNote {
-            note_id,
-            txids: pending.txids,
-            height: pending.height,
-            blocktime: pending.blocktime,
+            id: tx.txid.clone(),
+            height: tx.height,
+            blocktime: tx.blocktime,
             private,
             directed,
             received,
@@ -828,15 +781,18 @@ fn extract_notes_inner(
 /// plus the recipient scriptPubKey for a directed note. This is the exact
 /// body/flags/envelope logic the on-device compose path uses, factored out so
 /// an EXTERNAL (PSBT) funder can produce byte-identical on-chain note bytes
-/// without holding the funding key. Directed-private notes stay decryptable
-/// under external funding because the author key rides on a dust-to-self
-/// output (see `extract_notes`' candidate-key search).
+/// without holding the funding key. `outpoint` is the tx's FIRST input's
+/// prevout (`tx::outpoint_bytes`) — the caller already knows it (it built
+/// the inputs itself); ignored when the note isn't directed-private.
+/// Directed-private notes stay decryptable under external funding because
+/// the author key rides on a dust-to-self output (see `extract_notes`'
+/// candidate-key search).
 pub fn sealed_note_payloads(
     identity: &Identity,
     text: &str,
     private: bool,
     recipient: Option<&Recipient>,
-    note_id: [u8; 4],
+    outpoint: [u8; 36],
     max_op_return_bytes: usize,
 ) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>), Error> {
     let body = if private {
@@ -846,25 +802,25 @@ pub fn sealed_note_payloads(
                 &identity.tweaked_seckey,
                 &identity.output_x,
                 &recipient_x,
-                &note_id,
+                &outpoint,
                 text.as_bytes(),
             )?
         } else {
-            crypt::seal(&identity.enc_key, &note_id, text.as_bytes())?
+            crypt::seal(&identity.enc_key, text.as_bytes())?
         }
     } else {
         text.as_bytes().to_vec()
     };
     let flags = recipient.map_or(0, |_| FLAG_DIRECTED) | if private { FLAG_PRIVATE } else { 0 };
-    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
+    let payloads = envelope::encode_outputs(flags, None, &body, max_op_return_bytes)?;
     Ok((payloads, recipient.map(|r| r.spk.clone())))
 }
 
 /// Multi-recipient analog of [`sealed_note_payloads`] — the payload-side
 /// primitive for externally-assembled (PSBT / mixed-source) multi-recipient
 /// notes, exposing the SAME FROZEN `FLAG_MULTI` body framing the
-/// self-contained `compose_directed_note_multi_*` builders emit (count(u8)
-/// || utf8 text, or count || wraps || sealed body — see envelope.rs/dm.rs).
+/// self-contained `compose_directed_note_multi_*` builders emit (the count
+/// lives in the header, not the body — see envelope.rs/dm.rs).
 ///
 /// `recipients` are deduped by address (first occurrence wins, order
 /// preserved); exactly ONE unique address delegates to
@@ -878,7 +834,7 @@ pub fn sealed_note_payloads_multi(
     text: &str,
     private: bool,
     recipients: &[Recipient],
-    note_id: [u8; 4],
+    outpoint: [u8; 36],
     content_key: [u8; 32],
     max_op_return_bytes: usize,
 ) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), Error> {
@@ -892,23 +848,27 @@ pub fn sealed_note_payloads_multi(
         return Err(Error::Envelope("recipients: 1..=255"));
     }
     if deduped.len() == 1 {
-        let (payloads, spk) =
-            sealed_note_payloads(identity, text, private, Some(deduped[0]), note_id, max_op_return_bytes)?;
+        let (payloads, spk) = sealed_note_payloads(
+            identity, text, private, Some(deduped[0]), outpoint, max_op_return_bytes,
+        )?;
         return Ok((payloads, vec![spk.expect("recipient was given")]));
     }
-    let body = multi_body(identity, text, private, note_id, &deduped, content_key)?;
+    let count = deduped.len() as u8;
+    let body = multi_body(identity, text, private, &outpoint, &deduped, content_key)?;
     let flags = FLAG_DIRECTED | FLAG_MULTI | if private { FLAG_PRIVATE } else { 0 };
-    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
+    let payloads = envelope::encode_outputs(flags, Some(count), &body, max_op_return_bytes)?;
     Ok((payloads, deduped.iter().map(|r| r.spk.clone()).collect()))
 }
 
-/// Shared tail of both compose paths: body → enveloped payloads → signed tx.
-#[allow(clippy::too_many_arguments)]
+/// Shared tail of the self-note/public-directed compose paths (never the
+/// directed-PRIVATE path, which must select its inputs BEFORE sealing so it
+/// can bind the tx's first-input outpoint — see
+/// `compose_directed_note_with_change_amount`): body → enveloped payloads →
+/// signed tx.
 #[allow(clippy::too_many_arguments)]
 fn compose_inner(
     identity: &Identity,
     utxos: &[Utxo],
-    note_id: [u8; 4],
     flags: u8,
     body: &[u8],
     recipient_spk: Option<&[u8]>,
@@ -919,7 +879,7 @@ fn compose_inner(
     lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
-    let payloads = envelope::encode_chunks(note_id, flags, body, max_op_return_bytes)?;
+    let payloads = envelope::encode_outputs(flags, None, body, max_op_return_bytes)?;
     build_note_tx_with_change(
         utxos,
         &identity.output_x,
@@ -935,20 +895,18 @@ fn compose_inner(
 }
 
 /// Compose path: text → (sealed) body → enveloped payloads → signed tx.
-#[allow(clippy::too_many_arguments)]
 pub fn compose_note(
     identity: &Identity,
     utxos: &[Utxo],
     text: &str,
     private: bool,
-    note_id: [u8; 4],
     max_op_return_bytes: usize,
     fee_rate: f64,
     lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     compose_note_with_change(
-        identity, utxos, text, private, note_id, None, max_op_return_bytes, fee_rate, lock_time, aux,
+        identity, utxos, text, private, None, max_op_return_bytes, fee_rate, lock_time, aux,
     )
 }
 
@@ -959,22 +917,17 @@ pub fn compose_note_with_change(
     utxos: &[Utxo],
     text: &str,
     private: bool,
-    note_id: [u8; 4],
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
     lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
-    let body = if private {
-        crypt::seal(&identity.enc_key, &note_id, text.as_bytes())?
-    } else {
-        text.as_bytes().to_vec()
-    };
+    let body = if private { crypt::seal(&identity.enc_key, text.as_bytes())? } else { text.as_bytes().to_vec() };
     let flags = if private { FLAG_PRIVATE } else { 0 };
     compose_inner(
-        identity, utxos, note_id, flags, &body, None, crate::DUST_LIMIT, change_spk,
-        max_op_return_bytes, fee_rate, lock_time, aux,
+        identity, utxos, flags, &body, None, crate::DUST_LIMIT, change_spk, max_op_return_bytes,
+        fee_rate, lock_time, aux,
     )
 }
 
@@ -984,13 +937,11 @@ pub fn compose_note_with_change(
 /// only the recipient (and the sender, reciprocally) can read them; private
 /// therefore requires a taproot recipient. Public directed notes go to any
 /// segwit address.
-#[allow(clippy::too_many_arguments)]
 pub fn compose_directed_note(
     identity: &Identity,
     utxos: &[Utxo],
     text: &str,
     private: bool,
-    note_id: [u8; 4],
     recipient: &Recipient,
     max_op_return_bytes: usize,
     fee_rate: f64,
@@ -998,8 +949,7 @@ pub fn compose_directed_note(
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     compose_directed_note_with_change(
-        identity, utxos, text, private, note_id, recipient, None, max_op_return_bytes,
-        fee_rate, lock_time,
+        identity, utxos, text, private, recipient, None, max_op_return_bytes, fee_rate, lock_time,
         aux,
     )
 }
@@ -1011,7 +961,6 @@ pub fn compose_directed_note_with_change(
     utxos: &[Utxo],
     text: &str,
     private: bool,
-    note_id: [u8; 4],
     recipient: &Recipient,
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
@@ -1020,7 +969,7 @@ pub fn compose_directed_note_with_change(
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     compose_directed_note_with_change_amount(
-        identity, utxos, text, private, note_id, recipient, crate::DUST_LIMIT, change_spk,
+        identity, utxos, text, private, recipient, crate::DUST_LIMIT, change_spk,
         max_op_return_bytes, fee_rate, lock_time, aux,
     )
 }
@@ -1028,13 +977,20 @@ pub fn compose_directed_note_with_change(
 /// Like `compose_directed_note_with_change`, but the recipient (gift) output
 /// carries `recipient_amount` sats (must be >= DUST_LIMIT) instead of the
 /// default dust — lets a directed note double as a gift.
+///
+/// For a PRIVATE note, the AAD binds the tx's first-input outpoint (dm.rs),
+/// which is only known once inputs are selected — so this composes in TWO
+/// phases: select inputs first (`tx::select_note_inputs`, using the
+/// sealed body's LENGTH only — an AEAD's ciphertext length never depends
+/// on its AAD, so this doesn't need the outpoint yet), then seal with the
+/// real outpoint and build the exact same tx via `build_note_tx_exact`.
+/// Public notes need no outpoint and keep the single-phase auto-select path.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_directed_note_with_change_amount(
     identity: &Identity,
     utxos: &[Utxo],
     text: &str,
     private: bool,
-    note_id: [u8; 4],
     recipient: &Recipient,
     recipient_amount: u64,
     change_spk: Option<&[u8]>,
@@ -1043,57 +999,46 @@ pub fn compose_directed_note_with_change_amount(
     lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
-    let body = if private {
-        let recipient_x = recipient.p2tr_x.ok_or(Error::RecipientNotTaproot)?;
-        dm::seal_directed(
-            &identity.tweaked_seckey,
-            &identity.output_x,
-            &recipient_x,
-            &note_id,
-            text.as_bytes(),
-        )?
-    } else {
-        text.as_bytes().to_vec()
-    };
     let flags = FLAG_DIRECTED | if private { FLAG_PRIVATE } else { 0 };
-    compose_inner(
-        identity,
-        utxos,
-        note_id,
-        flags,
-        &body,
-        Some(&recipient.spk),
-        recipient_amount,
-        change_spk,
-        max_op_return_bytes,
-        fee_rate,
-        lock_time,
-        aux,
+    if !private {
+        return compose_inner(
+            identity, utxos, flags, text.as_bytes(), Some(&recipient.spk), recipient_amount,
+            change_spk, max_op_return_bytes, fee_rate, lock_time, aux,
+        );
+    }
+    let recipient_x = recipient.p2tr_x.ok_or(Error::RecipientNotTaproot)?;
+    let body_len = text.len() + crypt::SEAL_OVERHEAD;
+    let payload_lens = envelope::payload_lens_for(flags, None, body_len, max_op_return_bytes)?;
+    let selected = select_note_inputs(
+        utxos, &payload_lens, Some(recipient.spk.len()), recipient_amount, fee_rate,
+    )?;
+    let outpoint = outpoint_bytes(selected.first().ok_or(Error::InsufficientFunds)?);
+    let sealed = dm::seal_directed(
+        &identity.tweaked_seckey, &identity.output_x, &recipient_x, &outpoint, text.as_bytes(),
+    )?;
+    let payloads = envelope::encode_outputs(flags, None, &sealed, max_op_return_bytes)?;
+    build_note_tx_exact(
+        &selected, &identity.output_x, &payloads, Some(&recipient.spk), recipient_amount,
+        change_spk, fee_rate, lock_time, &identity.tweaked_seckey, aux,
     )
 }
 
 /// Coin-control compose: spend EXACTLY `inputs` (no auto-selection).
 /// Change (self unless `change_spk`) is the leftover.
-#[allow(clippy::too_many_arguments)]
 pub fn compose_note_exact(
     identity: &Identity,
     inputs: &[Utxo],
     text: &str,
     private: bool,
-    note_id: [u8; 4],
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
     lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
-    let body = if private {
-        crypt::seal(&identity.enc_key, &note_id, text.as_bytes())?
-    } else {
-        text.as_bytes().to_vec()
-    };
+    let body = if private { crypt::seal(&identity.enc_key, text.as_bytes())? } else { text.as_bytes().to_vec() };
     let flags = if private { FLAG_PRIVATE } else { 0 };
-    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
+    let payloads = envelope::encode_outputs(flags, None, &body, max_op_return_bytes)?;
     build_note_tx_exact(
         inputs,
         &identity.output_x,
@@ -1115,7 +1060,6 @@ pub fn compose_directed_note_exact(
     inputs: &[Utxo],
     text: &str,
     private: bool,
-    note_id: [u8; 4],
     recipient: &Recipient,
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
@@ -1124,20 +1068,22 @@ pub fn compose_directed_note_exact(
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     compose_directed_note_exact_amount(
-        identity, inputs, text, private, note_id, recipient, crate::DUST_LIMIT, change_spk,
+        identity, inputs, text, private, recipient, crate::DUST_LIMIT, change_spk,
         max_op_return_bytes, fee_rate, lock_time, aux,
     )
 }
 
 /// Like `compose_directed_note_exact`, but the recipient (gift) output carries
-/// `recipient_amount` sats (must be >= DUST_LIMIT).
+/// `recipient_amount` sats (must be >= DUST_LIMIT). Coin control already
+/// knows its full, final input set up front, so — unlike the auto-select
+/// `_with_change_amount` sibling — there's no two-phase dance: `inputs[0]`
+/// IS the tx's first input, so the outpoint is known immediately.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_directed_note_exact_amount(
     identity: &Identity,
     inputs: &[Utxo],
     text: &str,
     private: bool,
-    note_id: [u8; 4],
     recipient: &Recipient,
     recipient_amount: u64,
     change_spk: Option<&[u8]>,
@@ -1146,20 +1092,17 @@ pub fn compose_directed_note_exact_amount(
     lock_time: u32,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
+    let flags = FLAG_DIRECTED | if private { FLAG_PRIVATE } else { 0 };
     let body = if private {
         let recipient_x = recipient.p2tr_x.ok_or(Error::RecipientNotTaproot)?;
+        let outpoint = outpoint_bytes(inputs.first().ok_or(Error::InsufficientFunds)?);
         dm::seal_directed(
-            &identity.tweaked_seckey,
-            &identity.output_x,
-            &recipient_x,
-            &note_id,
-            text.as_bytes(),
+            &identity.tweaked_seckey, &identity.output_x, &recipient_x, &outpoint, text.as_bytes(),
         )?
     } else {
         text.as_bytes().to_vec()
     };
-    let flags = FLAG_DIRECTED | if private { FLAG_PRIVATE } else { 0 };
-    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
+    let payloads = envelope::encode_outputs(flags, None, &body, max_op_return_bytes)?;
     build_note_tx_exact(
         inputs,
         &identity.output_x,
@@ -1196,14 +1139,17 @@ fn dedupe_recipients(recipients: &[(Recipient, u64)]) -> Result<Vec<&(Recipient,
     Ok(deduped)
 }
 
-/// Build the FLAG_MULTI body: `count(u8) || utf8 text` (public) or
-/// `count(u8) || count × wrap(72B) || sealed_body` (private, via
-/// `dm::seal_multi`). Shared by both compose entry points below.
+/// Build the FLAG_MULTI body: the UTF-8 text verbatim (public) or
+/// `count × wrap(72B) || sealed_body` (private, via `dm::seal_multi`) — the
+/// recipient count lives in the envelope HEADER now, not a body-leading
+/// byte (PLAN-pnte-redesign.md). Shared by both compose entry points below.
+/// `outpoint` is ignored (ignored by `dm::seal_multi` too, transitively —
+/// only present in the AAD) when `private` is false.
 fn multi_body(
     identity: &Identity,
     text: &str,
     private: bool,
-    note_id: [u8; 4],
+    outpoint: &[u8; 36],
     deduped: &[&Recipient],
     content_key: [u8; 32],
 ) -> Result<Vec<u8>, Error> {
@@ -1216,47 +1162,47 @@ fn multi_body(
             &identity.tweaked_seckey,
             &identity.output_x,
             &recipients_x,
-            &note_id,
+            outpoint,
             &content_key,
             text.as_bytes(),
         )?;
-        let mut body = Vec::with_capacity(1 + wraps.len() * dm::WRAP_LEN + sealed_body.len());
-        body.push(deduped.len() as u8);
+        let mut body = Vec::with_capacity(wraps.len() * dm::WRAP_LEN + sealed_body.len());
         for w in &wraps {
             body.extend_from_slice(w);
         }
         body.extend_from_slice(&sealed_body);
         Ok(body)
     } else {
-        let mut body = Vec::with_capacity(1 + text.len());
-        body.push(deduped.len() as u8);
-        body.extend_from_slice(text.as_bytes());
-        Ok(body)
+        Ok(text.as_bytes().to_vec())
     }
 }
 
 /// Multi-recipient directed compose: like `compose_directed_note_with_change_amount`
 /// but for MANY recipients, each with its own gift amount (>= DUST_LIMIT).
 /// Private bodies are sealed ONCE under a caller-supplied `content_key`
-/// (never stored — same convention as `note_id`; TRNG'd by the app) and
-/// wrapped once per recipient under the usual pairwise ECDH key — see
-/// dm.rs's module docs for the full scheme. Private therefore requires
-/// every recipient to be taproot (`RecipientNotTaproot` otherwise); public
-/// allows any segwit address, same policy as the single-recipient path.
+/// (never stored — same convention as the single-recipient AAD's outpoint;
+/// TRNG'd by the app) and wrapped once per recipient under the usual
+/// pairwise ECDH key — see dm.rs's module docs for the full scheme. Private
+/// therefore requires every recipient to be taproot (`RecipientNotTaproot`
+/// otherwise); public allows any segwit address, same policy as the
+/// single-recipient path.
 ///
 /// `recipients` is deduped by address (first occurrence wins) BEFORE
 /// anything else, so a call that collapses to exactly one UNIQUE address —
 /// whether it started with one entry or several duplicates of the same
 /// address — delegates to `compose_directed_note_with_change_amount` and
 /// is therefore byte-identical to today's single-recipient wire format (no
-/// FLAG_MULTI, no count byte, no wraps, `content_key` unused).
+/// FLAG_MULTI, no header count, no wraps, `content_key` unused).
+///
+/// Private + many-recipient composes in the same two-phase shape as the
+/// single-recipient path: select inputs first (by LENGTH only), then seal
+/// with the real first-input outpoint, then build exact.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_directed_note_multi_with_change(
     identity: &Identity,
     utxos: &[Utxo],
     text: &str,
     private: bool,
-    note_id: [u8; 4],
     recipients: &[(Recipient, u64)],
     content_key: [u8; 32],
     change_spk: Option<&[u8]>,
@@ -1273,7 +1219,6 @@ pub fn compose_directed_note_multi_with_change(
             utxos,
             text,
             private,
-            note_id,
             recipient,
             *amount,
             change_spk,
@@ -1283,14 +1228,37 @@ pub fn compose_directed_note_multi_with_change(
             aux,
         );
     }
-    let recips: Vec<&Recipient> = deduped.iter().map(|(r, _)| r).collect();
-    let body = multi_body(identity, text, private, note_id, &recips, content_key)?;
+    let count = deduped.len() as u8;
     let flags = FLAG_DIRECTED | FLAG_MULTI | if private { FLAG_PRIVATE } else { 0 };
-    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
+    let recips: Vec<&Recipient> = deduped.iter().map(|(r, _)| r).collect();
     let recipient_pairs: Vec<(Vec<u8>, u64)> =
         deduped.iter().map(|(r, amount)| (r.spk.clone(), *amount)).collect();
-    build_note_tx_multi_with_change(
-        utxos,
+
+    if !private {
+        let body = multi_body(identity, text, private, &[0u8; 36], &recips, content_key)?;
+        let payloads = envelope::encode_outputs(flags, Some(count), &body, max_op_return_bytes)?;
+        return build_note_tx_multi_with_change(
+            utxos,
+            &identity.output_x,
+            &payloads,
+            &recipient_pairs,
+            change_spk,
+            fee_rate,
+            lock_time,
+            &identity.tweaked_seckey,
+            aux,
+        );
+    }
+    let recipient_lens: Vec<usize> = recipient_pairs.iter().map(|(spk, _)| spk.len()).collect();
+    let sent: u64 = recipient_pairs.iter().map(|(_, a)| a).sum();
+    let body_len = deduped.len() * dm::WRAP_LEN + text.len() + crypt::SEAL_OVERHEAD;
+    let payload_lens = envelope::payload_lens_for(flags, Some(count), body_len, max_op_return_bytes)?;
+    let selected = select_note_inputs_multi(utxos, &payload_lens, &recipient_lens, sent, fee_rate)?;
+    let outpoint = outpoint_bytes(selected.first().ok_or(Error::InsufficientFunds)?);
+    let body = multi_body(identity, text, private, &outpoint, &recips, content_key)?;
+    let payloads = envelope::encode_outputs(flags, Some(count), &body, max_op_return_bytes)?;
+    build_note_tx_multi_exact(
+        &selected,
         &identity.output_x,
         &payloads,
         &recipient_pairs,
@@ -1305,14 +1273,14 @@ pub fn compose_directed_note_multi_with_change(
 /// Coin-control (`_exact`) analog of [`compose_directed_note_multi_with_change`]:
 /// spend EXACTLY `inputs`. Same dedup/1-entry-delegation rule (delegates to
 /// `compose_directed_note_exact_amount`, byte-identical for a single
-/// unique address).
+/// unique address). `inputs[0]` is the tx's first input immediately — no
+/// two-phase selection needed (coin control already fixes the input set).
 #[allow(clippy::too_many_arguments)]
 pub fn compose_directed_note_multi_exact(
     identity: &Identity,
     inputs: &[Utxo],
     text: &str,
     private: bool,
-    note_id: [u8; 4],
     recipients: &[(Recipient, u64)],
     content_key: [u8; 32],
     change_spk: Option<&[u8]>,
@@ -1329,7 +1297,6 @@ pub fn compose_directed_note_multi_exact(
             inputs,
             text,
             private,
-            note_id,
             recipient,
             *amount,
             change_spk,
@@ -1339,12 +1306,21 @@ pub fn compose_directed_note_multi_exact(
             aux,
         );
     }
-    let recips: Vec<&Recipient> = deduped.iter().map(|(r, _)| r).collect();
-    let body = multi_body(identity, text, private, note_id, &recips, content_key)?;
+    if inputs.is_empty() {
+        return Err(Error::InsufficientFunds);
+    }
+    let count = deduped.len() as u8;
     let flags = FLAG_DIRECTED | FLAG_MULTI | if private { FLAG_PRIVATE } else { 0 };
-    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
+    let recips: Vec<&Recipient> = deduped.iter().map(|(r, _)| r).collect();
     let recipient_pairs: Vec<(Vec<u8>, u64)> =
         deduped.iter().map(|(r, amount)| (r.spk.clone(), *amount)).collect();
+    let body = if private {
+        let outpoint = outpoint_bytes(inputs.first().expect("checked non-empty above"));
+        multi_body(identity, text, private, &outpoint, &recips, content_key)?
+    } else {
+        multi_body(identity, text, private, &[0u8; 36], &recips, content_key)?
+    };
+    let payloads = envelope::encode_outputs(flags, Some(count), &body, max_op_return_bytes)?;
     build_note_tx_multi_exact(
         inputs,
         &identity.output_x,
@@ -1358,8 +1334,10 @@ pub fn compose_directed_note_multi_exact(
     )
 }
 
-/// Cost preview for the compose screen: (payload_lens, est_vsize) for the
-/// current text. Pure arithmetic — no crypto runs (see crypt::SEAL_OVERHEAD).
+/// Cost preview for the compose screen: (payload_lens.len(), est_vsize) for
+/// the current text (single/self/directed shape only — never
+/// multi-recipient, which has its own header size and estimator). Pure
+/// arithmetic — no crypto runs (see crypt::SEAL_OVERHEAD).
 pub fn estimate_note_cost(
     text_len: usize,
     private: bool,
@@ -1368,20 +1346,7 @@ pub fn estimate_note_cost(
     recipient_spk_len: Option<usize>,
 ) -> Result<(usize, usize), Error> {
     let body_len = if private { text_len + crypt::SEAL_OVERHEAD } else { text_len };
-    if body_len == 0 {
-        return Err(Error::Envelope("empty body"));
-    }
-    if max_op_return_bytes <= envelope::HEADER_LEN {
-        return Err(Error::Envelope("max_payload smaller than header"));
-    }
-    let chunk_size = max_op_return_bytes - envelope::HEADER_LEN;
-    let total = body_len.div_ceil(chunk_size);
-    if total > u8::MAX as usize {
-        return Err(Error::PayloadTooLarge);
-    }
-    let mut payload_lens = vec![max_op_return_bytes; total - 1];
-    let tail = body_len - (total - 1) * chunk_size;
-    payload_lens.push(envelope::HEADER_LEN + tail);
+    let payload_lens = envelope::payload_lens_for(0, None, body_len, max_op_return_bytes)?;
     let vsize = crate::tx::estimate_vsize(n_inputs.max(1), &payload_lens, recipient_spk_len, true);
-    Ok((total, vsize))
+    Ok((payload_lens.len(), vsize))
 }
