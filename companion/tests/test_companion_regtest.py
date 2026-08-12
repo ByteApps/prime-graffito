@@ -333,13 +333,25 @@ def main():
         # exactly the input that funded the directed note it sent B. This is
         # the mechanism (no default UI affordance): WITHOUT the param the
         # note still renders received-from-A (today's behavior, unchanged).
+        # Post-dedup contract (DISPLAY-OWNER rule, 2026-07-18 — supersedes
+        # this leg's original pre-dedup expectation): &mine=<A> makes the
+        # A-anchored own note render on A's OWN page only; B's page with
+        # &mine=A reclassifies it OWN and therefore DROPS it (the anchor is
+        # A, not B). The note must still be fully visible at A.
         viewer_mine = browser.new_page()
         viewer_mine.goto(BASE + f"/viewer.html?address={b_address}&network=regtest&mine={address}")
-        wait_log("#notes", DIRECTED_PUB_TEXT, viewer_mine)
+        viewer_mine.wait_for_function(
+            "document.querySelector('#notesHeader').textContent.includes('note')"
+        )
         notes_mine = viewer_mine.evaluate("window.__cnViewer.notes")
-        pub_mine = next(n for n in notes_mine if n["text"] == DIRECTED_PUB_TEXT)
-        assert not pub_mine["received"], f"&mine=<funder> must reclassify OWN: {pub_mine}"
-        print("PASS viewer &mine=<funder address> reclassifies a received note as OWN")
+        assert not any(n["text"] == DIRECTED_PUB_TEXT for n in notes_mine), \
+            f"A-anchored own note must be deduped off B's &mine= page: {notes_mine}"
+        viewer_mine.goto(BASE + f"/viewer.html?address={address}&network=regtest")
+        wait_log("#notes", DIRECTED_PUB_TEXT, viewer_mine)
+        pub_at_a = next(n for n in viewer_mine.evaluate("window.__cnViewer.notes")
+                        if n["text"] == DIRECTED_PUB_TEXT)
+        assert not pub_at_a["received"] and pub_at_a["to"] == b_address, pub_at_a
+        print("PASS viewer &mine= DISPLAY-OWNER dedup: own note renders at its anchor (A), dropped from B")
 
         viewer_mine.goto(BASE + f"/viewer.html?address={b_address}&network=regtest")
         wait_log("#notes", DIRECTED_PUB_TEXT, viewer_mine)
