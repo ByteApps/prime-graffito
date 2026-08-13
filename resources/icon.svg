@@ -1,17 +1,58 @@
-<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
-  <rect width="256" height="256" rx="58" fill="#151B23"/>
-  <g transform="translate(56,56) scale(6)" fill="none" stroke="#E6EDF3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-    <rect x="4.5" y="2.5" width="13" height="17.5" rx="2"/>
-    <path d="M8 7.5h6M8 11.5h4"/>
-  </g>
-  <g transform="translate(56,56) scale(6) translate(9.8,9.8) scale(0.62)" fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <g stroke="#151B23" stroke-width="7.2">
-      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.72"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <radialGradient id="wall" cx="38%" cy="30%" r="90%">
+      <stop offset="0%" stop-color="#2b2723"/>
+      <stop offset="60%" stop-color="#211e1a"/>
+      <stop offset="100%" stop-color="#171512"/>
+    </radialGradient>
+    <clipPath id="squircle"><rect x="0" y="0" width="1024" height="1024" rx="230"/></clipPath>
+  </defs>
+  <g clip-path="url(#squircle)">
+    <rect width="1024" height="1024" fill="url(#wall)"/>
+    <!-- plaster speckle -->
+    <g fill="#efe8da" opacity="0.05">
+      <circle cx="142" cy="210" r="4"/><circle cx="300" cy="120" r="3"/><circle cx="520" cy="88" r="5"/>
+      <circle cx="760" cy="150" r="3"/><circle cx="890" cy="300" r="4"/><circle cx="930" cy="540" r="3"/>
+      <circle cx="850" cy="820" r="5"/><circle cx="640" cy="930" r="3"/><circle cx="380" cy="900" r="4"/>
+      <circle cx="150" cy="780" r="3"/><circle cx="95" cy="520" r="4"/><circle cx="230" cy="640" r="2.5"/>
+      <circle cx="700" cy="420" r="2.5"/><circle cx="820" cy="640" r="3"/><circle cx="440" cy="180" r="2.5"/>
     </g>
-    <g stroke="#F7931A" stroke-width="3.2">
-      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.72"/>
+    <!-- hairline cracks -->
+    <g stroke="#0c0b09" stroke-width="3" fill="none" opacity="0.5">
+      <path d="M 940 120 L 880 210 L 895 300 L 845 370"/>
+      <path d="M 90 860 L 175 800 L 195 720"/>
+    </g>
+    <g stroke="#efe8da" stroke-width="1.5" fill="none" opacity="0.12">
+      <path d="M 942 123 L 882 213 L 897 303 L 847 373"/>
+      <path d="M 92 863 L 177 803 L 197 723"/>
+    </g>
+    <!-- the scratched g -->
+    <g transform="rotate(-4 512 512)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <!-- groove shadow -->
+      <g stroke="#000000" opacity="0.45" stroke-width="34" transform="translate(4,6)">
+        <path d="M 618 348 C 560 292, 415 296, 350 372 C 290 445, 302 560, 385 602 C 458 638, 570 610, 606 532"/>
+        <path d="M 622 318 L 630 380 L 636 560 C 642 668, 606 752, 492 758 C 418 760, 368 716, 380 668"/>
+      </g>
+      <!-- main scratch -->
+      <g stroke="#ece5d6" stroke-width="21">
+        <path d="M 618 348 C 560 292, 415 296, 350 372 C 290 445, 302 560, 385 602 C 458 638, 570 610, 606 532"/>
+        <path d="M 622 318 L 630 380 L 636 560 C 642 668, 606 752, 492 758 C 418 760, 368 716, 380 668"/>
+      </g>
+      <!-- bright broken core -->
+      <g stroke="#fffdf4" stroke-width="7" opacity="0.9" stroke-dasharray="64 16 110 12 88 20 140 14">
+        <path d="M 618 348 C 560 292, 415 296, 350 372 C 290 445, 302 560, 385 602 C 458 638, 570 610, 606 532"/>
+        <path d="M 622 318 L 630 380 L 636 560 C 642 668, 606 752, 492 758 C 418 760, 368 716, 380 668"/>
+      </g>
+      <!-- stray side scratches -->
+      <g stroke="#ece5d6" stroke-width="4.5" opacity="0.35" transform="translate(9,-8)">
+        <path d="M 618 348 C 560 292, 415 296, 350 372"/>
+        <path d="M 636 560 C 642 668, 606 752, 492 758"/>
+      </g>
+    </g>
+    <!-- orange scratched period -->
+    <g fill="none" stroke="#f7931a" stroke-linecap="round">
+      <path d="M 712 716 l 34 30 M 744 712 l -30 36" stroke-width="16"/>
+      <path d="M 714 718 l 32 28" stroke-width="6" opacity="0.6" transform="translate(6,-5)"/>
     </g>
   </g>
 </svg>
