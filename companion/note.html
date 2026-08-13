@@ -116,7 +116,7 @@ function log(el, msg, cls) {
     // whole address history (PLAN-pnte-redesign.md).
     const note = await fetchNote(API[network].base, noteId, address, mineAddresses, notebookAddresses);
     if (!note) {
-      return log(logEl, `Tx ${noteId} is not a Chain Notes entry at this address ` +
+      return log(logEl, `Tx ${noteId} is not a Graffito entry at this address ` +
         `(not found, doesn't touch the address, or has no valid PNTE header).`, "err");
     }
     $("note").appendChild(buildNoteCard(note, API[network].explorer, null));
