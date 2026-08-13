@@ -3,10 +3,10 @@
 # (github.com/ObjSal/graffito → docs/companion/ → GitHub Pages at
 # https://objsal.github.io/graffito/companion/).
 #
-# Canonical source stays HERE (prime-chain-notes/companion — its tests and
+# Canonical source stays HERE (prime-graffito/companion — its tests and
 # the Prime e2e live next to it); never edit graffito/docs/companion
 # directly. The old chain-notes-companion deploy-mirror repo is archived
-# and serves only redirects (it existed because prime-chain-notes was
+# and serves only redirects (it existed because prime-graffito was
 # once private; both repos are public since 2026-07-11, and the companion
 # moved under the Graffito product home 2026-08-12).
 set -euo pipefail

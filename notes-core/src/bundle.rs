@@ -258,7 +258,7 @@ pub fn decode_scanned(data: &[u8]) -> Result<String, Error> {
     } else if data.first() == Some(&b'{') {
         String::from_utf8(data.to_vec()).map_err(|_| Error::Envelope("bundle not utf-8"))
     } else {
-        Err(Error::Envelope("not a Chain Notes bundle QR"))
+        Err(Error::Envelope("not a Graffito bundle QR"))
     }
 }
 

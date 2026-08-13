@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local companion server for prime-chain-notes.
+"""Local companion server for prime-graffito.
 
 Serves the static companion page AND — when a node is configured — exposes
 a **remote** Bitcoin Core node (regtest or testnet4; reached over an SSH

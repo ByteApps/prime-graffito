@@ -1,4 +1,4 @@
-# <img src="resources/icon.svg" alt="" width="42" align="top" /> Chain Notes
+# <img src="resources/icon.svg" alt="" width="42" align="top" /> Graffito
 
 **Bitcoin · Notes** — personal notes on the bitcoin blockchain, written from a device that has no network on purpose.
 
