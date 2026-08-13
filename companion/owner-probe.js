@@ -14,7 +14,7 @@
 // address it already spent, instead of re-offering it as "next receive"
 // forever. `used: true` is exactly that signal; index.html collects it
 // across the whole watch list into the bundle's additive `owner_used`
-// field (see prime-chain-notes CLAUDE.md's "spending-adopt … used-only"
+// field (see prime-graffito CLAUDE.md's "spending-adopt … used-only"
 // log line, and notes-core::bundle::SyncBundle.owner_used).
 //
 // Deliberately dependency-light (companion stays crypto-free): no

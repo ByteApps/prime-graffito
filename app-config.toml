@@ -1,7 +1,7 @@
 # Foundation application configuration
 app-name = "prime-chain-notes"
-friendly-app-name = "Chain Notes"
-launcher-app-name = "Chain Notes"
+friendly-app-name = "Graffito"
+launcher-app-name = "Graffito"
 description = "Personal notes on the bitcoin blockchain: compose on-device, sign offline, sync via bundles"
 icon = "resources/icon.svg"
 app-id = "0x80939851304fbf1880340f62cd9f9aac"
