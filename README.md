@@ -39,7 +39,7 @@ Keep as many **notebooks** as you like — each is its own address, derived from
 
 ## The companion
 
-**Hosted at [objsal.github.io/graffito/companion](https://objsal.github.io/graffito/companion/)** — the online half, and no more than that: it builds sync bundles from public chain data and broadcasts what the device signed. It never sees a key.
+**Hosted at [byteapps.github.io/graffito/companion](https://byteapps.github.io/graffito/companion/)** — the online half, and no more than that: it builds sync bundles from public chain data and broadcasts what the device signed. It never sees a key.
 
 - **Sync & broadcast** (`index.html`) — builds bundles (shown as a file or a static/animated QR) and broadcasts the device's transactions, via mempool.space or your own local node.
 - **Read-only viewer** (`viewer.html`) — renders any address's on-chain notes in the browser: public notes as text, private ones as sealed placeholders. Decryption stays on the device by design.

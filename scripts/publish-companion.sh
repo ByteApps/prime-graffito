@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Publish companion/ into the PUBLIC graffito repo's Pages tree
-# (github.com/ObjSal/graffito → docs/companion/ → GitHub Pages at
-# https://objsal.github.io/graffito/companion/).
+# (github.com/ByteApps/graffito → docs/companion/ → GitHub Pages at
+# https://byteapps.github.io/graffito/companion/).
 #
 # Canonical source stays HERE (prime-graffito/companion — its tests and
 # the Prime e2e live next to it); never edit graffito/docs/companion
@@ -31,4 +31,4 @@ fi
 git add docs/companion
 git commit -m "Sync companion from prime-chain-notes ($(cd "$HERE" && git rev-parse --short HEAD))"
 git push
-echo "published — https://objsal.github.io/graffito/companion/"
+echo "published — https://byteapps.github.io/graffito/companion/"
