@@ -2,7 +2,7 @@ mod notebooks;
 mod spending;
 mod theme;
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -318,6 +318,30 @@ struct SweepPlan {
 }
 
 // ------------------------------------------------------------- helpers
+
+/// The app seed (`GetAppSeed`), fetched LAZILY on first read.
+///
+/// SDK 1.0.0 made `GetAppSeed` `grantOnFirstUse`: the security server presents
+/// a consent prompt through the app's GUI connection and BLOCKS until it is
+/// answered. Fetching during `app_main` setup therefore hangs the app forever
+/// -- the event loop that would draw that prompt and deliver the answer has
+/// not started yet -- with no panic and no log line to say so, which is
+/// exactly how it presents: a dead app whose last line is "Starting anonymous
+/// server". Under SDK 0.4.0 there was no prompt, so the eager fetch this
+/// replaces was correct then and silently became a hang on the port.
+///
+/// So every read goes through here, and the FIRST read is deliberately made
+/// from the boot timer at the end of `app_main`, once `ui.run()` is pumping.
+/// Anything reading the seed before that would reintroduce the hang.
+fn app_seed_get(cell: &OnceCell<Option<[u8; 32]>>) -> &Option<[u8; 32]> {
+    cell.get_or_init(|| match Security::default().app_seed() {
+        Ok(seed) => Some(seed),
+        Err(_) => {
+            log::warn!("identity unavailable: device locked or seed unavailable");
+            None
+        }
+    })
+}
 
 /// Derive a notebook's identity from the app seed (None if locked).
 /// Every notebook is a per-network BIP-86 leaf under its rotation seed
@@ -1080,16 +1104,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // The app seed (GetAppSeed, PIN-gated on hardware) — kept so each
     // notebook's identity can be derived on demand (`Identity::from_bip86`
     // over the notebook's rotation seed + BIP-86 account/index).
-    let app_seed: Rc<Option<[u8; 32]>> = Rc::new(
-        match Security::default().app_seed() {
-            Ok(seed) => Some(seed),
-            Err(_) => {
-                log::warn!("identity unavailable: device locked or seed unavailable");
-                ui.global::<Ui>().set_error("Device locked or seed unavailable".into());
-                None
-            }
-        },
-    );
+    //
+    // EMPTY here on purpose: the fetch prompts the user on SDK 1.0.0 and so
+    // cannot happen before the event loop runs (see `app_seed_get`). The boot
+    // timer at the end of `app_main` primes it.
+    let app_seed: Rc<OnceCell<Option<[u8; 32]>>> = Rc::new(OnceCell::new());
 
     // Notebooks: the index (account -> name/archived) + the ACTIVE notebook.
     // A notebook = an indexed identity; boot lands on the notebook LIST and
@@ -1326,7 +1345,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     continue;
                 }
                 nb_with_coins += 1;
-                let short = derive_identity(&app_seed, m, &active_net)
+                let short = derive_identity(app_seed_get(&app_seed), m, &active_net)
                     .map(|id| short_addr(&id.address(st2.network())))
                     .unwrap_or_default();
                 let name = notebook_name(&ix, m.account, &short);
@@ -1575,7 +1594,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 settings.set_spending_balance_line(
                     format!("{} coin(s) · {} sats", s.utxos.len(), s.balance()).into(),
                 );
-                if let Some(seed) = app_seed.as_ref() {
+                if let Some(seed) = app_seed_get(&app_seed).as_ref() {
                     let net_v = Network::from_str_opt(&active_net).unwrap_or(Network::Mainnet);
                     if let Ok(key) = notes_core::seeds::derive_spending_key(
                         seed, ctx.0, net_v, ctx.1, 0, s.next_receive,
@@ -1697,7 +1716,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let ctx = (*seed_idx.borrow(), *bip_account.borrow());
             let build = |m: &notebooks::NotebookMeta| -> NotebookRow {
                 let st = load_state(&fs, &dev_net, m.account);
-                let addr = derive_identity(&app_seed, m, &dev_net)
+                let addr = derive_identity(app_seed_get(&app_seed), m, &dev_net)
                     .map(|id| id.address(Network::from_str_opt(&dev_net).unwrap_or(Network::Mainnet)))
                     .unwrap_or_default();
                 let short = short_addr(&addr);
@@ -1768,7 +1787,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             *identity.borrow_mut() = notebooks
                 .borrow()
                 .get(account)
-                .and_then(|m| derive_identity(&app_seed, m, &net.borrow()));
+                .and_then(|m| derive_identity(app_seed_get(&app_seed), m, &net.borrow()));
             let mut loaded = load_state(&fs, &net.borrow(), account);
             loaded.chunk_override = *device_chunk.borrow(); // chunk is device-level
             *state.borrow_mut() = loaded;
@@ -2110,7 +2129,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let sources_raw = wallet_sources(
                     &fs,
                     &notebooks.borrow(),
-                    &app_seed,
+                    app_seed_get(&app_seed),
                     &st.network,
                     (*seed_idx.borrow(), *bip_account.borrow()),
                 );
@@ -2180,7 +2199,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         // prevout labels come straight from it.
                         let ix = notebooks.borrow();
                         let (self_spks, spending_spks) =
-                            confirm_self_spks(&ix, &app_seed, &st.network, (*seed_idx.borrow(), *bip_account.borrow()));
+                            confirm_self_spks(&ix, app_seed_get(&app_seed), &st.network, (*seed_idx.borrow(), *bip_account.borrow()));
                         let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> =
                             BTreeMap::new();
                         for (acct, ox, _, coins) in &sources_raw {
@@ -2830,7 +2849,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 st.network(),
                                 &id.output_x,
                                 false,
-                                &app_seed.as_ref().ok_or("identity unavailable")?,
+                                &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?,
                                 ctx.0,
                                 ctx.1,
                                 0,
@@ -2888,7 +2907,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 st.network(),
                                 &id.output_x,
                                 false,
-                                &app_seed.as_ref().ok_or("identity unavailable")?,
+                                &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?,
                                 ctx.0,
                                 ctx.1,
                                 0,
@@ -2933,7 +2952,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             // 2026-07-18) — a notebook input already anchors
                             // the tx to the notebook's address history.
                             let seed: &[u8; 32] =
-                                &app_seed.as_ref().ok_or("identity unavailable")?;
+                                &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?;
                             let notebook_dust_spk = p2tr_script_pubkey(&id.output_x);
                             let mut mixed_inputs: Vec<MixedInput> = Vec::new();
                             let mut has_notebook_input = false;
@@ -3140,7 +3159,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             notebook_name(&ix, active_acct, &short)
                         };
                         let (mut self_spks, mut spending_spks) =
-                            confirm_self_spks(&ix, &app_seed, &net_s, ctx);
+                            confirm_self_spks(&ix, app_seed_get(&app_seed), &net_s, ctx);
                         drop(ix);
                         // A fresh spending-wallet change address this very
                         // tx pays isn't in `used` yet (marked only after a
@@ -3172,7 +3191,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                         spending_spent.iter().any(|(t, v)| *t == u.txid && *v == u.vout)
                                     })
                                     .filter_map(|u| {
-                                        let seed_bytes = (*app_seed).as_ref()?;
+                                        let seed_bytes = app_seed_get(&app_seed).as_ref()?;
                                         notes_core::seeds::derive_spending_key(
                                             seed_bytes,
                                             ctx.0,
@@ -3870,7 +3889,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // Archived notebooks are excluded by `visible()`, so an
                 // archived notebook's input can never suppress a note in an
                 // active one.
-                let notebook_spks = wallet_notebook_spks(&ix, &app_seed, &net_s, ctx);
+                let notebook_spks = wallet_notebook_spks(&ix, app_seed_get(&app_seed), &net_s, ctx);
                 drop(ix);
                 let notebook_addr = id.address(st.network());
                 let self_spks: Vec<Vec<u8>> = {
@@ -4008,14 +4027,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     if let Some(addr) = already_known {
                         return Some((addr, false));
                     }
-                    // `app_seed.as_ref()` can resolve to either `Option<&[u8;
-                    // 32]>` (the inherent `Option::as_ref`) or `&Option<[u8;
-                    // 32]>` (`AsRef` on whatever smart pointer wraps it,
-                    // found first in method resolution) depending on
-                    // `app_seed`'s exact captured type — match ergonomics
-                    // make `let Some(x) = ‹either shape›` work uniformly,
-                    // unlike `?` which needs a concrete `Try` type.
-                    let Some(seed) = app_seed.as_ref() else { return None };
+                    // `app_seed_get` hands back a concrete `&Option<[u8; 32]>`,
+                    // so `.as_ref()` is unambiguously `Option::as_ref` here.
+                    let Some(seed) = app_seed_get(&app_seed).as_ref() else { return None };
                     let mut found_addr: Option<spending::SpendingAddress> = None;
                     'gap: for chain in [0u32, 1u32] {
                         let base = if chain == 0 { next_recv } else { next_chg };
@@ -4391,7 +4405,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let mut network = Network::from_str_opt(&net_dev).unwrap_or(Network::Mainnet);
             let wallet_ctx = (*seed_idx.borrow(), *bip_account.borrow());
             let ix = notebooks.borrow();
-            let (self_spks, spending_spks) = confirm_self_spks(&ix, &app_seed, &net_dev, wallet_ctx);
+            let (self_spks, spending_spks) = confirm_self_spks(&ix, app_seed_get(&app_seed), &net_dev, wallet_ctx);
             drop(ix);
 
             // Port B (network-display fix, 2026-07-19): a PSBT's
@@ -4539,7 +4553,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // BIP-44 coin type — their keys differ per network, so
                 // always re-derive from the meta.
                 if let Some(m) = notebooks.borrow().get(account) {
-                    *identity.borrow_mut() = derive_identity(&app_seed, m, &next);
+                    *identity.borrow_mut() = derive_identity(app_seed_get(&app_seed), m, &next);
                 }
             }
             let _ = &ui_weak;
@@ -4758,7 +4772,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // index of the active (seed, account) context — the
                 // recovery-seeds scheme, words-recoverable anywhere.
                 // (Legacy notebooks are never created anymore.)
-                if app_seed.is_none() {
+                if app_seed_get(&app_seed).is_none() {
                     ui.global::<Ui>().set_error("Device locked — can't create a notebook.".into());
                     return;
                 }
@@ -4857,7 +4871,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let Some(ui) = ui_weak.upgrade() else { return };
             let recovery = ui.global::<Recovery>();
             let index = *seed_idx.borrow();
-            let Some(seed) = app_seed.as_ref() else {
+            let Some(seed) = app_seed_get(&app_seed).as_ref() else {
                 ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
                 log::warn!("cb: reveal-seed index={index} err=locked");
                 return;
@@ -4948,7 +4962,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let mut rows: Vec<ExportNbRow> = Vec::new();
             let ixb = notebooks.borrow();
             for m in ixb.visible(si, acct) {
-                let addr = derive_identity(&app_seed, m, net_s)
+                let addr = derive_identity(app_seed_get(&app_seed), m, net_s)
                     .map(|id| id.address(network))
                     .unwrap_or_default();
                 let short = short_addr(&addr);
@@ -4986,7 +5000,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let r = ui.global::<Recovery>();
             let si = *seed_idx.borrow();
             let acct = *bip_account.borrow();
-            let Some(seed) = app_seed.as_ref() else {
+            let Some(seed) = app_seed_get(&app_seed).as_ref() else {
                 ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
                 log::warn!("cb: reveal-public seed={si} account={acct} err=locked");
                 return;
@@ -5024,7 +5038,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let r = ui.global::<Recovery>();
             let si = *seed_idx.borrow();
             let acct = *bip_account.borrow();
-            let Some(seed) = app_seed.as_ref() else {
+            let Some(seed) = app_seed_get(&app_seed).as_ref() else {
                 ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
                 log::warn!("cb: reveal-private seed={si} account={acct} err=locked");
                 return;
@@ -5072,7 +5086,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let r = ui.global::<Recovery>();
             let si = *seed_idx.borrow();
             let acct = *bip_account.borrow();
-            let Some(seed) = app_seed.as_ref() else { return };
+            let Some(seed) = app_seed_get(&app_seed).as_ref() else { return };
             let net_s = net.borrow().clone();
             let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
             let name = {
@@ -5191,13 +5205,39 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     // Boot: the notebook list is the main screen. Migrate/seed the index,
     // then land on the list (a fresh install starts empty). Seed/account
-    // fields mirror the persisted wallet context; the reveal is enabled
-    // whenever the app seed is present (wallet-level — no open notebook).
-    ui.global::<Recovery>().set_seed_available(app_seed.is_some());
+    // fields mirror the persisted wallet context.
+    //
+    // NOTHING here may read the app seed: `GetAppSeed` prompts on SDK 1.0.0
+    // and the prompt cannot be answered until `ui.run()` is pumping, so a read
+    // on this path hangs the app at launch (see `app_seed_get`). The list is
+    // therefore painted seed-free first — rows render without their addresses
+    // — and the timer below primes the seed once the loop is live, then
+    // repaints the list with them.
     ui.global::<Recovery>().set_seed_text(format!("{}", *seed_idx.borrow()).into());
     ui.global::<Recovery>().set_account_text(format!("{}", *bip_account.borrow()).into());
-    refresh_notebooks();
     ui.global::<Ui>().set_screen(20);
+
+    let boot_seed = {
+        let ui_weak = ui_weak.clone();
+        let app_seed = app_seed.clone();
+        let refresh_notebooks = refresh_notebooks.clone();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            // First read of the seed in the app's life: this is what raises
+            // the one-time "App-scoped seed" consent prompt, and the running
+            // loop is what lets the user answer it.
+            let available = app_seed_get(&app_seed).is_some();
+            ui.global::<Recovery>().set_seed_available(available);
+            if !available {
+                ui.global::<Ui>().set_error("Device locked or seed unavailable".into());
+            }
+            // Repaint: the rows drawn before the seed existed have no address.
+            refresh_notebooks();
+        }
+    };
+    // A frame's grace so the list is on screen behind the consent prompt,
+    // rather than the prompt appearing over a blank window.
+    Timer::single_shot(Duration::from_millis(150), boot_seed);
 
     ui.run().expect("UI running");
 }
