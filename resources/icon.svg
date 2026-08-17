@@ -5,7 +5,7 @@
       <stop offset="60%" stop-color="#211e1a"/>
       <stop offset="100%" stop-color="#171512"/>
     </radialGradient>
-    <clipPath id="squircle"><rect x="0" y="0" width="1024" height="1024" rx="230"/></clipPath>
+    <clipPath id="squircle"><circle cx="512" cy="512" r="512"/></clipPath>
   </defs>
   <g clip-path="url(#squircle)">
     <rect width="1024" height="1024" fill="url(#wall)"/>
@@ -55,4 +55,9 @@
       <path d="M 714 718 l 32 28" stroke-width="6" opacity="0.6" transform="translate(6,-5)"/>
     </g>
   </g>
+  <!-- Rim light: the wall is deliberately dark, and the launcher tile behind
+       it is dark too, so without this the disc's edge dissolves into the tile
+       and the icon reads as a floating "g". Drawn OUTSIDE the clip group so
+       the stroke isn't half-clipped by its own path. -->
+  <circle cx="512" cy="512" r="504" fill="none" stroke="#efe8da" stroke-width="16" opacity="0.22"/>
 </svg>
