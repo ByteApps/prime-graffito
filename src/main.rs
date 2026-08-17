@@ -22,7 +22,7 @@ use notes_core::tx::{
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
 use spending::SpendingIndex;
-use slint_keyos_platform::app_ui;
+use slint_keyos_platform::app_ui2;
 use slint_keyos_platform::fs::{self, Location, OpenFlags};
 use slint_keyos_platform::gui_server_api::navigation::qrscanner::{ScanQrOptions, ScanQrResult};
 use slint_keyos_platform::navigation::open_qr_scanner;
@@ -33,7 +33,7 @@ use slint_keyos_platform::slint::{
 
 security::use_api!();
 
-app_ui!("prime-chain-notes");
+app_ui2!("Graffito");
 
 type Fs = fs::FileSystem<fs_permissions::FileSystemPermissions>;
 
@@ -1967,7 +1967,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 ..ScanQrOptions::default()
             };
             let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
-                Ok(Some(ScanQrResult::Qr(data))) | Ok(Some(ScanQrResult::Ur2(_, data))) => data,
+                Ok(Some(ScanQrResult::Qr { data, .. })) | Ok(Some(ScanQrResult::Ur2 { data, .. })) => data,
                 Ok(_) => {
                     log::info!("cb: scan-contact cancelled");
                     return;
@@ -4251,8 +4251,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             // Blocks while the system scanner modal owns the screen; it
             // reassembles animated UR sequences itself (foundation-ur).
             let (kind, data) = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
-                Ok(Some(ScanQrResult::Qr(data))) => ("qr", data),
-                Ok(Some(ScanQrResult::Ur2(ur_type, data))) => {
+                Ok(Some(ScanQrResult::Qr { data, .. })) => ("qr", data),
+                Ok(Some(ScanQrResult::Ur2 { ur_type, data, .. })) => {
                     log::info!("cb: scan-bundle ur-type={ur_type}");
                     ("ur", data)
                 }
@@ -4353,7 +4353,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 ..ScanQrOptions::default()
             };
             let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
-                Ok(Some(ScanQrResult::Qr(d))) | Ok(Some(ScanQrResult::Ur2(_, d))) => d,
+                Ok(Some(ScanQrResult::Qr { data: d, .. })) | Ok(Some(ScanQrResult::Ur2 { data: d, .. })) => d,
                 Ok(_) => {
                     log::info!("cb: sign-psbt cancelled");
                     return;
