@@ -1,7 +1,7 @@
 # Workspace root: the KeyOS app binary plus the host-testable notes-core
 # library (wallet-core/pgp-core/bip85-core pattern — see ../CLAUDE.md).
 [package]
-name = "prime-chain-notes"
+name = "prime-graffito"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
