@@ -75,6 +75,8 @@ Donations help cover development costs and keep more open-source bitcoin tools c
 
 Licensed under the GNU General Public License v3.0 or later — see [COPYING](COPYING). Sections 15–17 of that license disclaim all warranty and limit liability; the notes below restate that in plain language.
 
+The **`notes-core/`** library inside this repository carries its own, more permissive terms: **MIT OR Apache-2.0**, see [`notes-core/LICENSE-MIT`](notes-core/LICENSE-MIT) and [`notes-core/LICENSE-APACHE`](notes-core/LICENSE-APACHE). It holds the PNTE protocol: envelope, sealing, ECDH, and taproot build/sign, and the split is deliberate — other projects, including non-GPL peers of this app, are meant to build on that crate. The GPL above covers the application around it.
+
 This is experimental software and it has **not been independently audited**.
 It is provided **"as is", without warranty of any kind**, express or implied,
 including but not limited to the warranties of merchantability, fitness for a
