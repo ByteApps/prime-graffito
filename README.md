@@ -57,6 +57,20 @@ foundation sim
 
 - [THIRD-PARTY.md](THIRD-PARTY.md) — libraries this app is built on
 
+## Support
+
+If this app is useful to you, a small bitcoin donation is always appreciated — entirely optional.
+
+<div align="center">
+
+<img src="donate-qr.png" alt="Donate bitcoin" width="200">
+
+**`bc1qkmg7qek6vuuw6hqp9sm06krzcr7pwd5jhcr43f`**
+
+</div>
+
+Donations help cover development costs and keep more open-source bitcoin tools coming. No VC funding, no ads, no tracking.
+
 ## License & disclaimer
 
 Licensed under the GNU General Public License v3.0 or later — see [COPYING](COPYING). Sections 15–17 of that license disclaim all warranty and limit liability; the notes below restate that in plain language.
