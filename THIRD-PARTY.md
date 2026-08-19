@@ -50,4 +50,11 @@ Provided by the installed Foundation SDK (path dependencies, not crates.io):
 | `slint-keyos-platform` (+ `-build`) | [Slint](https://slint.dev) UI runtime, QR rendering, and build integration for KeyOS |
 | `foundation-themes` | Design tokens and light/dark theming |
 
-The Slint UI toolkit itself is licensed under GPL-3.0-only OR the Slint Royalty-free / commercial licenses; this app is GPL-3.0-or-later.
+The Slint UI toolkit itself is licensed under GPL-3.0-only OR the Slint
+Royalty-free / commercial licenses. **This app elects the GPL**, which is why
+it is GPL-3.0-or-later. That is not a free choice: section 3 of the Slint
+Royalty-free license excludes embedded systems, and a Passport Prime is one, so
+on-device the GPL is the only option that costs nothing. KeyOS's own API crates
+(`server`, `fs`, `crypto`, `security`, ...) are GPL-3.0-or-later as well. Taking
+this app closed-source would require a paid Slint license *and* a resolution of
+the KeyOS side.
