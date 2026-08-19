@@ -1127,7 +1127,7 @@ fn sweep_multi_source_cross_check() {
 }
 
 // ---------------------------------------------------------------------
-// Self-spk-SET ownership rule (PLAN-chain-notes-funding-unification.md M0):
+// Self-spk-SET ownership rule (PLAN-graffito-funding-unification.md M0):
 // `extract_notes_multi`/`_watch_multi` generalize OWN from "spends from the
 // notebook address" to "spends from any of MY scriptPubKeys", via the new
 // `OnchainTx::input_prevout_spks` field. `extract_notes`/`extract_notes_watch`

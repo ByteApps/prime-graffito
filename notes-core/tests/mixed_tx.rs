@@ -1,5 +1,5 @@
 //! `notes_core::tx::build_note_tx_mixed_exact` / `estimate_vsize_mixed` —
-//! the Prime device spending-wallet port (PLAN-chain-notes-funding-unification.md,
+//! the Prime device spending-wallet port (PLAN-graffito-funding-unification.md,
 //! "Prime device" + M2). Cross-checked byte-for-byte against rust-bitcoin,
 //! mirroring `wpkh_vectors.rs`'s treatment of `wpkh::sign_mixed_inputs`
 //! (house rule for crypto/tx-assembly surface).

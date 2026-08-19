@@ -91,7 +91,7 @@ function log(el, msg, cls) {
   // Optional &mine=<addr1,addr2,...> (comma-separated) extends OWN detection
   // to additional funding-source addresses via chain-scan.js's myAddresses
   // param — the notebook owner's link to disclose, default omits it (no
-  // disclosure; PLAN-chain-notes-funding-unification.md open question 1).
+  // disclosure; PLAN-graffito-funding-unification.md open question 1).
   // The P2TR-looking entries double as `notebookAddresses` for chain-scan.js's
   // DISPLAY-OWNER dedup (2026-07-18) — see viewer.html's matching comment.
   const mineAddresses = (q.get("mine") || "").split(",").map((a) => a.trim()).filter(Boolean);

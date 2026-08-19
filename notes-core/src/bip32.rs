@@ -6,7 +6,7 @@
 //!
 //! Extended-key serialization (xprv/xpub) is provided for the reveal /
 //! key-export surfaces (`export.rs`) — the device UI still only shows the
-//! subset chosen in PLAN-chain-notes-seed-rotation.md (never a private
+//! subset chosen in PLAN-graffito-seed-rotation.md (never a private
 //! xprv), but the serialization lives here so both apps render identical
 //! strings from one pure-Rust path.
 
@@ -128,7 +128,7 @@ impl Xprv {
 
     /// Serialize as an extended PRIVATE key string (`xprv` on mainnet,
     /// `tprv` on the test chains). Carries secret material — used only by
-    /// chain-notes-app's reveal; the device deliberately never shows it.
+    /// the graffito desktop app's reveal; the device deliberately never shows it.
     pub fn to_xprv(&self, network: Network) -> String {
         let version: u32 = match network {
             Network::Mainnet => 0x0488_ADE4,

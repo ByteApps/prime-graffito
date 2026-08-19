@@ -9,7 +9,7 @@
 //! unexplainably high (Sal hit this on testnet4: a single 330-sat coin
 //! composed a valid tx whose whole value went to "fee").
 //!
-//! Ported from chain-notes-app's `app-core/src/mixed.rs`
+//! Ported from the graffito desktop app's `app-core/src/mixed.rs`
 //! (`predict_fold`/`predict_notebook_fold`/`predict_funded_fold`,
 //! 2026-07-18) onto THIS crate's own estimators, so the Prime device shows
 //! the identical honest split its Mac/mobile sibling does. Pure
@@ -45,7 +45,7 @@ use crate::DUST_LIMIT;
 /// rather than fold an oversized leftover, so every wrapper below passes
 /// `true`. The parameter is kept explicit (rather than hardcoded) so a
 /// future builder without that ceiling doesn't have to duplicate this
-/// function, matching chain-notes-app's `app_core::mixed::predict_fold`
+/// function, matching the graffito desktop app's `app_core::mixed::predict_fold`
 /// API shape.
 pub fn predict_fold(
     in_value: u64,
@@ -109,7 +109,7 @@ pub fn predict_notebook_fold(
 /// [`predict_fold`] for the mixed/coin-control shape (device "Pay from"
 /// coin control — pure notebook subset, pure spending-wallet, or a mix of
 /// both) — `build_note_tx_mixed_exact`/`_anchored`. Unlike
-/// chain-notes-app's `app-core` (a separate crate that has to re-derive an
+/// the graffito desktop app's `app-core` (a separate crate that has to re-derive an
 /// `estimate_funded_fee`/`_no_change` pair), this crate already exposes
 /// [`estimate_vsize_mixed`] with an explicit extra-output-length list, so
 /// the with-change/no-change fee pair is simply two calls to the SAME

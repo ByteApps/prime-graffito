@@ -4,7 +4,7 @@
 // exercises) AND whether it has ANY on-chain history at all.
 //
 // This is the companion half of gap-discovery option (b)
-// (PLAN-chain-notes-funding-unification.md, 2026-07-19): the device
+// (PLAN-graffito-funding-unification.md, 2026-07-19): the device
 // exports a lookahead WATCH WINDOW (Settings' spending card — next 20
 // receive + next 20 change addresses) instead of only its already-`used`
 // addresses. Most of those window addresses are still unused, but a

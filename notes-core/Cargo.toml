@@ -1,4 +1,4 @@
-# UI-free chain-notes library — key derivation, PNTE envelope, AEAD,
+# UI-free graffito notes library — key derivation, PNTE envelope, AEAD,
 # taproot transaction build/sign, sync-bundle handling. Host-testable
 # (`cargo test -p notes-core`), mirroring the wallet-core pattern.
 # Pure-Rust deps only: C code does not cross-compile to

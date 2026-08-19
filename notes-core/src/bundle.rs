@@ -43,10 +43,12 @@ impl Identity {
     }
 
     /// Identity from a BIP-86 leaf secret — the bip86 notebook scheme
-    /// (PLAN-chain-notes-seed-rotation.md) and chain-notes-app's shipped
-    /// derivation: BIP-341 tweak for the keys, the FROZEN
-    /// `chain-notes-app/enc/v1` rule for the enc key. Byte-identical to
-    /// what chain-notes-app derives after a plain BIP-39 import.
+    /// (PLAN-graffito-seed-rotation.md) and the graffito desktop app's
+    /// shipped derivation: BIP-341 tweak for the keys, the FROZEN
+    /// `graffito/enc/v1` rule for the enc key. Byte-identical to what the
+    /// graffito desktop app derives after a plain BIP-39 import — once it
+    /// adopts the identical post-epoch salt (a separately-scoped follow-up
+    /// in that repo; see the workspace report for this change).
     pub fn from_leaf_secret(leaf_secret: &[u8; 32]) -> Result<Self, Error> {
         let (internal_x, _) = xonly_pubkey(leaf_secret)?;
         let (output_x, _) = taproot_tweak_pubkey(&internal_x, None)?;
@@ -147,7 +149,7 @@ pub struct OnchainTx {
     pub recipient: Option<String>,
     /// Raw scriptPubKeys (hex) of every input's prevout — enables the
     /// self-spk-SET ownership rule (`extract_notes_multi`/`_watch_multi`,
-    /// PLAN-chain-notes-funding-unification.md). Empty (the serde default)
+    /// PLAN-graffito-funding-unification.md). Empty (the serde default)
     /// falls back to `spends_from_self` for bundles that don't populate it
     /// — old callers and old bundles are unaffected.
     #[serde(default)]
@@ -190,7 +192,7 @@ pub struct SyncBundle {
     pub btc_usd: Option<f64>,
     pub utxos: Vec<BundleUtxo>,
     pub notes_onchain: Vec<OnchainTx>,
-    /// Companion gap-discovery, option (b) (PLAN-chain-notes-funding-
+    /// Companion gap-discovery, option (b) (PLAN-graffito-funding-
     /// unification.md, 2026-07-19): every spending-wallet watch-window
     /// address (the device's exported next-20-receive + next-20-change
     /// lookahead, NOT just the addresses that currently hold a coin) the

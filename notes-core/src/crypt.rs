@@ -1,6 +1,6 @@
 //! Private-note sealing: XChaCha20-Poly1305, one nonce per NOTE (the whole
 //! note is sealed once, then chunked — never per-chunk nonces; see
-//! PLAN-chain-notes.md). Blob layout: nonce(24) || ciphertext || tag(16).
+//! PLAN-graffito.md). Blob layout: nonce(24) || ciphertext || tag(16).
 //!
 //! XChaCha20 is length-preserving, so sealed_len = plaintext_len + 40 —
 //! the compose screen's keystroke cost estimator depends on that constant.

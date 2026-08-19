@@ -1,4 +1,4 @@
-//! Spending-wallet bookkeeping (PLAN-chain-notes-funding-unification.md,
+//! Spending-wallet bookkeeping (PLAN-graffito-funding-unification.md,
 //! "Prime device" + M2). One P2WPKH BIP-84 wallet per (network, seed,
 //! bip_account) context — the SAME granularity notebooks are visible at
 //! (`NotebookMeta::in_context`), since a spending wallet is a property of
@@ -13,8 +13,9 @@
 //! ledger) while a spending wallet is per-ACCOUNT — several sibling
 //! notebooks of one account must all see the SAME spending wallet, which a
 //! per-notebook file can't express without duplicating (and desyncing) the
-//! bookkeeping; chain-notes-app hit exactly this bug living per-identity
-//! and fixed it by moving to its account-level `notebooks-<net>-<fp8>.json`
+//! bookkeeping; the graffito desktop app hit exactly this bug living
+//! per-identity and fixed it by moving to its account-level
+//! `notebooks-<net>-<fp8>.json`
 //! (PLAN's M3.1 note). `notebooks.json` already indexes data by
 //! (seed, bip_account) via `NotebookMeta`, so a new sibling array keyed the
 //! same way is the natural existing home, not a new file.

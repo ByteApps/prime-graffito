@@ -1,6 +1,6 @@
 //! `notes_core::confirm::summarize_signed_tx` — the device's universal
 //! "Confirm & sign" screen's byte-truth summarizer. Ported scenario-for-
-//! scenario from chain-notes-app's `app-core/src/confirm.rs` test module
+//! scenario from the graffito desktop app's `app-core/src/confirm.rs` test module
 //! (six classification scenarios) plus an `address_from_spk` round-trip
 //! check, adapted to this crate's own decoder/address rendering instead of
 //! `rust-bitcoin`. Integration test (not an inline `#[cfg(test)]` module)

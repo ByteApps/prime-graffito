@@ -1,10 +1,16 @@
 //! Directed-note encryption: STATIC-STATIC x-only ECDH between two taproot
 //! output keys, HKDF'd into an XChaCha20-Poly1305 key.
 //!
-//! CONSENSUS-CRITICAL FOR RE-DERIVATION — FROZEN like keys.rs: the salt and
-//! info strings below, the x-only shared-secret definition, and the AAD
-//! layout are baked into every directed note ever sealed. NEVER change
-//! them.
+//! CONSENSUS-CRITICAL FOR RE-DERIVATION — FROZEN like keys.rs (post-epoch):
+//! the salt and info strings below, the x-only shared-secret definition,
+//! and the AAD layout are baked into every directed note ever sealed.
+//! NEVER change them.
+//!
+//! GRAFFITO EPOCH (2026-08-18): `DM_SALT` was rebound from
+//! `prime-chain-notes/dm/v1` alongside keys.rs's salts — a deliberate
+//! crypto epoch break, not a compatibility-preserving change. Every
+//! directed note sealed under the old salt is now permanently
+//! undecryptable.
 //!
 //! Key agreement: `shared_x = x( my_tweaked_seckey · lift_x(peer_output_x) )`.
 //! The taproot-tweaked scalar `a` satisfies `a·G = ±lift_x(my_output_x)`, so
@@ -61,7 +67,7 @@ use crate::keys::scalar_from_bytes;
 use crate::taproot::lift_x;
 use crate::{crypt, Error};
 
-pub const DM_SALT: &[u8] = b"prime-chain-notes/dm/v1";
+pub const DM_SALT: &[u8] = b"prime-graffito/dm/v1";
 pub const DM_INFO: &[u8] = b"dm-enc/v1";
 
 /// x coordinate of `tweaked_seckey · lift_x(peer_output_x)`.
