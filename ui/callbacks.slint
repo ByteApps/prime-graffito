@@ -188,7 +188,7 @@ export global View {
     in-out property <image> qr;
     in-out property <bool> has-qr: false;
     in-out property <bool> show-qr: false;
-    // Reply / Reply-all (mirrors the chain-notes-app peer's semantics):
+    // Reply / Reply-all (mirrors the graffito desktop app peer's semantics):
     // non-"" shows a "Reply" button addressed to this address; a
     // reply-set with 2+ entries shows "Reply all" addressed to all of
     // them. Both computed by on-open-note from the note's from/recipients.
@@ -372,7 +372,7 @@ export global Recovery {
     // Account-level xpub/descriptor (all this account's notebooks) plus
     // index-0 hex/WIF (a single-key import). The private xprv is
     // deliberately NOT exported on the device — the 24 words already
-    // recover the whole seed (PLAN-chain-notes-seed-rotation.md).
+    // recover the whole seed (PLAN-graffito-seed-rotation.md).
     in-out property <string> export-title: "";   // "Seed N · account M · index 0"
     in-out property <string> export-xpub: "";
     in-out property <string> export-descriptor: "";

@@ -1,5 +1,5 @@
 //! Recovery seeds — the composed pipeline from `GetAppSeed` to a BIP-86
-//! notebook leaf (PLAN-chain-notes-seed-rotation.md):
+//! notebook leaf (PLAN-graffito-seed-rotation.md):
 //!
 //! ```text
 //! app_seed ── keys::derive_seed_entropy(·, seed_index) ─▶ entropy   ★ FROZEN, ours
@@ -10,7 +10,7 @@
 //! Everything below the ★ is the standard pipeline every wallet
 //! implements — which is exactly why the 24 words alone recover a seed's
 //! notebooks anywhere (funds in any taproot wallet; notes, encryption and
-//! directed-note ECDH in chain-notes-app via its plain BIP-39 import).
+//! directed-note ECDH in the graffito desktop app via its plain BIP-39 import).
 //! The rotation index appears ONLY inside `derive_seed_entropy`.
 
 use zeroize::Zeroizing;
@@ -21,7 +21,7 @@ use crate::keys::derive_seed_entropy;
 use crate::{Error, Network};
 
 /// BIP-44 coin type for the BIP-86 path: 0' on mainnet, 1' on every test
-/// network (the BIP-44 convention; matches chain-notes-app's rule).
+/// network (the BIP-44 convention; matches the graffito desktop app's rule).
 pub fn coin_type(network: Network) -> u32 {
     match network {
         Network::Mainnet => 0,
@@ -37,7 +37,7 @@ pub fn seed_mnemonic(app_seed: &[u8; 32], seed_index: u32) -> Result<Zeroizing<S
 }
 
 /// Master xprv of rotation `seed_index` (empty BIP-39 passphrase — the
-/// chain-notes-app import convention).
+/// the graffito desktop app import convention).
 pub fn seed_master(app_seed: &[u8; 32], seed_index: u32) -> Result<Xprv, Error> {
     let mnemonic = seed_mnemonic(app_seed, seed_index)?;
     let seed = Zeroizing::new(bip39::mnemonic_to_seed(&mnemonic, ""));
@@ -65,14 +65,14 @@ pub fn derive_leaf(
 }
 
 /// Master fingerprint (8-char hex) of rotation `seed_index` — for logs
-/// and store-file names, mirroring chain-notes-app's `index_fp8`. Never
+/// and store-file names, mirroring the graffito desktop app's `index_fp8`. Never
 /// a secret.
 pub fn seed_fingerprint_hex(app_seed: &[u8; 32], seed_index: u32) -> Result<String, Error> {
     seed_master(app_seed, seed_index)?.fingerprint_hex()
 }
 
 // ---------------------------------------------------------------------
-// BIP-84 spending wallet branch (PLAN-chain-notes-funding-unification.md,
+// BIP-84 spending wallet branch (PLAN-graffito-funding-unification.md,
 // "Derivation (the core spec)") — the SAME master material as the BIP-86
 // notebook leaf above, second standard branch:
 //

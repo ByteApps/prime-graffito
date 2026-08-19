@@ -1,5 +1,5 @@
 //! P2WPKH (BIP143) signing for the spending wallet's native-segwit inputs
-//! (PLAN-chain-notes-funding-unification.md, "New signing surface: P2WPKH
+//! (PLAN-graffito-funding-unification.md, "New signing surface: P2WPKH
 //! in notes-core"). Unlike the hand-rolled BIP340 Schnorr in `sign.rs`
 //! (hand-rolled per spec so `aux_rand` stays a parameter for reproducible
 //! vectors), ECDSA's RFC6979 deterministic nonce and low-S/DER

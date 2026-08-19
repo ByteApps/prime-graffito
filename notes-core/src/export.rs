@@ -1,10 +1,10 @@
 //! Key-export rendering for the "reveal" surfaces — every format
-//! chain-notes-app's importer (`parse_key_material`) accepts, rendered
+//! the graffito desktop app's importer (`parse_key_material`) accepts, rendered
 //! from a bip86 identity so a Prime (or the app) can hand its keys off to
 //! another wallet. Pure-Rust (base58check via `bs58`), so the device
 //! builds it too; cross-tested byte-for-byte against rust-bitcoin.
 //!
-//! Granularity mirrors chain-notes-app's import:
+//! Granularity mirrors the graffito desktop app's import:
 //! - **hex / WIF** are the single NOTEBOOK leaf `m/86'/coin'/account'/0/index`
 //!   (one address — imports as a raw key).
 //! - **xpub / xprv / descriptor** are the ACCOUNT `m/86'/coin'/account'`
@@ -12,7 +12,7 @@
 //!
 //! The app seed is NEVER an output here — every path runs through the
 //! one-way seed-entropy HKDF first (see `seeds.rs`). The device UI shows
-//! only the subset chosen in PLAN-chain-notes-seed-rotation.md (no private
+//! only the subset chosen in PLAN-graffito-seed-rotation.md (no private
 //! xprv); the app shows all of it.
 
 use zeroize::Zeroizing;
@@ -47,7 +47,7 @@ fn wif(key: &[u8; 32], network: Network) -> Zeroizing<String> {
 }
 
 /// Notebook leaf private key as raw 32-byte hex — imports into
-/// chain-notes-app's hex field, reproducing this exact taproot notebook.
+/// the graffito desktop app's hex field, reproducing this exact taproot notebook.
 pub fn leaf_hex(
     app_seed: &[u8; 32],
     seed_index: u32,
@@ -82,7 +82,7 @@ pub fn account_xpub(
 }
 
 /// Account xprv (`xprv`/`tprv`) — PRIVATE, unlocks the whole account.
-/// chain-notes-app only; the device reveal omits it.
+/// the graffito desktop app only; the device reveal omits it.
 pub fn account_xprv(
     app_seed: &[u8; 32],
     seed_index: u32,
@@ -94,7 +94,7 @@ pub fn account_xprv(
 
 /// Key-origin taproot descriptor
 /// `tr([<masterfp>/86'/<coin>'/<account>']<account_xpub>/<0;1>/*)` — the
-/// hardware-wallet watch-only form chain-notes-app imports.
+/// hardware-wallet watch-only form the graffito desktop app imports.
 pub fn account_descriptor(
     app_seed: &[u8; 32],
     seed_index: u32,

@@ -923,7 +923,7 @@ pub fn build_note_tx_multi_exact(
 
 // ---------------------------------------------------------------------
 // Mixed-source (taproot + P2WPKH) note transactions — the Prime device's
-// spending-wallet port (PLAN-chain-notes-funding-unification.md, "Prime
+// spending-wallet port (PLAN-graffito-funding-unification.md, "Prime
 // device" + "New signing surface: P2WPKH in notes-core"). Unlike every
 // builder above (always P2TR key-path, one shared `tweaked_seckey`), a
 // spending-wallet coin is a P2WPKH input owned by ITS OWN fresh-address
@@ -965,7 +965,7 @@ pub struct MixedInput {
 /// conservative budgeting convention most wallets use (a real signature is
 /// often 1-2 bytes shorter, so the fee is a slight, harmless overpay).
 /// Together with the shared 41-byte base these reproduce
-/// PLAN-chain-notes-funding-unification.md's cost table exactly: P2TR input
+/// PLAN-graffito-funding-unification.md's cost table exactly: P2TR input
 /// 57.5 vB, P2WPKH input 68 vB ((41*4 + 66)/4 = 57.5, (41*4 + 108)/4 = 68).
 fn mixed_input_witness_wu(kind: InputKind) -> usize {
     match kind {

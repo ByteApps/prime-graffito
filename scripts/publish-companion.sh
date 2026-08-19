@@ -29,6 +29,6 @@ if [ -z "$(git status --porcelain docs/companion)" ]; then
     exit 0
 fi
 git add docs/companion
-git commit -m "Sync companion from prime-chain-notes ($(cd "$HERE" && git rev-parse --short HEAD))"
+git commit -m "Sync companion from prime-graffito ($(cd "$HERE" && git rev-parse --short HEAD))"
 git push
 echo "published — https://byteapps.com/graffito/companion/"

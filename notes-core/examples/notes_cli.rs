@@ -63,9 +63,9 @@ fn main() {
             let network = Network::from_str_opt(&args[2]).expect("network");
             println!("{}", identity.address(network));
         }
-        // Recovery seeds (PLAN-chain-notes-seed-rotation.md): mirror what
+        // Recovery seeds (PLAN-graffito-seed-rotation.md): mirror what
         // the device derives so the e2e can cross-check the sim UI and
-        // feed the words to the chain-notes-app import.
+        // feed the words to the graffito desktop app import.
         Some("seed-words") => {
             // seed-words <seed_index>
             let index: u32 = args[2].parse().expect("seed index");
@@ -82,12 +82,12 @@ fn main() {
             println!("{}", id.address(network));
         }
         // Spending wallet (funding-unification, device port): stateless
-        // BIP-84 leaf derivation, mirroring chain-notes-app's `cli
+        // BIP-84 leaf derivation, mirroring the graffito desktop app's `cli
         // spending-derive`/`spending-address` (same arg order as
         // `seed-address` above: network first). Prints
         // "<address> <spk_hex>" so a bash caller can seed
         // notebooks.json's spending[].used entry with both fields
-        // (`ui-automation/tests/chain-notes.sh`'s mixed-compose leg).
+        // (`ui-automation/tests/graffito.sh`'s mixed-compose leg).
         Some("spending-address") => {
             // spending-address <network> <seed_index> <account> <chain> <index>
             let network = Network::from_str_opt(&args[2]).expect("network");
@@ -112,7 +112,7 @@ fn main() {
         // device itself uses (`wpkh::sign_mixed_inputs` via
         // `build_sweep_tx_mixed`, a single-input degenerate case of the
         // same mixed-source sweep builder the device's wallet-wide sweep
-        // already exercises) — so `ui-automation/tests/chain-notes.sh` can
+        // already exercises) — so `ui-automation/tests/graffito.sh` can
         // simulate "this watch-window address was already spent to empty"
         // without driving device UI for every leg. Prints "<txid> <raw_hex>".
         Some("spending-sweep") => {

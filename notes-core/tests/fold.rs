@@ -1,5 +1,5 @@
 //! Pin tests for `notes_core::fold` (honest-fee-label prediction, ported
-//! from chain-notes-app's `app-core/src/mixed.rs`, 2026-07-19): every
+//! from the graffito desktop app's `app-core/src/mixed.rs`, 2026-07-19): every
 //! predictor here must match what this crate's OWN builders actually do,
 //! for the three shapes the device confirm gate and compose cost line
 //! care about — a real WITH-CHANGE build, a real NO-CHANGE/FOLDED build,

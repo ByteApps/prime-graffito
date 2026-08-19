@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end proof of the chain-notes pipeline against the ONE shared node
+# End-to-end proof of the graffito pipeline against the ONE shared node
 # (the Pi's persistent regtest, or testnet4 — see ../../PLAN-one-regtest-node.md).
 # This script no longer starts, stops, or owns any bitcoind: it is a client
 # of a node that other suites/units may be touching at the same time.
@@ -86,14 +86,14 @@ CN_NODE_PORT="${CN_NODE_PORT:-$DEFAULT_PORT}"
 CLI() { bitcoin-cli "-$CN_NETWORK" "-rpcconnect=$CN_NODE_HOST" "-rpcport=$CN_NODE_PORT" \
     "-rpcuser=$CORE_RPC_USER" "-rpcpassword=$CORE_RPC_PASS" "$@"; }
 
-WATCH_WALLET="chain-notes-watch"   # matches companion/server.py's convention — reused, not reinvented
-MINER_WALLET="chain-notes-miner"   # ours; NEVER the Pi's `testwallet`
+WATCH_WALLET="graffito-watch"   # matches companion/server.py's convention — reused, not reinvented
+MINER_WALLET="graffito-miner"   # ours; NEVER the Pi's `testwallet`
 IMPORT_TIMEOUT=1800                # a genuinely historical importdescriptors (timestamp:0) rescans
                                     # from genesis — free on a fresh regtest, hundreds of seconds on
                                     # testnet4 or a chain that's grown (the rescan trap)
 # `importdescriptors` at timestamp:0 starts an ASYNCHRONOUS rescan — the
 # call can return before the scan finishes, and every other RPC against
-# `chain-notes-watch` (ours or another suite's, since the wallet is
+# `graffito-watch` (ours or another suite's, since the wallet is
 # SHARED) is rejected with -4 "Wallet is currently rescanning" until it
 # completes. Found live against the Pi once the chain passed ~1,500
 # blocks (the throwaway ~100-block chain this used to run against never
@@ -161,7 +161,7 @@ ensure_miner_wallet() {
 
 # Idempotent AGAINST THE NODE (getaddressinfo first), never just against
 # process memory — the fast-path cache below is only a speedup on top.
-# `chain-notes-watch` is SHARED across every identity this script derives
+# `graffito-watch` is SHARED across every identity this script derives
 # (A, B, C, D) AND across other suites/runs on this persistent node, so a
 # wallet-wide `listtransactions` can return other identities' txs too —
 # build_bundle filters by address-touch below for exactly that reason.
@@ -169,7 +169,7 @@ ensure_miner_wallet() {
 # 3.2 (no `declare -A`) and this script must run under the system bash.
 _watched_list=""
 
-# Wait for chain-notes-watch's own background rescan to finish (only ever
+# Wait for graffito-watch's own background rescan to finish (only ever
 # needed after a `historical`-mode import below).
 wait_for_rescan() {
     local max="${1:-$IMPORT_TIMEOUT}" waited=0 info
@@ -286,7 +286,7 @@ fund_from_wif() { # dest_addr sats -> echoes txid  (testnet4 only)
 }
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-WORK="${E2E_WORK:-$(mktemp -d /tmp/chain-notes-e2e.XXXXXX)}"
+WORK="${E2E_WORK:-$(mktemp -d /tmp/graffito-e2e.XXXXXX)}"
 NOTES="$WORK/notes_cli"
 SRV_PID=""
 

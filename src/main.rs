@@ -86,11 +86,11 @@ fn fit_check(
     }
 }
 
-const STATE_DIR: &str = "/.chain-notes";
-const NOTEBOOKS_PATH: &str = "/.chain-notes/notebooks.json";
-const CONFIG_PATH: &str = "/.chain-notes/config.json"; // device-level {network, chunk}
-const INBOX_DIR: &str = "/chain-notes/inbox";
-const OUTBOX_DIR: &str = "/chain-notes/outbox";
+const STATE_DIR: &str = "/.graffito";
+const NOTEBOOKS_PATH: &str = "/.graffito/notebooks.json";
+const CONFIG_PATH: &str = "/.graffito/config.json"; // device-level {network, chunk}
+const INBOX_DIR: &str = "/graffito/inbox";
+const OUTBOX_DIR: &str = "/graffito/outbox";
 
 // ---------------------------------------------------------------- state
 
@@ -345,7 +345,7 @@ fn app_seed_get(cell: &OnceCell<Option<[u8; 32]>>) -> &Option<[u8; 32]> {
 
 /// Derive a notebook's identity from the app seed (None if locked).
 /// Every notebook is a per-network BIP-86 leaf under its rotation seed
-/// (PLAN-chain-notes-seed-rotation.md).
+/// (PLAN-graffito-seed-rotation.md).
 fn derive_identity(
     app_seed: &Option<[u8; 32]>,
     meta: &notebooks::NotebookMeta,
@@ -494,13 +494,13 @@ fn save_config(fs: &Fs, cfg: &DeviceConfig) {
 
 /// Pre-2b per-notebook state path (had its own network field).
 fn state_path_v1(account: u32) -> String {
-    format!("/.chain-notes/state-{account}.json")
+    format!("/.graffito/state-{account}.json")
 }
 
 /// Per-(network, notebook) state file: each notebook has a separate ledger
 /// on each network (network is device-level now).
 fn state_path(net: &str, account: u32) -> String {
-    format!("/.chain-notes/state-{net}-{account}.json")
+    format!("/.graffito/state-{net}-{account}.json")
 }
 
 /// Load a notebook's state for `net`, stamping network + account so
@@ -681,7 +681,7 @@ fn list_inbox_bundles(fs: &Fs) -> Vec<(String, Location, &'static str)> {
     out
 }
 
-/// Honest-fee-label (2026-07-19, ported from chain-notes-app): the
+/// Honest-fee-label (2026-07-19, ported from the graffito desktop app): the
 /// sub-dust leftover a real signed [`notes_core::tx::NoteTx`] folded into
 /// its own fee, decomposed from numbers the build already reports —
 /// unlike the compose cost line's PRE-build prediction (`notes-core`'s
@@ -785,7 +785,7 @@ fn to_label_for(st: &State, address: &str) -> String {
 }
 
 // ----------------------------------------------------- spending wallet
-// (PLAN-chain-notes-funding-unification.md, "Prime device" + M2/M3.)
+// (PLAN-graffito-funding-unification.md, "Prime device" + M2/M3.)
 
 /// Per-chunk OP_RETURN payload lengths for `text_len` bytes — the same
 /// arithmetic `notes_core::bundle::estimate_note_cost` uses internally,
@@ -2673,7 +2673,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     (vsize_no_change, fee_no_change, ok2, true)
                 }
             };
-            // Honest-fee-label (2026-07-19, ported from chain-notes-app):
+            // Honest-fee-label (2026-07-19, ported from the graffito desktop app):
             // when the no-change (dust-fold) shape is what a real build
             // would take, `fee` above is already the byte-true NOMINAL
             // fee — but the actual signed tx's fee also carries the
@@ -3971,7 +3971,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // fix, 2026-07-19) rather than dropped.
                 //
                 // Gap-adoption: the device has no chain access to probe
-                // blindly like chain-notes-app's discover_spending() does,
+                // blindly like the graffito desktop app's discover_spending() does,
                 // so instead it derives the bounded candidate set — both
                 // chains, `next_receive`/`next_change` .. +SPENDING_ADOPT_GAP
                 // (= 20, same constant the app's gap scan uses) — and
@@ -4163,7 +4163,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let Some(ui) = ui_weak.upgrade() else { return };
             let result = (|| -> Result<String, String> {
                 let (name, loc, loc_label) =
-                    first_inbox_bundle(&fs).ok_or("no .json bundle in /chain-notes/inbox")?;
+                    first_inbox_bundle(&fs).ok_or("no .json bundle in /graffito/inbox")?;
                 let json = read_text(&fs, &format!("{INBOX_DIR}/{name}"), loc)?;
                 if loc == Location::Airlock {
                     unmount_airlock(&fs);
@@ -4210,7 +4210,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 .collect();
             sync.set_bundles(Rc::new(VecModel::from(rows)).into());
             sync.set_empty_hint(
-                "No bundle files found. Put a .json bundle in /chain-notes/inbox on Internal (or the Airlock volume), then tap Refresh — or use \"Scan bundle\" to import by QR from the companion.".into(),
+                "No bundle files found. Put a .json bundle in /graffito/inbox on Internal (or the Airlock volume), then tap Refresh — or use \"Scan bundle\" to import by QR from the companion.".into(),
             );
             sync.set_picking(true);
             log::info!("cb: list-bundles n={}", found.len());

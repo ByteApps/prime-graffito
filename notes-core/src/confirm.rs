@@ -1,6 +1,6 @@
 //! The device's universal "Confirm & sign" screen's byte-truth summarizer.
 //!
-//! Philosophy (paranoid-bitcoiner, mirrors chain-notes-app's
+//! Philosophy (paranoid-bitcoiner, mirrors the graffito desktop app's
 //! `app-core/src/confirm.rs` — same rules, ported off `rust-bitcoin` onto
 //! this crate's own [`crate::decode::decode_transaction`] since
 //! `rust-bitcoin`/secp256k1-sys stays a dev-dependency only on this
@@ -260,7 +260,7 @@ fn resolve_spk(address: &str, network: Network) -> Option<Vec<u8>> {
 }
 
 /// Thousands-separated sats, e.g. `1234567` -> `"1,234,567"`. notes-core
-/// has no existing helper for this (unlike chain-notes-app's
+/// has no existing helper for this (unlike the graffito desktop app's
 /// `mixed::commas`) — a fresh, minimal implementation.
 fn commas(n: u64) -> String {
     let digits = n.to_string();

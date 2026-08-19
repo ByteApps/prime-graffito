@@ -65,7 +65,7 @@ CN_NODE_PORT="${CN_NODE_PORT:-$DEFAULT_PORT}"
 CLI() { bitcoin-cli "-$CN_NETWORK" "-rpcconnect=$CN_NODE_HOST" "-rpcport=$CN_NODE_PORT" \
     "-rpcuser=$CORE_RPC_USER" "-rpcpassword=$CORE_RPC_PASS" "$@"; }
 
-# Default "chain-notes-watch" matches companion/server.py's default — but
+# Default "graffito-watch" matches companion/server.py's default — but
 # that wallet is SHARED by every suite and every run on the Pi, forever,
 # so a wallet-wide `listtransactions` (below, and in the `bundle`
 # subcommand) is O(all history anyone has ever recorded), not O(this
@@ -76,14 +76,14 @@ CLI() { bitcoin-cli "-$CN_NETWORK" "-rpcconnect=$CN_NODE_HOST" "-rpcport=$CN_NOD
 # and this script picks it up automatically) so this script only ever
 # scans its own handful of addresses. Unset callers keep today's shared-
 # wallet behavior unchanged.
-WATCH_WALLET="${CN_WATCH_WALLET:-chain-notes-watch}"
-MINER_WALLET="chain-notes-miner"   # ours; NEVER the Pi's `testwallet`
+WATCH_WALLET="${CN_WATCH_WALLET:-graffito-watch}"
+MINER_WALLET="graffito-miner"   # ours; NEVER the Pi's `testwallet`
 IMPORT_TIMEOUT=1800                # a genuinely historical importdescriptors (timestamp:0) rescans
                                     # from genesis — free on a fresh regtest, hundreds of seconds on
                                     # testnet4 or a chain that's grown (the rescan trap)
 # `importdescriptors` at timestamp:0 starts an ASYNCHRONOUS rescan — the
 # call can return before the scan finishes, and every other RPC against
-# `chain-notes-watch` (ours or another suite's, since the wallet is
+# `graffito-watch` (ours or another suite's, since the wallet is
 # SHARED) is rejected with -4 "Wallet is currently rescanning" until it
 # completes. Found live against the Pi once the chain passed ~1,500
 # blocks. Every WATCH call gets a retry-with-backoff safety net for
@@ -152,7 +152,7 @@ ensure_miner_wallet() {
 # 3.2 (no `declare -A`) and this script must run under the system bash.
 _watched_list=""
 
-# Wait for chain-notes-watch's own background rescan to finish (only ever
+# Wait for graffito-watch's own background rescan to finish (only ever
 # needed after a `historical`-mode import below).
 wait_for_rescan() {
     local max="${1:-$IMPORT_TIMEOUT}" waited=0 info

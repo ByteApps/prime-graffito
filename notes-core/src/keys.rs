@@ -123,9 +123,10 @@ pub fn derive_seed_entropy(app_seed: &[u8; 32], index: u32) -> [u8; 32] {
     okm
 }
 
-/// Note-encryption key for a BIP-86 leaf secret — chain-notes-app's
-/// FROZEN rule, identical for all its import formats, relocated here so
-/// device bip86 notebooks and the app derive byte-identically. FROZEN.
+/// Note-encryption key for a BIP-86 leaf secret — the graffito desktop
+/// app's FROZEN rule, identical for all its import formats, relocated
+/// here so device bip86 notebooks and the app derive byte-identically.
+/// FROZEN.
 pub fn enc_key_from_leaf(leaf_secret: &[u8; 32]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(ENC_APP_SALT), leaf_secret);
     let mut okm = [0u8; 32];

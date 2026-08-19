@@ -7,7 +7,7 @@ resources/*
 /manifest.toml
 companion/tests/screenshots/
 
-# Internal docs kept in the private workspace companion (prime/private/prime-chain-notes)
+# Internal docs kept in the private workspace companion (prime/private/prime-graffito)
 CLAUDE.md
 DEVELOPMENT.md
 NOTES.md

@@ -27,7 +27,7 @@ these exported. This file is part of a PUBLIC repo: it must never read
 ../private/ or print a credential value.
 
 CN_WATCH_WALLET (env only, no flag) overrides the bitcoind wallet this
-server watches addresses through — default "chain-notes-watch", the
+server watches addresses through — default "graffito-watch", the
 wallet shared by every suite and every run on the Pi. A harness run
 should instead pass its OWN unique per-run wallet name (see
 ui-automation/node-suite-lib.sh) so `listtransactions "*"` in
@@ -72,16 +72,16 @@ PAGE_SIZE = 25  # esplora /txs/chain pagination size
 DEFAULT_PORT_BY_NETWORK = {"regtest": 18443, "testnet4": 48332}
 # The watch wallet name is configurable (CN_WATCH_WALLET) so a harness run
 # can point this server at its OWN per-run wallet instead of the shared
-# "chain-notes-watch" — see PLAN-one-regtest-node.md, "Two things now grow
+# "graffito-watch" — see PLAN-one-regtest-node.md, "Two things now grow
 # without bound": that wallet is shared by every suite and every run
 # forever, so `listtransactions "*"` in address_txids() below is O(all
 # history ever recorded on the node), not O(this run). Measured 2026-08-03
 # at 444 entries / 6.5-6.7s per address query with no caching or
-# improvement on repeat. Defaulting to "chain-notes-watch" keeps every
+# improvement on repeat. Defaulting to "graffito-watch" keeps every
 # caller that doesn't opt in (a bare `server.py --node ... --network ...`
 # with no CN_WATCH_WALLET set) byte-identical to before.
-WATCH_WALLET = os.environ.get("CN_WATCH_WALLET", "chain-notes-watch")
-MINER_WALLET = "chain-notes-miner"  # ours; NEVER touch the Pi's `testwallet`
+WATCH_WALLET = os.environ.get("CN_WATCH_WALLET", "graffito-watch")
+MINER_WALLET = "graffito-miner"  # ours; NEVER touch the Pi's `testwallet`
 DEFAULT_RPC_TIMEOUT = 60
 # How far back a lazily-imported address is scanned. 0 means GENESIS, which
 # is the only correct DEFAULT — a restore/recovery flow legitimately needs
@@ -121,7 +121,7 @@ _wallets_ready = set()   # wallets we've confirmed loaded this process
 
 class TxNotFound(RuntimeError):
     """A DEFINITIVELY unknown txid — bitcoind RPC error code -5. Esplora
-    answers this with a plain 404, not a 400; chain-notes-app's dropped-tx
+    answers this with a plain 404, not a 400; the graffito desktop app's dropped-tx
     detection (TxLookupStatus::NotFound) depends on the real status code,
     so this must never fire for a transport/other error (those keep
     raising a plain RuntimeError -> 400, unchanged)."""
@@ -270,7 +270,7 @@ def mine(blocks=1):
     # callbacks drain on the scheduler thread AFTER generatetoaddress
     # returns) — without this, a listunspent served right after a mine can
     # answer from the PRE-block view: freshly-spent coins still listed,
-    # fresh outputs missing. The chain-notes-app UI suite's mixed-sweep leg
+    # fresh outputs missing. The graffito desktop app's UI suite's mixed-sweep leg
     # raced exactly that (scanned its consolidate's spent inputs as
     # spendable → missing-inputs on broadcast). Best-effort: the drain is
     # a consistency optimization — a hiccup in this hidden RPC must never
@@ -326,7 +326,7 @@ def esplora_tx(txid, tip):
             # live node: a mempool vin has no `prevout` key at all, a confirmed
             # one does. Without this fallback every unconfirmed tx reports
             # `scriptpubkey_address: null` for its inputs, and a consumer that
-            # identifies ownership by input address (chain-notes-app's
+            # identifies ownership by input address (the graffito desktop app's
             # spending-wallet-funded self-notes) mis-files its OWN note as
             # `received` until a block arrives.
             #
@@ -482,7 +482,7 @@ def handle_api(handler, method, path, query, body):
         return txs[:50 if not chain_only else PAGE_SIZE]
 
     # /node/api/tx/{txid}[/hex] — single-tx lookup (esplora shape / raw hex),
-    # what the chain-notes-app watch-mode bump/rebroadcast path reads.
+    # what the graffito desktop app's watch-mode bump/rebroadcast path reads.
     if method == "GET" and len(parts) >= 5 and parts[3] == "tx" and parts[4]:
         if len(parts) >= 6 and parts[5] == "hex":
             return cli("getrawtransaction", parts[4])
@@ -673,7 +673,7 @@ def main():
 
     print(f"companion on http://localhost:{port}  (node: {_node['network'] if _node else 'off'})")
     # request_queue_size: the default listen backlog (5) is too small for
-    # the chain-notes-app's scan workers — each opens its own connection,
+    # the graffito desktop app's scan workers — each opens its own connection,
     # and a burst of queued scans can fill the backlog so a broadcast
     # POST's connect gets REFUSED ("error sending request"). This server
     # is single-threaded on purpose (deterministic ordering for tests);

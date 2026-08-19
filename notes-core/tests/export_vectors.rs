@@ -1,6 +1,6 @@
 //! Cross-check the key-export rendering (`notes_core::export`) against
 //! rust-bitcoin: WIF, account xprv/xpub, and the key-origin descriptor a
-//! Prime (or chain-notes-app) reveals must be byte-identical to what the
+//! Prime (or the graffito desktop app) reveals must be byte-identical to what the
 //! reference implementation produces for the same BIP-86 path — that is
 //! what makes "reveal on the device, import into another wallet" sound.
 

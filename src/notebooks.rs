@@ -1,6 +1,6 @@
 //! Notebook index for the device app: which identities exist as
 //! notebooks, their local names, and archive flags. One JSON file
-//! (`/.chain-notes/notebooks.json`); each notebook's notes/UTXO ledger
+//! (`/.graffito/notebooks.json`); each notebook's notes/UTXO ledger
 //! lives in its own `state-<net>-<account>.json`, keyed by the unique
 //! notebook KEY (`account` — the field name is historic).
 //!
@@ -10,12 +10,12 @@
 //! from the seed's 24 words alone in any taproot wallet; per-network keys
 //! (coin_type 0'/1'). New notebooks are created under the device's active
 //! (seed, account) context. (The pre-recovery-seeds HKDF "legacy" scheme
-//! was removed before any release — PLAN-chain-notes-seed-rotation.md.)
+//! was removed before any release — PLAN-graffito-seed-rotation.md.)
 //!
 //! Local metadata only — names and archive flags are NOT
 //! chain-recoverable after a wipe; notes recover per address, and the
 //! index rebuilds by re-creating notebooks.
-//! Design: ../../PLAN-chain-notes-notebooks.md + PLAN-chain-notes-seed-rotation.md.
+//! Design: ../../PLAN-graffito-notebooks.md + PLAN-graffito-seed-rotation.md.
 
 use serde::{Deserialize, Serialize};
 

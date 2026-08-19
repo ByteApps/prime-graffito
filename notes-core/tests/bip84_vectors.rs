@@ -1,5 +1,5 @@
 //! BIP-84 (native-segwit spending wallet) derivation —
-//! PLAN-chain-notes-funding-unification.md M0. The spec's own test
+//! PLAN-graffito-funding-unification.md M0. The spec's own test
 //! mnemonic and account-0 addresses through our whole stack, plus a
 //! rust-bitcoin cross-check of the full app_seed → spending-key pipeline,
 //! mirroring `seed_vectors.rs`'s BIP-86 treatment.

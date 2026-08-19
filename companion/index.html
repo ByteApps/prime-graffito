@@ -92,7 +92,7 @@
   <section>
     <h2>2 · Broadcast signed transactions</h2>
     <p class="sub">Drop the <code>.hex</code> file(s) the device exported to
-    <code>/chain-notes/outbox</code>, or paste raw hex.</p>
+    <code>/graffito/outbox</code>, or paste raw hex.</p>
     <div class="row" style="align-items:center">
       <div><input type="file" id="hexFiles" accept=".hex,.txt" multiple></div>
       <div><button class="secondary" id="scanBtn" style="width:100%; margin-top:0">Scan from device 📷</button></div>
@@ -322,7 +322,7 @@ $("buildBtn").addEventListener("click", async () => {
         // fabricate its script, matching notes-core's additive
         // input_prevout_spks field, which falls back to spends_from_self
         // when empty). Enables the device's self-spk-SET ownership rule
-        // (PLAN-chain-notes-funding-unification.md).
+        // (PLAN-graffito-funding-unification.md).
         const inputPrevoutSpks = t.vin
           .map((i) => i.prevout && i.prevout.scriptpubkey)
           .filter(Boolean);
@@ -401,7 +401,7 @@ $("buildBtn").addEventListener("click", async () => {
     log(logEl, `Bundle ready: ${bundle.utxos.length} utxo(s)` +
       (spendingUtxos.length ? ` (${spendingUtxos.length} from the spending wallet)` : "") +
       `, ${notesOnchain.length} note tx(s), ${txs.length} total txs scanned.`, "ok");
-    log(logEl, "Download it and copy to the device's /chain-notes/inbox/.");
+    log(logEl, "Download it and copy to the device's /graffito/inbox/.");
   } catch (e) {
     log(logEl, `Failed: ${e.message}`, "err");
   } finally {
