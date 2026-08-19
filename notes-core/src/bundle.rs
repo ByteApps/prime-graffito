@@ -43,10 +43,12 @@ impl Identity {
     }
 
     /// Identity from a BIP-86 leaf secret — the bip86 notebook scheme
-    /// (PLAN-chain-notes-seed-rotation.md) and chain-notes-app's shipped
-    /// derivation: BIP-341 tweak for the keys, the FROZEN
-    /// `chain-notes-app/enc/v1` rule for the enc key. Byte-identical to
-    /// what chain-notes-app derives after a plain BIP-39 import.
+    /// (PLAN-graffito-seed-rotation.md) and the graffito desktop app's
+    /// shipped derivation: BIP-341 tweak for the keys, the FROZEN
+    /// `graffito/enc/v1` rule for the enc key. Byte-identical to what the
+    /// graffito desktop app derives after a plain BIP-39 import — once it
+    /// adopts the identical post-epoch salt (a separately-scoped follow-up
+    /// in that repo; see the workspace report for this change).
     pub fn from_leaf_secret(leaf_secret: &[u8; 32]) -> Result<Self, Error> {
         let (internal_x, _) = xonly_pubkey(leaf_secret)?;
         let (output_x, _) = taproot_tweak_pubkey(&internal_x, None)?;

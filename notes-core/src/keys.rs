@@ -2,9 +2,18 @@
 //!
 //! CONSENSUS-CRITICAL FOR RE-DERIVATION: the HKDF salt/info strings below
 //! are baked into every note ever written — the wipe-recovery story
-//! (PLAN-chain-notes.md) depends on re-deriving the identical identity key
+//! (PLAN-graffito.md) depends on re-deriving the identical identity key
 //! and encryption key from `GetAppSeed` after a seed restore. NEVER change
 //! them (same rule as prime-paper-wallet's backup-key derivation).
+//!
+//! GRAFFITO EPOCH (2026-08-18): the salts below were rebound from their
+//! prime-chain-notes/chain-notes-app values as a deliberate crypto epoch
+//! break — Sal's directive, accepted consequence: every note (self and
+//! directed) sealed under the old salts is now permanently undecryptable,
+//! and the old on-chain address history is orphaned (a wipe/restore now
+//! derives different identity + encryption keys from the same app seed).
+//! Nothing here is a compatibility constraint — there was no in-place
+//! migration and none is planned.
 
 use elliptic_curve::point::AffineCoordinates;
 use elliptic_curve::PrimeField;
@@ -16,15 +25,18 @@ use sha2::{Digest, Sha256};
 
 use crate::Error;
 
-const KEY_SALT: &[u8] = b"prime-chain-notes/key/v1";
-const ENC_SALT: &[u8] = b"prime-chain-notes/enc/v1";
-/// Recovery-seed entropy salt (PLAN-chain-notes-seed-rotation.md). FROZEN.
-const SEED_SALT: &[u8] = b"prime-chain-notes/seed/v1";
-/// The chain-notes-app FROZEN enc rule, relocated here so both apps share
-/// one code path (app-core delegates). NEVER change — every private note
-/// composed by chain-notes-app (and by bip86-scheme device notebooks)
-/// depends on these exact strings.
-const ENC_APP_SALT: &[u8] = b"chain-notes-app/enc/v1";
+const KEY_SALT: &[u8] = b"prime-graffito/key/v1";
+const ENC_SALT: &[u8] = b"prime-graffito/enc/v1";
+/// Recovery-seed entropy salt (PLAN-graffito-seed-rotation.md). FROZEN
+/// (post-epoch).
+const SEED_SALT: &[u8] = b"prime-graffito/seed/v1";
+/// The graffito (desktop app) shared enc rule, relocated here so both apps
+/// share one code path (app-core delegates). NEVER change — every private
+/// note composed by the graffito desktop app (and by bip86-scheme device
+/// notebooks) depends on these exact strings. The desktop `graffito` repo
+/// adopts this identical string as a separately-scoped follow-up (it is
+/// NOT changed by this commit) — see the workspace report for that repo.
+const ENC_APP_SALT: &[u8] = b"graffito/enc/v1";
 const ENC_APP_INFO: &[u8] = b"note-enc/v1";
 
 /// Parse 32 bytes as a scalar, rejecting 0 and values >= the curve order.

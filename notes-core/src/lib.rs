@@ -1,4 +1,4 @@
-//! notes-core — UI-free library for prime-chain-notes.
+//! notes-core — UI-free library for prime-graffito.
 //!
 //! Everything needed to turn "text typed on the device" into a signed
 //! bitcoin transaction carrying that text in OP_RETURN outputs, and to turn
