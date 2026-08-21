@@ -56,7 +56,11 @@ pub fn leaf_hex(
     index: u32,
 ) -> Result<Zeroizing<String>, Error> {
     let leaf = Zeroizing::new(derive_leaf(app_seed, seed_index, network, account, index)?);
-    Ok(Zeroizing::new(hex::encode(leaf.as_ref())))
+    // `.as_slice()` (an inherent `[u8; 32]` method, not the `AsRef` trait)
+    // to disambiguate from the blanket `impl AsRef<hybrid_array::Array<..>>
+    // for [T; N]` that ml-kem's hybrid-array dep now also brings into scope
+    // — same 32 bytes, just a type-inference-safe way to reach them.
+    Ok(Zeroizing::new(hex::encode(leaf.as_slice())))
 }
 
 /// Notebook leaf private key as a compressed WIF.
