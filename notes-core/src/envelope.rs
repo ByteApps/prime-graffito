@@ -26,6 +26,15 @@
 //! additive versioning (a new flag bit, or shipping FLAG_CONT) is allowed.
 //! The decoder is LIBERAL: anything that doesn't parse as a valid header
 //! is foreign data, silently ignored (`None`), never a panic or an `Err`.
+//!
+//! Additive (2026): bits 4-5, `FLAG_PW`/`FLAG_MLKEM` (notes-core/src/pq.rs)
+//! — optional post-quantum sealing layers for a directed-private
+//! single-recipient note, hybrid on top of the existing dm.rs ECDH, never a
+//! replacement for it. Header ENCODING is unchanged (flags already occupy a
+//! full byte); only their body FRAMING is new (extra prefix blocks ahead of
+//! today's sealed blob — see pq.rs). Exactly like FLAG_MULTI-without-
+//! FLAG_DIRECTED, a header combining either bit without both
+//! FLAG_PRIVATE|FLAG_DIRECTED, or together with FLAG_MULTI, is undecodable.
 
 use crate::Error;
 
@@ -56,11 +65,25 @@ pub const FLAG_MULTI: u8 = 0x04;
 /// `None` (liberal/forward-compat: a decoder that doesn't understand
 /// chaining must never render a fragment as if it were a whole note).
 pub const FLAG_CONT: u8 = 0x08;
+/// flags bit 4: post-quantum password layer (notes-core/src/pq.rs) — an
+/// Argon2id-stretched shared password, hybrid ON TOP of the existing
+/// dm.rs ECDH key for a directed-private note (never a replacement for
+/// it). Valid only together with `FLAG_PRIVATE | FLAG_DIRECTED`, and
+/// INVALID with `FLAG_MULTI` (no multi-recipient pq support) — a header
+/// violating either constraint is undecodable (`None`), same guard as
+/// FLAG_MULTI-without-FLAG_DIRECTED above. May combine with `FLAG_MLKEM`.
+pub const FLAG_PW: u8 = 0x10;
+/// flags bit 5: post-quantum ML-KEM layer (notes-core/src/pq.rs) — a
+/// FIPS-203 key-encapsulation ciphertext addressed to the recipient,
+/// hybrid ON TOP of the existing dm.rs ECDH key. Same validity rule as
+/// `FLAG_PW` (requires `FLAG_PRIVATE | FLAG_DIRECTED`, incompatible with
+/// `FLAG_MULTI`); may combine with `FLAG_PW`.
+pub const FLAG_MLKEM: u8 = 0x20;
 
-/// Every flag bit this decoder understands. Any OTHER set bit (4-7, or
+/// Every flag bit this decoder understands. Any OTHER set bit (6-7, or
 /// FLAG_CONT until it ships) makes the header undecodable — the same
 /// forward-compat guard as FLAG_CONT.
-const KNOWN_FLAGS: u8 = FLAG_PRIVATE | FLAG_DIRECTED | FLAG_MULTI;
+const KNOWN_FLAGS: u8 = FLAG_PRIVATE | FLAG_DIRECTED | FLAG_MULTI | FLAG_PW | FLAG_MLKEM;
 
 /// Fixed length of the first output's header EXCLUDING the optional
 /// multi-recipient count field: `PNTE` (4) + version (1) + flags (2) +
@@ -128,6 +151,22 @@ fn validate_multi(flags: u8, multi_count: Option<u8>) -> Result<(), Error> {
     }
 }
 
+/// `flags`'s pq bits (`FLAG_PW`/`FLAG_MLKEM`) validity: either requires
+/// `FLAG_PRIVATE | FLAG_DIRECTED` both set, and is invalid together with
+/// `FLAG_MULTI` (no multi-recipient pq support — notes-core/src/pq.rs).
+fn validate_pq(flags: u8) -> Result<(), Error> {
+    if flags & (FLAG_PW | FLAG_MLKEM) == 0 {
+        return Ok(());
+    }
+    if flags & (FLAG_PRIVATE | FLAG_DIRECTED) != (FLAG_PRIVATE | FLAG_DIRECTED) {
+        return Err(Error::Envelope("FLAG_PW/FLAG_MLKEM require FLAG_PRIVATE|FLAG_DIRECTED"));
+    }
+    if flags & FLAG_MULTI != 0 {
+        return Err(Error::Envelope("FLAG_PW/FLAG_MLKEM are incompatible with FLAG_MULTI"));
+    }
+    Ok(())
+}
+
 /// Output lengths [`encode_outputs`] would produce for a body of `body_len`
 /// bytes — pure arithmetic, no actual body bytes needed. Used by the
 /// cost estimator (no crypto/body available yet) and by directed-private
@@ -142,6 +181,7 @@ pub fn payload_lens_for(
     max_payload: usize,
 ) -> Result<Vec<usize>, Error> {
     validate_multi(flags, multi_count)?;
+    validate_pq(flags)?;
     if body_len == 0 {
         return Err(Error::Envelope("empty body"));
     }
@@ -248,6 +288,9 @@ pub fn parse_header(payload: &[u8]) -> Option<(u8, Option<u8>, usize)> {
     }
     let multi = flags & FLAG_MULTI != 0;
     if multi && flags & FLAG_DIRECTED == 0 {
+        return None;
+    }
+    if validate_pq(flags).is_err() {
         return None;
     }
     let mut idx = 7;
