@@ -13,6 +13,9 @@ Direct dependencies of this app, its `notes-core` library, and the companion web
 | [pbkdf2](https://crates.io/crates/pbkdf2) | 0.12 | MIT OR Apache-2.0 | BIP-39 mnemonic → seed (recovery seeds) |
 | [ripemd](https://crates.io/crates/ripemd) | 0.1 | MIT OR Apache-2.0 | BIP-32 key fingerprints (recovery seeds) |
 | [chacha20poly1305](https://crates.io/crates/chacha20poly1305) | 0.10 | Apache-2.0 OR MIT | XChaCha20-Poly1305 sealing of private notes |
+| [ml-kem](https://crates.io/crates/ml-kem) | 0.2 | Apache-2.0 OR MIT | FIPS 203 ML-KEM (512/768/1024) — the optional post-quantum hybrid layer on directed private notes (`pq.rs`; deterministic APIs only, entropy via `getrandom`) |
+| [argon2](https://crates.io/crates/argon2) | 0.5 | MIT OR Apache-2.0 | Argon2id passphrase stretching for the optional password layer on directed private notes |
+| [base64](https://crates.io/crates/base64) | 0.22 | MIT OR Apache-2.0 | Armored ML-KEM key import/export |
 | [bech32](https://crates.io/crates/bech32) | 0.11 | MIT | Taproot addresses (BIP350) |
 | [getrandom](https://crates.io/crates/getrandom) | 0.2 | MIT OR Apache-2.0 | Entropy source (see vendored override below) |
 | [miniz_oxide](https://crates.io/crates/miniz_oxide) | 0.8 | MIT OR Zlib OR Apache-2.0 | Deflate decompression of scanned bundle payloads |
