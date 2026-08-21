@@ -20,6 +20,7 @@ pub mod envelope;
 pub mod export;
 pub mod fold;
 pub mod keys;
+pub mod pq;
 pub mod psbt;
 pub mod seeds;
 pub mod sighash;
@@ -45,8 +46,24 @@ pub enum Error {
     /// P2WPKH (BIP143) signing failures — `wpkh.rs`.
     Signing(&'static str),
     /// Raw-tx deserialization failures — `decode.rs` — and the confirm
-    /// summarizer's own hex/shape checks (`confirm.rs`).
+    /// summarizer's own hex/shape checks (`confirm.rs`). Also used by
+    /// `pq.rs` for malformed pq prefix blocks / armor payloads.
     Decode(&'static str),
+    /// `pq.rs`: a pq-locked note needs a password to unlock and none was
+    /// supplied.
+    NeedsPassword,
+    /// `pq.rs`: a pq-locked note needs an ML-KEM decapsulation secret and
+    /// none was supplied.
+    NeedsMlKemKey,
+    /// `pq.rs`: a supplied `MlKemSecret` is structurally incompatible with
+    /// the note's ML-KEM alg/ciphertext (wrong length) — a decap/encap
+    /// failure caught before ever touching crypto, distinct from
+    /// `DecryptFailed` (which covers a structurally-valid but WRONG key).
+    MlKemAlgMismatch,
+    /// `pq.rs`: `unlock_sent` on a note with `FLAG_MLKEM` set — the KEM
+    /// secret was encapsulated to the RECIPIENT only, so the sender can
+    /// never re-open their own sent pq-KEM note.
+    SenderCannotReopen,
 }
 
 impl core::fmt::Display for Error {
@@ -68,6 +85,14 @@ impl core::fmt::Display for Error {
             Error::Derivation(m) => write!(f, "derivation: {m}"),
             Error::Signing(m) => write!(f, "signing: {m}"),
             Error::Decode(m) => write!(f, "decode: {m}"),
+            Error::NeedsPassword => write!(f, "this note needs a password to unlock"),
+            Error::NeedsMlKemKey => write!(f, "this note needs an ML-KEM key to unlock"),
+            Error::MlKemAlgMismatch => {
+                write!(f, "ML-KEM key/ciphertext length mismatch for this note's algorithm")
+            }
+            Error::SenderCannotReopen => {
+                write!(f, "sender cannot re-open a post-quantum-sealed note (KEM secret is recipient-only)")
+            }
         }
     }
 }
