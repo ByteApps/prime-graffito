@@ -665,6 +665,8 @@ fn reply_set_unit() {
         recipient: Some(b.address(NET)),
         recipients: vec![b.address(NET), c.address(NET)],
         text: Some("hi".into()),
+        pq_flags: 0,
+        locked: None,
     };
     // I'm B: sender A plus the OTHER recipient C, not myself.
     let set = reply_set(&note, &b.address(NET));

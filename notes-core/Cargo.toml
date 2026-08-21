@@ -33,6 +33,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zeroize = { version = "1", features = ["derive"] }
 hex = "0.4"
+# Post-quantum sealing layer (pq.rs): FIPS-203 ML-KEM, pure Rust (RustCrypto).
+# Deterministic-only API usage — see pq.rs's module doc for the RNG rule
+# (no rand/rand_core::OsRng anywhere; all entropy routes through the
+# getrandom 0.2 TRNG-patched dep already above). "deterministic" unlocks
+# generate_deterministic()/encapsulate_deterministic() (caller-supplied
+# seed/randomness, never an internal RNG draw); "zeroize" wipes key
+# material on drop; default-features off so the plain (non-deterministic,
+# rand_core-consuming) generate()/encapsulate() paths are never reachable
+# from this crate even by accident.
+ml-kem = { version = "0.2", default-features = false, features = ["deterministic", "zeroize"] }
+# Argon2id password-based key layer (pq.rs). default-features off: the
+# default "rand" feature pulls password-hash's rand_core integration,
+# which this crate must never touch (see the RNG rule above) — only
+# "alloc" is needed for Argon2::hash_password_into.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# Armor encoding for pq.rs's ML-KEM key export/import (base64, no RNG).
+base64 = "0.22"
 
 [dev-dependencies]
 # Cross-check ONLY: our hand-rolled tx serialization / sighashes / signatures

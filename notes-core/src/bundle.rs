@@ -11,6 +11,7 @@ use crate::address::{p2tr_script_pubkey, p2tr_x_of_address, taproot_address, Rec
 use crate::crypt;
 use crate::dm;
 use crate::envelope::{self, FLAG_DIRECTED, FLAG_MULTI, FLAG_PRIVATE};
+use crate::pq;
 use crate::keys::{derive_encryption_key, derive_identity_key, xonly_pubkey};
 use crate::taproot::{taproot_tweak_pubkey, taproot_tweak_seckey};
 use crate::tx::{
@@ -319,6 +320,24 @@ pub struct RecoveredNote {
     pub recipients: Vec<String>,
     /// None = private note that did not decrypt under our key (foreign).
     pub text: Option<String>,
+    /// Post-quantum sealing flags (`envelope::FLAG_PW`/`FLAG_MLKEM`,
+    /// notes-core/src/pq.rs) — 0 for an ordinary v1 note. Nonzero means
+    /// this note carries one or both pq layers, in which case `text` is
+    /// always `None` here (extraction never attempts v1-style
+    /// decryption on a pq note) and `locked`, when populated, holds
+    /// everything needed to attempt `pq::unlock_received`/`unlock_sent`.
+    pub pq_flags: u8,
+    /// Present for a pq-flagged note recovered by a KEYED scan
+    /// (`extract_notes`/`extract_notes_multi`/`_deduped`) when the
+    /// sender/recipient x-coordinate pair was resolvable from the bundle
+    /// (needs `OnchainTx::first_input_outpoint` plus, for a received
+    /// note, a resolvable taproot sender address). `None` on a watch-only
+    /// scan (no `Identity` to supply "my own" x-coordinate) or when that
+    /// data is missing/malformed — same liberal "can't decode yet, not a
+    /// crash" convention as the rest of this module. See
+    /// [`extract_notes_pq`] for a convenience wrapper that also attempts
+    /// auto-unlock.
+    pub locked: Option<crate::pq::LockedBody>,
 }
 
 /// `{sender} ∪ recipients` minus `my_address`, deduped, sender first then
@@ -429,6 +448,49 @@ pub fn extract_notes_multi_deduped(
 ) -> Vec<RecoveredNote> {
     let own_spk = p2tr_script_pubkey(&identity.output_x);
     extract_notes_inner(bundle, Some(identity), network, self_spks, notebook_spks, &own_spk)
+}
+
+/// [`extract_notes_multi_deduped`] (the richest keyed extract variant —
+/// self-spk set + notebook dedup) plus post-quantum AUTO-UNLOCK: any
+/// recovered note whose `pq_flags == FLAG_MLKEM` EXACTLY (the KEM layer
+/// alone, no password) is a RECEIVED note is retried against every
+/// supplied [`pq::MlKemSecret`] via [`pq::unlock_received`], and `text` is
+/// filled in on the first one that authenticates. A password-flagged note
+/// (`FLAG_PW`, alone or combined with `FLAG_MLKEM`) is NEVER auto-unlocked
+/// here — passwords are never stored on this device, so there is nothing
+/// to try. An OWN kem-layered note is never attempted either: the KEM
+/// secret was encapsulated to the RECIPIENT only, so the sender
+/// structurally cannot decapsulate it (see `pq::unlock_sent`'s
+/// `SenderCannotReopen`) — trying would be wasted work, not just
+/// unnecessary. `locked` stays populated on every pq note regardless of
+/// whether auto-unlock succeeded (informational; unlocking again is cheap
+/// and callers may still want the raw material).
+pub fn extract_notes_pq(
+    bundle: &SyncBundle,
+    identity: &Identity,
+    network: Network,
+    self_spks: &[Vec<u8>],
+    notebook_spks: &[Vec<u8>],
+    mlkem_secrets: &[pq::MlKemSecret],
+) -> Vec<RecoveredNote> {
+    let mut notes = extract_notes_multi_deduped(bundle, identity, network, self_spks, notebook_spks);
+    for note in &mut notes {
+        if note.pq_flags != envelope::FLAG_MLKEM || !note.received {
+            continue;
+        }
+        let Some(locked) = note.locked.clone() else { continue };
+        for secret in mlkem_secrets {
+            if let Ok(pt) =
+                pq::unlock_received(&locked, &identity.tweaked_seckey, Some(secret), None)
+            {
+                if let Ok(s) = String::from_utf8(pt) {
+                    note.text = Some(s);
+                    break;
+                }
+            }
+        }
+    }
+    notes
 }
 
 /// Watch-only [`extract_notes`]: everything a public observer of the address
@@ -565,6 +627,50 @@ fn extract_notes_inner(
         }
 
         let outpoint = tx.first_input_outpoint.as_deref().and_then(parse_outpoint);
+
+        // Post-quantum layer(s) (envelope::FLAG_PW/FLAG_MLKEM — pq.rs).
+        // Header validity (envelope.rs) guarantees these bits never appear
+        // together with FLAG_MULTI, and only on FLAG_PRIVATE|FLAG_DIRECTED
+        // notes — so `decoded.multi_count` is always `None` here and
+        // `directed`/`private` are always true. Extraction never attempts
+        // v1-style decryption on a pq note: it packages everything needed
+        // to unlock later (`pq::LockedBody`) instead. See
+        // `RecoveredNote::locked`'s doc for the watch-only/keyed scope.
+        let pq_body_flags = flags & (envelope::FLAG_PW | envelope::FLAG_MLKEM);
+        if pq_body_flags != 0 {
+            let locked = keys.and_then(|identity| {
+                let outpoint = outpoint?;
+                let (sender_x, recipient_x) = if received {
+                    let sx = sender.as_deref().and_then(|a| p2tr_x_of_address(network, a))?;
+                    (sx, identity.output_x)
+                } else {
+                    let rx = recipient.as_deref().and_then(|a| p2tr_x_of_address(network, a))?;
+                    (identity.output_x, rx)
+                };
+                Some(crate::pq::LockedBody {
+                    pq_flags: pq_body_flags,
+                    body: body.clone(),
+                    sender_x,
+                    recipient_x,
+                    outpoint,
+                })
+            });
+            notes.push(RecoveredNote {
+                id: tx.txid.clone(),
+                height: tx.height,
+                blocktime: tx.blocktime,
+                private,
+                directed,
+                received,
+                sender,
+                recipient,
+                recipients: Vec::new(),
+                text: None,
+                pq_flags: pq_body_flags,
+                locked,
+            });
+            continue;
+        }
 
         let plaintext: Option<Vec<u8>> = if let Some(count) = decoded.multi_count {
             let count = count as usize;
@@ -775,6 +881,8 @@ fn extract_notes_inner(
             recipient,
             recipients,
             text,
+            pq_flags: 0,
+            locked: None,
         });
     }
     // Confirmed first, oldest first; unconfirmed last.
@@ -1367,6 +1475,118 @@ pub fn compose_directed_note_multi_exact(
         &identity.tweaked_seckey,
         aux,
     )
+}
+
+// ---------------------------------------------------------------------
+// Post-quantum directed compose (envelope::FLAG_PW/FLAG_MLKEM, pq.rs) —
+// hybrid sealing layers over the same dm.rs ECDH, single-recipient only
+// (FLAG_MULTI is incompatible — envelope.rs's validity rule). Additive:
+// none of the compose functions above are touched. PRIVATE-only by
+// construction — there is no `private: bool` parameter here at all, so a
+// public note can never carry pq layers (mirrors the brief's "a public
+// note never takes layers" rule structurally rather than as a runtime
+// check).
+// ---------------------------------------------------------------------
+
+/// Like [`compose_directed_note_with_change_amount`], but the private body
+/// is additionally sealed under one or both of `layers`' post-quantum
+/// layers (`pq::SealLayers`) — hybrid over the ordinary dm.rs ECDH, never
+/// replacing it. Two-phase, same reasoning as every other directed-private
+/// composer: the AAD binds the tx's first-input outpoint, which is only
+/// known once inputs are selected, so this selects inputs by LENGTH first
+/// (`pq::pq_overhead` extends the usual `crypt::SEAL_OVERHEAD` accounting),
+/// then seals with the real outpoint and builds the exact same tx via
+/// [`build_note_tx_exact`].
+#[allow(clippy::too_many_arguments)]
+pub fn compose_directed_note_pq_with_change_amount(
+    identity: &Identity,
+    utxos: &[Utxo],
+    text: &str,
+    recipient: &Recipient,
+    recipient_amount: u64,
+    layers: pq::SealLayers,
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    lock_time: u32,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let recipient_x = recipient.p2tr_x.ok_or(Error::RecipientNotTaproot)?;
+    let pq_flags_guess = layers.flags();
+    if pq_flags_guess == 0 {
+        return Err(Error::Envelope("pq compose requires at least one seal layer"));
+    }
+    let alg = layers.mlkem_ek.map(|(a, _)| a);
+    let flags = FLAG_DIRECTED | FLAG_PRIVATE | pq_flags_guess;
+    let body_len = text.len() + crypt::SEAL_OVERHEAD + pq::pq_overhead(pq_flags_guess, alg);
+    let payload_lens = envelope::payload_lens_for(flags, None, body_len, max_op_return_bytes)?;
+    let selected = select_note_inputs(
+        utxos, &payload_lens, Some(recipient.spk.len()), recipient_amount, fee_rate,
+    )?;
+    let outpoint = outpoint_bytes(selected.first().ok_or(Error::InsufficientFunds)?);
+    let (pq_flags, full_body) = pq::seal_directed_pq(
+        &identity.tweaked_seckey, &identity.output_x, &recipient_x, &outpoint, text.as_bytes(),
+        layers,
+    )?;
+    let flags = FLAG_DIRECTED | FLAG_PRIVATE | pq_flags;
+    let payloads = envelope::encode_outputs(flags, None, &full_body, max_op_return_bytes)?;
+    build_note_tx_exact(
+        &selected, &identity.output_x, &payloads, Some(&recipient.spk), recipient_amount,
+        change_spk, fee_rate, lock_time, &identity.tweaked_seckey, aux,
+    )
+}
+
+/// Coin-control (`_exact`) analog of
+/// [`compose_directed_note_pq_with_change_amount`]: spend EXACTLY `inputs`.
+/// `inputs[0]` is the tx's first input immediately — no two-phase
+/// selection needed (coin control already fixes the input set), mirroring
+/// [`compose_directed_note_exact_amount`].
+#[allow(clippy::too_many_arguments)]
+pub fn compose_directed_note_pq_exact_amount(
+    identity: &Identity,
+    inputs: &[Utxo],
+    text: &str,
+    recipient: &Recipient,
+    recipient_amount: u64,
+    layers: pq::SealLayers,
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    lock_time: u32,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let recipient_x = recipient.p2tr_x.ok_or(Error::RecipientNotTaproot)?;
+    let outpoint = outpoint_bytes(inputs.first().ok_or(Error::InsufficientFunds)?);
+    let (pq_flags, full_body) = pq::seal_directed_pq(
+        &identity.tweaked_seckey, &identity.output_x, &recipient_x, &outpoint, text.as_bytes(),
+        layers,
+    )?;
+    let flags = FLAG_DIRECTED | FLAG_PRIVATE | pq_flags;
+    let payloads = envelope::encode_outputs(flags, None, &full_body, max_op_return_bytes)?;
+    build_note_tx_exact(
+        inputs, &identity.output_x, &payloads, Some(&recipient.spk), recipient_amount,
+        change_spk, fee_rate, lock_time, &identity.tweaked_seckey, aux,
+    )
+}
+
+/// [`estimate_note_cost`] extended to price the post-quantum prefix
+/// overhead (`pq::pq_overhead`) — for the compose screen when one or both
+/// pq layers are active. Always the directed-private shape (`FLAG_DIRECTED
+/// | FLAG_PRIVATE | pq_flags`) — pq notes have no public/self-note form.
+/// Pure arithmetic, same no-crypto-needed contract as `estimate_note_cost`.
+pub fn estimate_note_cost_pq(
+    text_len: usize,
+    max_op_return_bytes: usize,
+    n_inputs: usize,
+    recipient_spk_len: Option<usize>,
+    pq_flags: u8,
+    alg: Option<pq::MlKemAlg>,
+) -> Result<(usize, usize), Error> {
+    let body_len = text_len + crypt::SEAL_OVERHEAD + pq::pq_overhead(pq_flags, alg);
+    let flags = FLAG_DIRECTED | FLAG_PRIVATE | pq_flags;
+    let payload_lens = envelope::payload_lens_for(flags, None, body_len, max_op_return_bytes)?;
+    let vsize = crate::tx::estimate_vsize(n_inputs.max(1), &payload_lens, recipient_spk_len, true);
+    Ok((payload_lens.len(), vsize))
 }
 
 /// Cost preview for the compose screen: (payload_lens.len(), est_vsize) for

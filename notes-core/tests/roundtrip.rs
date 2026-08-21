@@ -66,7 +66,11 @@ fn envelope_rejects_bad_shapes() {
     assert!(envelope::decode_note(&[b"PNTE100hi".to_vec()]).is_none(), "missing separator");
     // Reserved FLAG_CONT bit set (0x08) -> undecodable today.
     assert!(envelope::decode_note(&[b"PNTE108 1/1 hi".to_vec()]).is_none());
-    // Unassigned bits (0x10) set -> undecodable.
+    // 0x10 is FLAG_PW (pq.rs, additive 2026) without the FLAG_PRIVATE|
+    // FLAG_DIRECTED it requires -> still undecodable, same as before FLAG_PW
+    // existed (this exact input used to test an unassigned bit; it now
+    // exercises FLAG_PW's own validity rule instead — see envelope.rs's
+    // pq bits tests for coverage of an actually-unassigned bit).
     assert!(envelope::decode_note(&[b"PNTE110 hi".to_vec()]).is_none());
     // FLAG_MULTI without FLAG_DIRECTED -> undecodable.
     assert!(envelope::decode_note(&[b"PNTE0401 hi".to_vec()]).is_none());
