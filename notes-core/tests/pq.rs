@@ -10,9 +10,9 @@ use notes_core::bundle::{
 };
 use notes_core::envelope::{self, FLAG_DIRECTED, FLAG_MLKEM, FLAG_MULTI, FLAG_PRIVATE, FLAG_PW};
 use notes_core::pq::{
-    self, export_private, export_public, fingerprint, import_private, import_public, pw_key,
-    seal_directed_pq, unlock_received, unlock_sent, LockedBody, MlKemAlg, MlKemKeypair,
-    SealLayers,
+    self, export_private, export_public, fingerprint, import_private, import_public,
+    mlkem_keypair_from_leaf, mlkem_seed_from_leaf, pw_key, seal_directed_pq, unlock_received,
+    unlock_sent, LockedBody, MlKemAlg, MlKemKeypair, SealLayers,
 };
 use notes_core::tx::{op_return_payload, Utxo};
 use notes_core::{Error, Network, DUST_LIMIT};
@@ -750,4 +750,92 @@ fn pq_overhead_matches_actual_body_growth() {
     // pw-only overhead is exactly 19 bytes, independent of alg.
     assert_eq!(pq::pq_overhead(FLAG_PW, None), 19);
     assert_eq!(pq::pq_overhead(0, None), 0);
+}
+
+// ---------------------------------------------------------------------
+// Seed-derived receive keypair (pq.rs's "Seed-derived receive keypair"
+// section) — the cross-app recovery contract shared with the Mac app's
+// `app-core/src/pqkeys.rs`. Determinism/independence checks mirror the
+// Mac app's `pqkeys` unit tests; the pinned vectors below are copied
+// LITERALLY from that suite's `pinned_derivation_vectors_per_level` so a
+// mismatch here means the two apps would derive different keys from the
+// same notebook — SHIP-BLOCKING, never "fix" it by updating the hex.
+// ---------------------------------------------------------------------
+
+fn leaf(byte: u8) -> [u8; 32] {
+    [byte; 32]
+}
+
+#[test]
+fn mlkem_keypair_from_leaf_is_deterministic() {
+    let l = leaf(0x11);
+    let a = mlkem_keypair_from_leaf(&l, MlKemAlg::MlKem768);
+    let b = mlkem_keypair_from_leaf(&l, MlKemAlg::MlKem768);
+    assert_eq!(a.ek(), b.ek());
+    assert_eq!(a.seed(), b.seed());
+}
+
+#[test]
+fn mlkem_keypair_from_leaf_different_leaf_secrets_differ() {
+    let a = mlkem_keypair_from_leaf(&leaf(0x11), MlKemAlg::MlKem768);
+    let b = mlkem_keypair_from_leaf(&leaf(0x22), MlKemAlg::MlKem768);
+    assert_ne!(a.ek(), b.ek());
+    assert_ne!(a.seed(), b.seed());
+}
+
+#[test]
+fn mlkem_keypair_from_leaf_different_levels_are_independent_draws() {
+    // Same leaf_secret, three levels: the seeds must differ too, proving
+    // the alg id genuinely folds into the HKDF info rather than the
+    // three levels sharing one expansion.
+    let l = leaf(0x33);
+    let k512 = mlkem_keypair_from_leaf(&l, MlKemAlg::MlKem512);
+    let k768 = mlkem_keypair_from_leaf(&l, MlKemAlg::MlKem768);
+    let k1024 = mlkem_keypair_from_leaf(&l, MlKemAlg::MlKem1024);
+    assert_ne!(k512.seed(), k768.seed());
+    assert_ne!(k768.seed(), k1024.seed());
+    assert_ne!(k512.seed(), k1024.seed());
+}
+
+#[test]
+fn mlkem_seed_from_leaf_matches_keypair_from_leaf_seed() {
+    let l = leaf(0x44);
+    for alg in ALL_ALGS {
+        let seed = mlkem_seed_from_leaf(&l, alg);
+        let kp = mlkem_keypair_from_leaf(&l, alg);
+        assert_eq!(&*seed, kp.seed());
+    }
+}
+
+// ---- FROZEN cross-app derivation vectors ----------------------------
+//
+// Same fixed leaf_secret and expected ek-prefix hex as the Mac app's
+// `app-core/src/pqkeys.rs` `pinned_derivation_vectors_per_level` test —
+// literal-for-literal. If this ever fails, the derivation changed and
+// every already-shared pq receive key would silently stop matching what
+// a contact has stored. Do not "fix" this test by updating the hex;
+// treat a failure here as SHIP-BLOCKING.
+
+const FIXED_LEAF: [u8; 32] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+    0x1f, 0x20,
+];
+
+#[test]
+fn pinned_derivation_vectors_per_level() {
+    for (alg, expected_ek_prefix_hex, expected_len) in [
+        (MlKemAlg::MlKem512, "0b629735573ce73b363d2acc1ad998c4", 800usize),
+        (MlKemAlg::MlKem768, "7cbbcf17294071d7674ffb5618848fa5", 1184usize),
+        (MlKemAlg::MlKem1024, "7f7a36d7b029f0088dc9e970d5304f5f", 1568usize),
+    ] {
+        let kp = mlkem_keypair_from_leaf(&FIXED_LEAF, alg);
+        assert_eq!(kp.ek().len(), expected_len);
+        let prefix_hex = hex::encode(&kp.ek()[..16]);
+        assert_eq!(
+            prefix_hex, expected_ek_prefix_hex,
+            "derivation for {alg:?} changed — this is a FROZEN cross-app vector \
+             (must match app-core/src/pqkeys.rs in the graffito repo)"
+        );
+    }
 }
