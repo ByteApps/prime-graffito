@@ -182,6 +182,34 @@ component NoteEntry inherits Rectangle {
                 font-weight: 700;
                 vertical-alignment: center;
             }
+            // Post-quantum (pq.rs): a locked note (still encrypted — a
+            // received pq note this device couldn't auto-decrypt) shows a
+            // muted lock glyph instead of the "PQ" pill, so the two states
+            // stay visually distinct at a glance. Same "PQ" pill styling as
+            // the contacts picker's quantum-key badge (ContactEntry below).
+            if root.entry.locked: Image {
+                source: @image-url("../resources/icons/lock.svg");
+                colorize: Theme.palette-danger;
+                width: 16px;
+                height: 16px;
+                y: (parent.height - 16px) / 2;
+            }
+            if !root.entry.locked && root.entry.pq: Rectangle {
+                width: 30px;
+                border-radius: 8px;
+                background: Theme.palette-primary;
+                Text {
+                    text: "PQ";
+                    color: #ffffff;
+                    font-family: "Montserrat";
+                    font-size: 11px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: parent.width;
+                    height: parent.height;
+                }
+            }
         }
         Text {
             text: root.entry.meta;
@@ -1157,7 +1185,18 @@ export component AppWindow inherits Window {
                             }
                         }
                         SecondaryAction {
-                            width: 90px;
+                            // Sibling SecondaryActions all use width: 100%
+                            // (they're the sole control in their row); this
+                            // one shares a row with the passphrase field, so
+                            // it needs an explicit width AND a font-size/
+                            // padding that actually fit "Generate" — the
+                            // previous 90px at the component's default 20px
+                            // font + 20px horizontal padding left no room
+                            // for the label (elided down to nothing, a
+                            // narrow empty pill).
+                            width: 108px;
+                            font-size: 15px;
+                            padding-horizontal: 12px;
                             text: "Generate";
                             clicked => { Callbacks.pq-generate-passphrase(); }
                         }
@@ -2903,6 +2942,53 @@ export component AppWindow inherits Window {
                 wrap: word-wrap;
             }
 
+            // Notebook picker — same row design + selection convention as
+            // the Export-keys screen's "Notebook (whose private key)"
+            // picker (screen 23/24, `Recovery.export-notebooks` /
+            // `export-pick-notebook`), reusing the shared `ExportNbRow`
+            // struct. Each notebook has its own ML-KEM keypair (derived
+            // from its own BIP-86 leaf secret), so switching here must
+            // re-derive the fingerprint + QR for the newly picked notebook.
+            Text {
+                text: "Notebook:";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                font-weight: 600;
+            }
+            VerticalLayout {
+                spacing: 6px;
+                for nb in QuantumKeys.notebooks: Rectangle {
+                    height: 40px;
+                    background: nb.index == QuantumKeys.nb-index ? Theme.palette-primary : Theme.palette-surface;
+                    border-radius: 10px;
+                    border-width: 1px;
+                    border-color: nb.index == QuantumKeys.nb-index ? Theme.palette-primary : Theme.palette-border;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 8px;
+                        Text {
+                            text: nb.name;
+                            color: nb.index == QuantumKeys.nb-index ? #ffffff : Theme.palette-foreground;
+                            font-family: "Montserrat";
+                            font-size: 14px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: nb.addr;
+                            color: nb.index == QuantumKeys.nb-index ? #ffffff : Theme.palette-muted;
+                            font-family: "SourceCodePro";
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    TouchArea { clicked => { Callbacks.quantum-key-pick-notebook(nb.index); } }
+                }
+            }
+
             HorizontalLayout {
                 spacing: 6px;
                 PillOption {
@@ -2964,6 +3050,20 @@ export component AppWindow inherits Window {
                     height: 176px;
                     image-rendering: pixelated;
                 }
+            }
+            // Legibility note: an armored ML-KEM public key is ~1.7 KB,
+            // rendered as one dense QR (no animated-UR encoder is wired
+            // in this app — the device only ever DECODES animated UR via
+            // the system scanner, e.g. for sync bundles; encoding one
+            // would need a different, not readily-reusable payload
+            // framing). A phone camera can still read a dense code, but
+            // it wants a steady hand and good light.
+            Text {
+                text: "Dense QR — hold steady and well-lit, or scan with the companion / graffito desktop app, which also accepts this key by file or paste.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 12px;
+                wrap: word-wrap;
             }
             Text {
                 text: "This is your PUBLIC key — safe to share. Your device backup is the 24 recovery words (Settings → \"Recovery words…\"), which reconstruct this key too.";

@@ -149,6 +149,12 @@ export struct NoteRow {
     preview: string,
     meta: string,     // "pending" | "block 123 · 2 chunks" etc.
     badge: string,    // "PRIVATE" | "PUBLIC"
+    // Post-quantum (pq.rs): pq = NoteRec.pq_flags != 0 (a passphrase and/or
+    // ML-KEM layer was used), locked = NoteRec.locked.is_some() (a received
+    // pq note this device couldn't auto-decrypt at scan time — still
+    // encrypted, distinct from an unlocked pq note).
+    pq: bool,
+    locked: bool,
 }
 
 export struct SenderRow {
@@ -344,6 +350,16 @@ export global Settings {
     in-out property <image> spending-window-qr;
 }
 
+// Notebook picker row shared by the Quantum-keys screen (27) and the
+// Export-keys hex/WIF picker (23/24, declared further below) — same shape
+// (index/name/short address), reused rather than forked so both pickers
+// stay visually and structurally identical.
+export struct ExportNbRow {
+    index: int,       // BIP-86 receive index
+    name: string,
+    addr: string,     // short address
+}
+
 // Screen 27 — Quantum keys: the active notebook's post-quantum (ML-KEM)
 // receive identity. Public-key export only — device backup is the 24
 // recovery words (Settings → "Recovery words…"), which already
@@ -355,6 +371,12 @@ export global QuantumKeys {
     in-out property <string> fingerprint: "";
     in-out property <image> public-qr;
     in-out property <string> public-armor;
+    // Notebook picker (mirrors the Export-keys screen's — screen 23/24 —
+    // "Notebook (whose private key)" row exactly): which notebook's
+    // ML-KEM receive key is being shown.
+    in-out property <[ExportNbRow]> notebooks;
+    in-out property <int> nb-index: 0;
+    in-out property <string> nb-name: "";
 }
 
 // One coin on the Pay-from screen (screen 25) — a notebook OR spending-
@@ -397,13 +419,8 @@ export global ChangePick {
 // A seed index rotates the whole 24-word phrase (scoped compromise);
 // the account is the BIP-86 wallet context — together they pick which
 // bip86 notebooks are visible (legacy notebooks are context-free).
-// Export-keys notebook picker row (screen 23, hex/WIF only): which
-// receive index's private key to export, labeled by notebook name + addr.
-export struct ExportNbRow {
-    index: int,       // BIP-86 receive index (the hex/WIF selector)
-    name: string,
-    addr: string,     // short address
-}
+// Export-keys notebook picker (screen 23/24, hex/WIF only) reuses the
+// `ExportNbRow` struct declared above (next to QuantumKeys, its other user).
 
 export global Recovery {
     // True when GetAppSeed returned (set once at boot) — gates the reveal
@@ -551,5 +568,6 @@ export global Callbacks {
     callback scan-contact-pq();           // naming modal "Scan quantum key" → system scanner
     callback open-quantum-keys();         // Settings → screen 27
     callback quantum-key-level(int);      // level pill tapped → re-derive fingerprint/QR
+    callback quantum-key-pick-notebook(int); // notebook row tapped → re-derive for that index
     callback quantum-keys-close();        // Back → settings
 }

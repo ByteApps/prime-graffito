@@ -1323,6 +1323,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let lock_policy: Rc<RefCell<LockTimePolicy>> = Rc::new(RefCell::new(device_cfg.lock_time));
     // Default ML-KEM level for the Quantum-keys screen (wallet-level).
     let mlkem_level: Rc<RefCell<u8>> = Rc::new(RefCell::new(device_cfg.mlkem_level));
+    // Quantum-keys screen (27): which notebook's ML-KEM key is shown —
+    // `None` until the picker is touched, meaning "active-or-first-visible"
+    // (the screen's original single-notebook default); `Some(index)` once
+    // the user picks a specific notebook from the picker.
+    let quantum_nb: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
     let active: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
 
     // Persist the device config from the current cells (single source of
@@ -1481,6 +1486,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     }
                     .into(),
                     badge: if n.private { "PRIVATE" } else { "PUBLIC" }.into(),
+                    // Post-quantum (pq.rs): pq mirrors the contacts picker's
+                    // "PQ" badge (a passphrase and/or ML-KEM layer was
+                    // used); locked mirrors the note-view screen's lock
+                    // state (a received pq note this device couldn't
+                    // auto-decrypt at scan time — still visually distinct
+                    // from an unlocked pq note in the list).
+                    pq: n.pq_flags != 0,
+                    locked: n.locked.is_some(),
                 })
                 .collect();
             log::info!("cb: refresh-notes n={} hidden={hidden}", rows.len());
@@ -2295,12 +2308,17 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
-    // Quantum-keys screen (27): the ACTIVE notebook's ML-KEM receive
-    // identity when one is open, else the current wallet context's first
-    // visible notebook (Settings is reached from the wallet-level
-    // notebook LIST, so `active` may be None) — level picker, fingerprint,
-    // public-key export QR. Public-key only: device backup is the 24
-    // recovery words, which already reconstruct this key.
+    // Quantum-keys screen (27): every visible notebook in the active
+    // (seed, account) wallet context has its OWN ML-KEM receive identity
+    // (derived from its own BIP-86 leaf secret, like the Export-keys
+    // screen's hex/WIF), so the screen needs the same notebook picker —
+    // `export_pick_notebook`'s row design + selection convention, reusing
+    // the shared `ExportNbRow` struct. Default selection when the picker
+    // hasn't been touched (`quantum_nb == None`): the ACTIVE notebook when
+    // one is open, else the wallet context's first visible notebook — the
+    // screen's original single-notebook behavior, preserved as the
+    // default. Public-key only: device backup is the 24 recovery words,
+    // which already reconstruct every notebook's key.
     let refresh_quantum_keys = {
         let ui_weak = ui_weak.clone();
         let notebooks = notebooks.clone();
@@ -2310,6 +2328,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let active = active.clone();
         let app_seed = app_seed.clone();
         let mlkem_level = mlkem_level.clone();
+        let quantum_nb = quantum_nb.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let qk = ui.global::<QuantumKeys>();
@@ -2321,14 +2340,58 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             };
             qk.set_level(level_idx);
             qk.set_level_caption(mlkem_alg_describe(alg).into());
+
             let ix = notebooks.borrow();
             let net_s = net.borrow().clone();
+            let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
             let ctx = (*seed_idx.borrow(), *bip_account.borrow());
-            let meta = (*active.borrow())
+
+            // Picker rows: every visible notebook in this wallet context,
+            // same shape/derivation as `export_rows`.
+            let mut rows: Vec<ExportNbRow> = Vec::new();
+            for m in ix.visible(ctx.0, ctx.1) {
+                let addr = derive_identity(app_seed_get(&app_seed), m, &net_s)
+                    .map(|id| id.address(network))
+                    .unwrap_or_default();
+                let name = if m.name.trim().is_empty() {
+                    notebooks::default_name(m.index)
+                } else {
+                    m.name.clone()
+                };
+                rows.push(ExportNbRow {
+                    index: m.index as i32,
+                    name: name.into(),
+                    addr: short_addr(&addr).into(),
+                });
+            }
+
+            // Selection: an explicit picker choice (if it's still visible),
+            // else the active-or-first default described above.
+            let default_meta = (*active.borrow())
                 .and_then(|acc| ix.get(acc))
                 .or_else(|| ix.visible(ctx.0, ctx.1).next())
                 .cloned();
+            let meta = quantum_nb
+                .borrow()
+                .and_then(|i| ix.visible(ctx.0, ctx.1).find(|m| m.index == i).cloned())
+                .or(default_meta);
             drop(ix);
+
+            let (nb_idx, nb_name) = meta
+                .as_ref()
+                .map(|m| {
+                    let name = if m.name.trim().is_empty() {
+                        notebooks::default_name(m.index)
+                    } else {
+                        m.name.clone()
+                    };
+                    (m.index as i32, name)
+                })
+                .unwrap_or((0, "".to_string()));
+            qk.set_notebooks(Rc::new(VecModel::from(rows)).into());
+            qk.set_nb_index(nb_idx);
+            qk.set_nb_name(nb_name.into());
+
             let leaf =
                 meta.as_ref().and_then(|m| derive_leaf_secret(app_seed_get(&app_seed), m, &net_s));
             match leaf {
@@ -2349,7 +2412,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     {
         let refresh_quantum_keys = refresh_quantum_keys.clone();
+        let quantum_nb = quantum_nb.clone();
         ui.global::<Callbacks>().on_open_quantum_keys(move || {
+            // Reopening the screen resets to the active-or-first default
+            // rather than remembering the last-picked notebook from a
+            // previous visit.
+            *quantum_nb.borrow_mut() = None;
             refresh_quantum_keys();
         });
     }
@@ -2369,6 +2437,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             *mlkem_level.borrow_mut() = alg.id();
             persist_config();
             log::info!("cb: pq-key level={}", mlkem_alg_name(alg));
+            refresh_quantum_keys();
+        });
+    }
+
+    {
+        let refresh_quantum_keys = refresh_quantum_keys.clone();
+        let quantum_nb = quantum_nb.clone();
+        ui.global::<Callbacks>().on_quantum_key_pick_notebook(move |index| {
+            *quantum_nb.borrow_mut() = Some(index as u32);
+            log::info!("cb: pq-key notebook={index}");
             refresh_quantum_keys();
         });
     }
