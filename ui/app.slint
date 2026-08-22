@@ -3044,11 +3044,23 @@ export component AppWindow inherits Window {
 
             HorizontalLayout {
                 alignment: center;
-                Image {
-                    source: QuantumKeys.public-qr;
+                Rectangle {
                     width: 176px;
                     height: 176px;
-                    image-rendering: pixelated;
+                    Image {
+                        source: QuantumKeys.public-qr;
+                        width: 176px;
+                        height: 176px;
+                        image-rendering: pixelated;
+                    }
+                    // LAST child so the tap isn't swallowed by the Image
+                    // (slint: later sibling wins input — qr-zoom memory).
+                    TouchArea {
+                        clicked => {
+                            QuantumKeys.qr-zoom = true;
+                            Callbacks.quantum-qr-zoom(true);
+                        }
+                    }
                 }
             }
             // Legibility note: an armored ML-KEM public key is ~1.7 KB,
@@ -3074,6 +3086,29 @@ export component AppWindow inherits Window {
             }
 
             Rectangle { vertical-stretch: 1; }
+        }
+
+        // Fullscreen armor-QR overlay (screen 27's tap-to-zoom) — a LATER
+        // SIBLING of the screen layout so it paints on top; white ground
+        // so the code has maximum contrast, QR at the largest square that
+        // fits. Tap anywhere closes (dismiss TouchArea is the LAST child —
+        // the qr-zoom rule: anything stacked above it swallows the tap).
+        if Ui.screen == 27 && QuantumKeys.qr-zoom: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #ffffff;
+            Image {
+                source: QuantumKeys.public-qr;
+                width: min(parent.width, parent.height) - 24px;
+                height: self.width;
+                image-rendering: pixelated;
+            }
+            TouchArea {
+                clicked => {
+                    QuantumKeys.qr-zoom = false;
+                    Callbacks.quantum-qr-zoom(false);
+                }
+            }
         }
 
         // ------------------------------------ screen 7: contacts (send-to)

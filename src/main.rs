@@ -2405,6 +2405,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             match leaf {
                 Some(leaf) => {
                     let kp = pq::mlkem_keypair_from_leaf(&leaf, alg);
+                    qk.set_qr_zoom(false); // never re-enter the screen zoomed
                     qk.set_fingerprint(kp.fingerprint().into());
                     // The dense armor QR is optically unverifiable at
                     // device resolution (~1.2px/module), so the UI suite
@@ -2467,6 +2468,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     {
         ui.global::<Callbacks>().on_quantum_keys_close(move || {});
+    }
+    {
+        let ui = ui_weak.upgrade().unwrap();
+        ui.global::<Callbacks>().on_quantum_qr_zoom(move |open| {
+            log::info!("cb: pq-key qr-zoom={}", if open { "open" } else { "closed" });
+        });
     }
 
     {

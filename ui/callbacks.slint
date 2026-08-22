@@ -371,6 +371,11 @@ export global QuantumKeys {
     in-out property <string> fingerprint: "";
     in-out property <image> public-qr;
     in-out property <string> public-armor;
+    // Tap-to-fullscreen for the dense armor QR (Sal, 2026-08-22): at the
+    // inline 176px the ~141-module code is ~1.2px/module — unscannable by
+    // any camera. Full-screen (~456px, ~3.2px/module) scans fine. Tap the
+    // QR to open, tap anywhere to close; reset on every screen open.
+    in-out property <bool> qr-zoom: false;
     // Notebook picker (mirrors the Export-keys screen's — screen 23/24 —
     // "Notebook (whose private key)" row exactly): which notebook's
     // ML-KEM receive key is being shown.
@@ -570,4 +575,5 @@ export global Callbacks {
     callback quantum-key-level(int);      // level pill tapped → re-derive fingerprint/QR
     callback quantum-key-pick-notebook(int); // notebook row tapped → re-derive for that index
     callback quantum-keys-close();        // Back → settings
+    callback quantum-qr-zoom(bool);       // fullscreen QR opened/closed (log only)
 }
