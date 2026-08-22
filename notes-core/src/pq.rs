@@ -65,7 +65,7 @@
 
 use hkdf::Hkdf;
 use sha2::Sha256;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use ml_kem::array::Array;
 use ml_kem::kem::{Decapsulate, EncapsulationKey};
@@ -448,6 +448,67 @@ pub fn import_public(armored: &str) -> Result<(MlKemAlg, Vec<u8>), Error> {
         return Err(Error::Decode("pq armor: wrong ek length for alg"));
     }
     Ok((alg, ek))
+}
+
+// ---------------------------------------------------------------------
+// Seed-derived receive keypair — cross-app recovery contract, FROZEN
+// once shipped
+// ---------------------------------------------------------------------
+//
+// Per-notebook seed-derived ML-KEM receive keys, relocated here from the
+// Mac app's `app-core/src/pqkeys.rs` (same precedent as `keys::
+// enc_key_from_leaf`'s relocation) so the Passport Prime device app and
+// the Mac app derive BYTE-IDENTICAL keys from the same notebook leaf
+// secret — a notebook's leaf secret fully determines its ML-KEM receive
+// keys at every level, on device and Mac alike, so recovery from the
+// seed words alone reproduces exactly the keys a contact already has
+// stored, on either platform.
+//
+// ```text
+// seed64 = HKDF-SHA256(salt = "graffito/mlkem/v1", ikm = leaf_secret)
+//            .expand(info = "seed/v1" || alg_id(1), 64)
+// MlKemKeypair::from_seed(alg, &seed64)
+// ```
+//
+// `alg_id` (`MlKemAlg::id()`) folds into the HKDF `info`, making the
+// three levels independent draws from the same `leaf_secret` — never the
+// same seed truncated/reused three ways, so compromising one level's
+// decapsulation key reveals nothing about the other two.
+//
+// FROZEN FOREVER once shipped: receive keys derived here are advertised
+// to peers (a contact stores the resulting `ek`), so changing the salt,
+// info prefix, alg-id placement, or `MlKemKeypair::from_seed`'s (d, z)
+// byte layout orphans every already-shared pq receive key. Pinned by
+// `pinned_derivation_vectors_per_level` below — treat a failure there as
+// SHIP-BLOCKING, never "fix" it by updating the hex.
+
+const MLKEM_SEED_SALT: &[u8] = b"graffito/mlkem/v1";
+const MLKEM_SEED_INFO_PREFIX: &[u8] = b"seed/v1";
+
+/// The HKDF step alone (seed derivation, no ML-KEM keygen) — broken out
+/// so [`mlkem_keypair_from_leaf`] and any future caller that only needs
+/// the seed (never the expensive keygen) share one implementation.
+/// Zeroizing: the 64-byte seed is exactly as sensitive as the
+/// decapsulation key it deterministically reconstructs. FROZEN — see the
+/// section doc above.
+pub fn mlkem_seed_from_leaf(leaf_secret: &[u8; 32], alg: MlKemAlg) -> Zeroizing<[u8; 64]> {
+    let hk = Hkdf::<Sha256>::new(Some(MLKEM_SEED_SALT), leaf_secret);
+    let mut info = Vec::with_capacity(MLKEM_SEED_INFO_PREFIX.len() + 1);
+    info.extend_from_slice(MLKEM_SEED_INFO_PREFIX);
+    info.push(alg.id());
+    let mut okm = Zeroizing::new([0u8; 64]);
+    hk.expand(&info, &mut *okm).expect("64 bytes is a valid HKDF length");
+    okm
+}
+
+/// Deterministically derive a notebook's ML-KEM receive keypair at `alg`
+/// from its `leaf_secret` — see the section doc above for the exact
+/// derivation. Infallible (HKDF expand to a fixed 64-byte length never
+/// fails, and [`MlKemKeypair::from_seed`] is deterministic keygen, no
+/// entropy draw).
+pub fn mlkem_keypair_from_leaf(leaf_secret: &[u8; 32], alg: MlKemAlg) -> MlKemKeypair {
+    let seed = mlkem_seed_from_leaf(leaf_secret, alg);
+    MlKemKeypair::from_seed(alg, &seed)
 }
 
 // ---------------------------------------------------------------------
