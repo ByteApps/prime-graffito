@@ -3451,6 +3451,8 @@ export component AppWindow inherits Window {
                         spacing: 8px;
                         SecondaryAction {
                             horizontal-stretch: 1;
+                            font-size: 16px;          // 48px row: default 20px+12px padding elides (2026-08-22)
+                            padding-vertical: 6px;
                             text: "Cancel";
                             clicked => {
                                 nb-name-input.clear-focus();
@@ -3459,6 +3461,8 @@ export component AppWindow inherits Window {
                         }
                         PrimaryAction {
                             horizontal-stretch: 1;
+                            font-size: 16px;          // 48px row: default 20px+12px padding elides (2026-08-22)
+                            padding-vertical: 6px;
                             text: NotebooksUi.name-account == -2 ? "Create" : "Save";
                             clicked => {
                                 nb-name-input.clear-focus();
@@ -3543,6 +3547,12 @@ export component AppWindow inherits Window {
                     SecondaryAction {
                         height: 40px;
                         width: 100%;
+                        // 40px tall: the component's 20px font + 12px
+                        // vertical padding elide the label to NOTHING —
+                        // shrink both (the pre-pq naming dialog had the
+                        // same blank-button bug; 2026-08-22).
+                        font-size: 15px;
+                        padding-vertical: 6px;
                         text: "Scan quantum key";
                         clicked => { Callbacks.scan-contact-pq(); }
                     }
@@ -3551,6 +3561,8 @@ export component AppWindow inherits Window {
                         spacing: 8px;
                         SecondaryAction {
                             horizontal-stretch: 1;
+                            font-size: 16px;          // 48px row: default 20px+12px padding elides (2026-08-22)
+                            padding-vertical: 6px;
                             text: "Cancel";
                             clicked => {
                                 Contacts.naming-address = "";
@@ -3561,6 +3573,8 @@ export component AppWindow inherits Window {
                         }
                         PrimaryAction {
                             horizontal-stretch: 1;
+                            font-size: 16px;
+                            padding-vertical: 6px;
                             text: "Save";
                             clicked => {
                                 name-input.clear-focus();
