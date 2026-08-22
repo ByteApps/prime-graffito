@@ -2406,6 +2406,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 Some(leaf) => {
                     let kp = pq::mlkem_keypair_from_leaf(&leaf, alg);
                     qk.set_fingerprint(kp.fingerprint().into());
+                    // The dense armor QR is optically unverifiable at
+                    // device resolution (~1.2px/module), so the UI suite
+                    // cross-checks THIS line against notes_cli
+                    // pq-fingerprint's independent host derivation.
+                    // Public info — safe to log.
+                    log::info!("cb: pq-key fp={}", kp.fingerprint());
                     let armor = pq::export_public(alg, kp.ek());
                     qk.set_public_qr(qr_image(&armor));
                     qk.set_public_armor(armor.into());
