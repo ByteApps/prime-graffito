@@ -799,19 +799,27 @@ fn ensure_dir(fs: &Fs, path: &str, loc: Location) -> Result<(), String> {
 /// Lazy Airlock mount with format-on-failed-mount recovery (nothing mounts
 /// Airlock in the hosted simulator; see paper-wallet NOTES.md).
 fn ensure_airlock_mounted(fs: &Fs) -> Result<(), String> {
-    let mut fs = fs.clone();
-    if fs.mount_airlock().is_ok() {
-        return Ok(());
-    }
-    log::warn!("airlock mount failed — formatting (no readable filesystem)");
-    fs.format_airlock()
-        .and_then(|_| fs.mount_airlock())
-        .map_err(|e| format!("airlock unavailable: {e:?}"))
+    // SDK 1.0.0: MountAirlock/FormatAirlock/UnmountAirlock are
+    // Foundation-only — a third-party app CALLING them gets AccessDenied,
+    // and under the 1.0.0 permission model a denial PANICS inside the
+    // generated SDK client (scalar.rs unwrap), killing the app. It is not
+    // catchable app-side; `let _ = fs.mount_airlock()` still dies. Found
+    // the hard way when the Sync screen's Import tap took the whole app
+    // down in the hosted sim (2026-08-21).
+    //
+    // The app never needed to own the mount anyway: on HARDWARE the
+    // SYSTEM mounts Airlock when USB attaches (and unmounts on detach) —
+    // and in the hosted sim nothing mounts it at all. So: probe with a
+    // GRANTED message (OpenDir on the volume root) whose failure is an
+    // ordinary Err, and treat "can't open" as "Airlock not present".
+    fs.open_dir("/", Location::Airlock)
+        .map(|_| ())
+        .map_err(|e| format!("airlock not present: {e:?}"))
 }
 
-fn unmount_airlock(fs: &Fs) {
-    let mut fs = fs.clone();
-    let _ = fs.unmount_airlock();
+fn unmount_airlock(_fs: &Fs) {
+    // Deliberately nothing — see ensure_airlock_mounted: the system owns
+    // the mount lifecycle, and the UnmountAirlock message would panic.
 }
 
 fn first_inbox_bundle(fs: &Fs) -> Option<(String, Location, &'static str)> {
