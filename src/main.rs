@@ -1,4 +1,5 @@
 mod notebooks;
+mod passphrase;
 mod spending;
 mod theme;
 
@@ -10,11 +11,13 @@ use std::time::Duration;
 use notes_core::address::Recipient;
 use notes_core::bundle::{
     compose_directed_note_multi_exact, compose_directed_note_multi_with_change,
-    compose_note_exact, decode_scanned, estimate_note_cost, extract_notes_multi_deduped,
-    sealed_note_payloads, sealed_note_payloads_multi, Identity, SyncBundle,
+    compose_directed_note_pq_exact_amount, compose_directed_note_pq_with_change_amount,
+    compose_note_exact, decode_scanned, estimate_note_cost, estimate_note_cost_pq,
+    extract_notes_pq, sealed_note_payloads, sealed_note_payloads_multi, Identity, SyncBundle,
 };
 use notes_core::address::p2tr_script_pubkey;
 use notes_core::keys::generate_aux_rand;
+use notes_core::pq;
 use notes_core::tx::{
     build_note_tx_mixed_exact_anchored_multi, build_sweep_tx_multi, estimate_sweep_vsize,
     estimate_vsize_mixed, InputKind, LockTimePolicy, MixedInput, NoteTx, SweepSource, Utxo,
@@ -63,8 +66,18 @@ enum FitCheck {
     HardWall,
 }
 
-fn note_fits(text_len: usize, private: bool, chunk: usize, recipient_spk_len: Option<usize>) -> bool {
-    estimate_note_cost(text_len, private, chunk, 1, recipient_spk_len)
+// `pq_extra` = `pq::pq_overhead(pq_flags, alg)` bytes (0 when the compose
+// Security section is inactive) — folded into the same `estimate_note_cost`
+// arithmetic `estimate_note_cost_pq` uses internally, so a pq-layered
+// note's ceiling/chunk-size checks see its real (larger) body.
+fn note_fits(
+    text_len: usize,
+    private: bool,
+    chunk: usize,
+    recipient_spk_len: Option<usize>,
+    pq_extra: usize,
+) -> bool {
+    estimate_note_cost(text_len + pq_extra, private, chunk, 1, recipient_spk_len)
         .map(|(_, vsize)| vsize <= MAX_STANDARD_TX_VSIZE)
         .unwrap_or(false) // Err = >255 chunks → over-limit
 }
@@ -74,11 +87,12 @@ fn fit_check(
     text_len: usize,
     private: bool,
     recipient_spk_len: Option<usize>,
+    pq_extra: usize,
 ) -> FitCheck {
-    if note_fits(text_len, private, effective_chunk, recipient_spk_len) {
+    if note_fits(text_len, private, effective_chunk, recipient_spk_len, pq_extra) {
         FitCheck::Ok
     } else if effective_chunk < DEFAULT_CHUNK
-        && note_fits(text_len, private, DEFAULT_CHUNK, recipient_spk_len)
+        && note_fits(text_len, private, DEFAULT_CHUNK, recipient_spk_len, pq_extra)
     {
         FitCheck::FitsAtStandard
     } else {
@@ -126,6 +140,21 @@ struct NoteRec {
     /// back-compat single-recipient display/log parity.
     #[serde(default)]
     recipients: Vec<String>,
+    /// Post-quantum sealing flags (`notes_core::envelope::FLAG_PW`/
+    /// `FLAG_MLKEM`) — 0 for an ordinary note. Structural, set once at
+    /// scan/compose time from `RecoveredNote.pq_flags`/`SealLayers::flags`
+    /// and never recomputed.
+    #[serde(default)]
+    pq_flags: u8,
+    /// Present for a RECEIVED pq note this device couldn't auto-decrypt at
+    /// scan time (a password layer, or a combined password+ML-KEM note —
+    /// `extract_notes_pq` only auto-tries ML-KEM alone). `text` holds a
+    /// placeholder until a manual `unlock-note` succeeds, at which point
+    /// this is cleared and `text` becomes the real plaintext — mirrors the
+    /// Mac app's `NoteRecord.locked`/`unlock_note`. Never populated for a
+    /// note this device composed itself (plaintext is already known then).
+    #[serde(default)]
+    locked: Option<pq::LockedBody>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -142,6 +171,12 @@ struct UtxoRec {
 struct ContactRec {
     name: String, // "" = unnamed
     address: String,
+    /// This contact's ML-KEM public key, armored (`notes_core::pq::export_public`
+    /// format — the same armor a Quantum-keys screen "Show public key" QR
+    /// carries). Only the public half is ever stored. `None` = no key
+    /// scanned yet.
+    #[serde(default)]
+    mlkem_ek: Option<String>,
 }
 
 const MAX_CONTACTS: usize = 20;
@@ -303,6 +338,10 @@ struct Plan {
     /// OP_RETURN(s)/optional recipient — the ledger vout math below
     /// derives both positions from this flag, never a hardcoded offset.
     notebook_dust: bool,
+    /// Post-quantum sealing flags (`notes_core::envelope::FLAG_PW`/
+    /// `FLAG_MLKEM`) — 0 for an ordinary note. Carried straight into the
+    /// persisted `NoteRec` on sign.
+    pq_flags: u8,
 }
 
 /// A built-and-signed sweep/consolidate waiting for user confirmation.
@@ -354,6 +393,142 @@ fn derive_identity(
     let seed = app_seed.as_ref()?;
     let network = Network::from_str_opt(net).unwrap_or(Network::Mainnet);
     Identity::from_bip86(seed, meta.seed, network, meta.bip_account, meta.index).ok()
+}
+
+/// A notebook's raw BIP-86 leaf secret — needed for post-quantum key
+/// derivation (`pq::mlkem_seed_from_leaf`/`mlkem_keypair_from_leaf`), which
+/// `Identity::from_bip86` folds away internally (it only exposes the
+/// tweaked keys, not the leaf itself). Mirrors `export_leaf_formats`'s use
+/// of the same `seeds::derive_leaf` call.
+fn derive_leaf_secret(
+    app_seed: &Option<[u8; 32]>,
+    meta: &notebooks::NotebookMeta,
+    net: &str,
+) -> Option<[u8; 32]> {
+    let seed = app_seed.as_ref()?;
+    let network = Network::from_str_opt(net).unwrap_or(Network::Mainnet);
+    notes_core::seeds::derive_leaf(seed, meta.seed, network, meta.bip_account, meta.index).ok()
+}
+
+/// `pq::MlKemAlg` from a persisted level id (`config.json`'s `mlkem_level`,
+/// or an on-chain alg byte) — 0/unknown resolves to the recommended
+/// default, ML-KEM-768 (never a hard error; this is a display/UI default,
+/// not wire-format decoding).
+fn mlkem_alg_from_u8(id: u8) -> pq::MlKemAlg {
+    pq::MlKemAlg::from_id(id).unwrap_or(pq::MlKemAlg::MlKem768)
+}
+
+fn mlkem_alg_name(alg: pq::MlKemAlg) -> &'static str {
+    match alg {
+        pq::MlKemAlg::MlKem512 => "ML-KEM-512",
+        pq::MlKemAlg::MlKem768 => "ML-KEM-768",
+        pq::MlKemAlg::MlKem1024 => "ML-KEM-1024",
+    }
+}
+
+/// Verbatim-pinned description strings — same wording as the graffito
+/// Mac app's `MlKemLevel::describe()`, so a contact importing a Prime
+/// device's exported key sees identical copy on either platform.
+fn mlkem_alg_describe(alg: pq::MlKemAlg) -> &'static str {
+    match alg {
+        pq::MlKemAlg::MlKem512 => {
+            "Lowest parameter size; offers security roughly comparable to AES-128."
+        }
+        pq::MlKemAlg::MlKem768 => {
+            "Standard recommendation for most general applications; provides security \
+             comparable to AES-192."
+        }
+        pq::MlKemAlg::MlKem1024 => {
+            "Highest parameter size; offers security comparable to AES-256 for maximum \
+             long-term protection."
+        }
+    }
+}
+
+/// Every one of a notebook's three ML-KEM receive keypairs (512/768/1024),
+/// derived from its leaf secret — for `extract_notes_pq`'s auto-unlock
+/// candidate set and for the Quantum-keys screen's fingerprint/export.
+/// Cheap: deterministic keygen from an HKDF-derived seed, no entropy draw
+/// (`pq.rs`'s FROZEN per-notebook derivation, shared byte-for-byte with the
+/// Mac app).
+fn derive_mlkem_keypairs(leaf_secret: &[u8; 32]) -> Vec<pq::MlKemKeypair> {
+    [pq::MlKemAlg::MlKem512, pq::MlKemAlg::MlKem768, pq::MlKemAlg::MlKem1024]
+        .into_iter()
+        .map(|alg| pq::mlkem_keypair_from_leaf(leaf_secret, alg))
+        .collect()
+}
+
+/// Parse a contact's stored armored ML-KEM public key into `(level,
+/// fingerprint)` for display (contact picker badge, naming-modal caption,
+/// compose recipient caption) — `notes_core::pq::import_public` +
+/// `pq::fingerprint`, same as the Quantum-keys screen and the Mac app's
+/// `pqkeys::contact_pq_display`.
+fn contact_pq_display(armor: &str) -> Result<(pq::MlKemAlg, String), String> {
+    let (alg, ek) = pq::import_public(armor).map_err(|e| e.to_string())?;
+    Ok((alg, pq::fingerprint(alg, &ek)))
+}
+
+/// "ML-KEM-768 · xxxx xxxx xxxx xxxx" — the one-line display format shared
+/// by the contact picker's PQ badge/caption, the naming modal, and the
+/// compose Security section's recipient-key caption.
+fn contact_pq_caption(armor: &str) -> String {
+    contact_pq_display(armor)
+        .map(|(alg, fp)| format!("{} · {fp}", mlkem_alg_name(alg)))
+        .unwrap_or_default()
+}
+
+/// Post-quantum status line for the compose Security section — mirrors the
+/// Mac app's `passphrase::security_label` wording verbatim (ported for
+/// cross-platform copy parity), restricted to the cases reachable here:
+/// this device only calls it for a directed private single-recipient
+/// draft, so the public-note/self-note branches never fire in practice but
+/// are kept for completeness. `passphrase_verified` = the typed text is
+/// byte-identical to the last `passphrase::generate()` output (the ONLY
+/// way a passphrase counts toward quantum resistance — an unverified
+/// typed/pasted phrase never does, however long).
+fn pq_security_label(
+    private: bool,
+    directed: bool,
+    passphrase_active: bool,
+    passphrase_verified: bool,
+    mlkem_level: Option<pq::MlKemAlg>,
+) -> String {
+    if !private {
+        return "Public note: anyone can read it on the blockchain, forever.".to_string();
+    }
+    if !directed {
+        return "Private note: sealed with a key derived from your seed. Already \
+                quantum-resistant — no public-key material ever touches the chain."
+            .to_string();
+    }
+    let passphrase_counts = passphrase_active && passphrase_verified;
+    match (mlkem_level, passphrase_active) {
+        (None, false) => {
+            "Directed note: end-to-end encrypted (~128-bit ECDH), but NOT quantum-resistant."
+                .to_string()
+        }
+        (None, true) if !passphrase_counts => {
+            "Passphrase added — strength unverifiable, not counted as quantum-resistant."
+                .to_string()
+        }
+        (None, true) => format!(
+            "Quantum-resistant: protected by a strong passphrase (~{:.0} bits).",
+            passphrase::GENERATED_BITS
+        ),
+        (Some(level), false) => format!(
+            "Quantum-resistant: protected by {} hybrid encryption.",
+            mlkem_alg_name(level)
+        ),
+        (Some(level), true) if passphrase_counts => format!(
+            "Quantum-resistant: {} hybrid encryption plus a strong passphrase (~{:.0} bits).",
+            mlkem_alg_name(level),
+            passphrase::GENERATED_BITS
+        ),
+        (Some(level), true) => format!(
+            "Quantum-resistant via {} hybrid encryption — passphrase layer added but unverified.",
+            mlkem_alg_name(level)
+        ),
+    }
 }
 
 /// The active notebook's leaf key rendered as (raw hex, WIF) for the
@@ -440,6 +615,12 @@ struct DeviceConfig {
     /// height can be stale, which is harmless: the tx is simply already
     /// final. `Zero` restores the pre-2026-07-27 behavior.
     lock_time: LockTimePolicy,
+    /// Default ML-KEM level (`pq::MlKemAlg::id()`) the Quantum-keys screen
+    /// shows/exports — 0 = unset, resolved to ML-KEM-768 (`mlkem_alg_from_u8`).
+    /// Purely a display/export default: compose always seals to whichever
+    /// level the resolved recipient's contact key actually advertises.
+    #[serde(default)]
+    mlkem_level: u8,
 }
 impl Default for DeviceConfig {
     fn default() -> Self {
@@ -449,6 +630,7 @@ impl Default for DeviceConfig {
             seed_index: 0,
             account: 0,
             lock_time: LockTimePolicy::default(),
+            mlkem_level: 0,
         }
     }
 }
@@ -761,15 +943,19 @@ fn short_addr(addr: &str) -> String {
 }
 
 /// Move-to-front recency (no clock on-device): reinsert the address at
-/// index 0 preserving any existing name; cap the list at MAX_CONTACTS.
+/// index 0 preserving any existing name AND quantum key; cap the list at
+/// MAX_CONTACTS.
 fn upsert_contact(st: &mut State, address: &str) {
-    let name = st
+    let (name, mlkem_ek) = st
         .contacts
         .iter()
         .position(|c| c.address == address)
-        .map(|i| st.contacts.remove(i).name)
+        .map(|i| {
+            let c = st.contacts.remove(i);
+            (c.name, c.mlkem_ek)
+        })
         .unwrap_or_default();
-    st.contacts.insert(0, ContactRec { name, address: address.to_string() });
+    st.contacts.insert(0, ContactRec { name, address: address.to_string(), mlkem_ek });
     st.contacts.truncate(MAX_CONTACTS);
 }
 
@@ -792,8 +978,14 @@ fn to_label_for(st: &State, address: &str) -> String {
 /// exposed locally because the funding-unification cost preview needs the
 /// actual per-chunk lengths (for `tx::estimate_vsize_mixed`), not just the
 /// single-taproot-input vsize that helper returns.
-fn payload_lens_for(text_len: usize, private: bool, max_op_return_bytes: usize) -> Result<Vec<usize>, String> {
-    let body_len = if private { text_len + notes_core::crypt::SEAL_OVERHEAD } else { text_len };
+fn payload_lens_for(
+    text_len: usize,
+    private: bool,
+    pq_extra: usize,
+    max_op_return_bytes: usize,
+) -> Result<Vec<usize>, String> {
+    let body_len =
+        if private { text_len + notes_core::crypt::SEAL_OVERHEAD + pq_extra } else { text_len };
     notes_core::envelope::payload_lens_for(0, None, body_len, max_op_return_bytes)
         .map_err(|e| e.to_string())
 }
@@ -1129,6 +1321,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let bip_account: Rc<RefCell<u32>> = Rc::new(RefCell::new(device_cfg.account));
     // Anti-fee-sniping policy (wallet-level, like network and chunk).
     let lock_policy: Rc<RefCell<LockTimePolicy>> = Rc::new(RefCell::new(device_cfg.lock_time));
+    // Default ML-KEM level for the Quantum-keys screen (wallet-level).
+    let mlkem_level: Rc<RefCell<u8>> = Rc::new(RefCell::new(device_cfg.mlkem_level));
     let active: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
 
     // Persist the device config from the current cells (single source of
@@ -1140,6 +1334,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let seed_idx = seed_idx.clone();
         let bip_account = bip_account.clone();
         let lock_policy = lock_policy.clone();
+        let mlkem_level = mlkem_level.clone();
         Rc::new(move || {
             save_config(
                 &fs,
@@ -1149,6 +1344,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     seed_index: *seed_idx.borrow(),
                     account: *bip_account.borrow(),
                     lock_time: *lock_policy.borrow(),
+                    mlkem_level: *mlkem_level.borrow(),
                 },
             );
         })
@@ -1308,6 +1504,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     label: if c.name.is_empty() { short_addr(&c.address) } else { c.name.clone() }
                         .into(),
                     meta: short_addr(&c.address).into(),
+                    pq_caption: c
+                        .mlkem_ek
+                        .as_deref()
+                        .map(contact_pq_caption)
+                        .unwrap_or_default()
+                        .into(),
                 })
                 .collect();
             log::info!("cb: refresh-contacts n={}", rows.len());
@@ -2031,6 +2233,150 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
+    // Quantum key scan (naming modal "Scan quantum key"): armored
+    // ML-KEM public key only — `pq::import_public` rejects anything else
+    // with a clear message (a private-key armor, a note, an address QR).
+    // Scoped to `Contacts.naming-address` (set when the modal opened), so
+    // scanning does NOT require re-saving the name field.
+    {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let fs = fs.clone();
+        let refresh_contacts = refresh_contacts.clone();
+        ui.global::<Callbacks>().on_scan_contact_pq(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let contacts_g = ui.global::<Contacts>();
+            let addr = contacts_g.get_naming_address().to_string();
+            if addr.is_empty() {
+                return;
+            }
+            let opts = ScanQrOptions {
+                header_title: "Scan quantum key".into(),
+                message: "Point at a contact's ML-KEM public-key QR (their Settings → \
+                          \"Quantum keys…\" screen)."
+                    .into(),
+                ..ScanQrOptions::default()
+            };
+            let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
+                Ok(Some(ScanQrResult::Qr { data, .. })) | Ok(Some(ScanQrResult::Ur2 { data, .. })) => {
+                    data
+                }
+                Ok(_) => {
+                    log::info!("cb: contact-pq-key cancelled");
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("cb: contact-pq-key err=scanner {e:?}");
+                    contacts_g.set_naming_pq_error(format!("QR scanner unavailable: {e:?}").into());
+                    return;
+                }
+            };
+            let armor = String::from_utf8(data).unwrap_or_default();
+            match pq::import_public(&armor) {
+                Ok((alg, ek)) => {
+                    let fp = pq::fingerprint(alg, &ek);
+                    let mut st = state.borrow_mut();
+                    if let Some(c) = st.contacts.iter_mut().find(|c| c.address == addr) {
+                        c.mlkem_ek = Some(armor);
+                    }
+                    save_state(&fs, &st);
+                    drop(st);
+                    log::info!("cb: contact-pq-key ok fp={fp}");
+                    contacts_g
+                        .set_naming_pq_caption(format!("{} · {fp}", mlkem_alg_name(alg)).into());
+                    contacts_g.set_naming_pq_error("".into());
+                    refresh_contacts();
+                }
+                Err(e) => {
+                    log::warn!("cb: contact-pq-key err={e}");
+                    contacts_g.set_naming_pq_error(format!("Not a quantum public key: {e}").into());
+                }
+            }
+        });
+    }
+
+    // Quantum-keys screen (27): the ACTIVE notebook's ML-KEM receive
+    // identity when one is open, else the current wallet context's first
+    // visible notebook (Settings is reached from the wallet-level
+    // notebook LIST, so `active` may be None) — level picker, fingerprint,
+    // public-key export QR. Public-key only: device backup is the 24
+    // recovery words, which already reconstruct this key.
+    let refresh_quantum_keys = {
+        let ui_weak = ui_weak.clone();
+        let notebooks = notebooks.clone();
+        let net = net.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let active = active.clone();
+        let app_seed = app_seed.clone();
+        let mlkem_level = mlkem_level.clone();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let qk = ui.global::<QuantumKeys>();
+            let alg = mlkem_alg_from_u8(*mlkem_level.borrow());
+            let level_idx = match alg {
+                pq::MlKemAlg::MlKem512 => 0,
+                pq::MlKemAlg::MlKem768 => 1,
+                pq::MlKemAlg::MlKem1024 => 2,
+            };
+            qk.set_level(level_idx);
+            qk.set_level_caption(mlkem_alg_describe(alg).into());
+            let ix = notebooks.borrow();
+            let net_s = net.borrow().clone();
+            let ctx = (*seed_idx.borrow(), *bip_account.borrow());
+            let meta = (*active.borrow())
+                .and_then(|acc| ix.get(acc))
+                .or_else(|| ix.visible(ctx.0, ctx.1).next())
+                .cloned();
+            drop(ix);
+            let leaf =
+                meta.as_ref().and_then(|m| derive_leaf_secret(app_seed_get(&app_seed), m, &net_s));
+            match leaf {
+                Some(leaf) => {
+                    let kp = pq::mlkem_keypair_from_leaf(&leaf, alg);
+                    qk.set_fingerprint(kp.fingerprint().into());
+                    let armor = pq::export_public(alg, kp.ek());
+                    qk.set_public_qr(qr_image(&armor));
+                    qk.set_public_armor(armor.into());
+                }
+                None => {
+                    qk.set_fingerprint("No notebook yet — create one first.".into());
+                    qk.set_public_armor("".into());
+                }
+            }
+        }
+    };
+
+    {
+        let refresh_quantum_keys = refresh_quantum_keys.clone();
+        ui.global::<Callbacks>().on_open_quantum_keys(move || {
+            refresh_quantum_keys();
+        });
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        let mlkem_level = mlkem_level.clone();
+        let persist_config = persist_config.clone();
+        let refresh_quantum_keys = refresh_quantum_keys.clone();
+        ui.global::<Callbacks>().on_quantum_key_level(move |level_idx| {
+            let Some(_ui) = ui_weak.upgrade() else { return };
+            let alg = match level_idx {
+                0 => pq::MlKemAlg::MlKem512,
+                2 => pq::MlKemAlg::MlKem1024,
+                _ => pq::MlKemAlg::MlKem768,
+            };
+            *mlkem_level.borrow_mut() = alg.id();
+            persist_config();
+            log::info!("cb: pq-key level={}", mlkem_alg_name(alg));
+            refresh_quantum_keys();
+        });
+    }
+
+    {
+        ui.global::<Callbacks>().on_quantum_keys_close(move || {});
+    }
+
     {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
@@ -2375,6 +2721,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // the "too large" dialog pops once on crossing — not on every keystroke.
     let compose_oversize = Rc::new(std::cell::Cell::new(false));
 
+    // Post-quantum Security section (pq.rs): the exact text the last
+    // `passphrase::generate()` call produced — a typed passphrase counts
+    // toward quantum resistance ONLY while it's still byte-identical to
+    // this (any edit un-certifies it). `None` until Generate is tapped.
+    let pq_generated: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
     // Keystroke cost estimator — pure arithmetic, no crypto runs (see
     // notes-core crypt::SEAL_OVERHEAD), so per-keystroke recompute is free.
     {
@@ -2388,6 +2740,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let seed_idx = seed_idx.clone();
         let bip_account = bip_account.clone();
         let active = active.clone();
+        let pq_generated = pq_generated.clone();
         ui.global::<Callbacks>().on_compose_changed(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let compose = ui.global::<Compose>();
@@ -2478,9 +2831,90 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 if directed { 1 + compose.get_to_extra().row_count() } else { 0 };
             let total_gift: u64 = gift * n_recipients as u64;
             let private = compose.get_private_note();
+
+            // Post-quantum Security section (pq.rs) — directed private
+            // single-recipient notes only (envelope validity rule: pq
+            // layers are incompatible with FLAG_MULTI). Recomputed every
+            // keystroke so the section reacts immediately to the Private
+            // toggle, an extra recipient being added, or the recipient
+            // changing underneath an already-open draft.
+            let pq_eligible = directed && private && compose.get_to_extra().row_count() == 0;
+            compose.set_pq_eligible(pq_eligible);
+            let mlkem_parsed: Option<(pq::MlKemAlg, Vec<u8>)> = if pq_eligible {
+                st.contacts
+                    .iter()
+                    .find(|c| c.address == to_address)
+                    .and_then(|c| c.mlkem_ek.as_deref())
+                    .and_then(|a| pq::import_public(a).ok())
+            } else {
+                None
+            };
+            let mlkem_available = mlkem_parsed.is_some();
+            compose.set_pq_mlkem_available(mlkem_available);
+            if (!pq_eligible || !mlkem_available) && compose.get_pq_mlkem_active() {
+                compose.set_pq_mlkem_active(false);
+            }
+            compose.set_pq_mlkem_caption(
+                if !pq_eligible {
+                    String::new()
+                } else if let Some((alg, ek)) = &mlkem_parsed {
+                    format!("{} · {}", mlkem_alg_name(*alg), pq::fingerprint(*alg, ek))
+                } else {
+                    "recipient has no quantum key — add one in Contacts".to_string()
+                }
+                .into(),
+            );
+            if !pq_eligible && compose.get_pq_passphrase_active() {
+                compose.set_pq_passphrase_active(false);
+            }
+            let pq_passphrase_active = pq_eligible && compose.get_pq_passphrase_active();
+            let pq_mlkem_active = pq_eligible && mlkem_available && compose.get_pq_mlkem_active();
+            let pq_passphrase_text = compose.get_pq_passphrase_text().to_string();
+            let pq_passphrase_verified = pq_passphrase_active
+                && !pq_passphrase_text.is_empty()
+                && pq_generated.borrow().as_deref() == Some(pq_passphrase_text.as_str());
+            compose.set_pq_passphrase_strength(
+                if !pq_passphrase_active {
+                    String::new()
+                } else if pq_passphrase_verified {
+                    format!("{:.0}-bit generated phrase", passphrase::GENERATED_BITS)
+                } else {
+                    "strength can't be verified — use Generate for a certified phrase".to_string()
+                }
+                .into(),
+            );
+            let pq_flags_guess: u8 = (if pq_passphrase_active { notes_core::envelope::FLAG_PW } else { 0 })
+                | (if pq_mlkem_active { notes_core::envelope::FLAG_MLKEM } else { 0 });
+            let pq_alg_guess = mlkem_parsed.as_ref().map(|(alg, _)| *alg);
+            let pq_extra = pq::pq_overhead(pq_flags_guess, pq_alg_guess);
+            compose.set_pq_security_label(
+                if pq_flags_guess == 0 {
+                    String::new()
+                } else {
+                    pq_security_label(
+                        private,
+                        directed,
+                        pq_passphrase_active,
+                        pq_passphrase_verified,
+                        if pq_mlkem_active { pq_alg_guess } else { None },
+                    )
+                }
+                .into(),
+            );
+
             let effective = st.effective_chunk();
-            let est = estimate_note_cost(text_len, private, effective, 1, recipient_spk_len);
-            let fit = fit_check(effective, text_len, private, recipient_spk_len);
+            // `estimate_note_cost_pq` bakes `pq::pq_overhead` into the same
+            // body_len arithmetic `estimate_note_cost` uses — byte-exact
+            // for the compose cost line whenever a pq layer is active;
+            // `(0, None)` (pq_flags_guess == 0) is never reached here.
+            let est = if pq_flags_guess != 0 {
+                estimate_note_cost_pq(
+                    text_len, effective, 1, recipient_spk_len, pq_flags_guess, pq_alg_guess,
+                )
+            } else {
+                estimate_note_cost(text_len, private, effective, 1, recipient_spk_len)
+            };
+            let fit = fit_check(effective, text_len, private, recipient_spk_len, pq_extra);
 
             // Over the per-tx broadcast ceiling (vsize > 100 kB, or > 255
             // chunks). Show it in the cost line, gate Continue, and pop the
@@ -2574,7 +3008,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             // mixed): real selected input kinds/count and real extra
             // outputs, unlike `estimate_note_cost`'s single-taproot-input
             // approximation above (used only for `fit_check`'s ceiling test).
-            let payload_lens = match payload_lens_for(text_len, private, effective) {
+            let payload_lens = match payload_lens_for(text_len, private, pq_extra, effective) {
                 Ok(v) => v,
                 Err(e) => {
                     compose.set_cost_line(e.into());
@@ -2732,6 +3166,38 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
+    // Post-quantum Security section: a typed edit un-certifies the
+    // passphrase (compose-changed recomputes `pq-passphrase-verified`
+    // from `pq_generated` vs. the current text) — this callback is just
+    // the "recompute now" trigger `edited` fires, same shape as every
+    // other compose field's `edited => { Callbacks.compose-changed(); }`.
+    {
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_pq_passphrase_changed(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            ui.global::<Callbacks>().invoke_compose_changed();
+        });
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        let pq_generated = pq_generated.clone();
+        ui.global::<Callbacks>().on_pq_generate_passphrase(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            match passphrase::generate() {
+                Ok(phrase) => {
+                    ui.global::<Compose>().set_pq_passphrase_text(phrase.clone().into());
+                    *pq_generated.borrow_mut() = Some(phrase);
+                    log::info!("cb: pq-generate bits={:.0}", passphrase::GENERATED_BITS);
+                    ui.global::<Callbacks>().invoke_compose_changed();
+                }
+                Err(e) => {
+                    log::warn!("cb: pq-generate err={e}");
+                }
+            }
+        });
+    }
+
     {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
@@ -2775,6 +3241,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let tier = compose.get_tier();
                 let rate_text = compose.get_rate_text().to_string();
                 let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
+                // Post-quantum Security section (pq.rs) — read once here;
+                // `compose-changed` already clamps these false whenever
+                // the section isn't eligible (not directed/private, an
+                // extra recipient present, or no usable recipient key).
+                let pq_passphrase_active = compose.get_pq_passphrase_active();
+                let pq_mlkem_active = compose.get_pq_mlkem_active();
+                let pq_passphrase_text = compose.get_pq_passphrase_text().to_string();
                 let st = state.borrow();
                 let id_guard = identity.borrow();
                 let pick = funding_pick.borrow().clone();
@@ -2797,6 +3270,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     Option<spending::SpendingAddress>,
                     bool,
                     bool,
+                    u8, // pq_flags: 0 = ordinary note, else FLAG_PW|FLAG_MLKEM
                 );
                 let result: Result<ComposeOut, String> = id_guard
                     .as_ref()
@@ -2839,6 +3313,44 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         let sp_participates = !pick.spending.is_empty();
                         let mode_auto = !pick.touched && !sp_participates;
 
+                        // Post-quantum layers (pq.rs) — single-recipient
+                        // directed-private notes only (envelope validity),
+                        // and notebook-funded only: the pq compose
+                        // primitives seal against `id.tweaked_seckey`
+                        // directly and have no mixed/spending-wallet
+                        // variant (unlike the ordinary/`_multi` builders).
+                        let pq_wanted = pq_passphrase_active || pq_mlkem_active;
+                        if pq_wanted && sp_participates {
+                            return Err(
+                                "Quantum-safe layers need notebook-only funding — clear the \
+                                 spending-wallet coins from \"Pay from\"."
+                                    .to_string(),
+                            );
+                        }
+                        let pq_active = pq_wanted && directed && private && extra_addrs.is_empty();
+                        let pq_mlkem_pair: Option<(pq::MlKemAlg, Vec<u8>)> = if pq_active
+                            && pq_mlkem_active
+                        {
+                            let armor = st
+                                .contacts
+                                .iter()
+                                .find(|c| c.address == to_address)
+                                .and_then(|c| c.mlkem_ek.clone())
+                                .ok_or("recipient has no quantum key — add one in Contacts")?;
+                            Some(pq::import_public(&armor).map_err(|e| e.to_string())?)
+                        } else {
+                            None
+                        };
+                        let pq_layers = pq::SealLayers {
+                            mlkem_ek: pq_mlkem_pair.as_ref().map(|(alg, ek)| (*alg, ek.as_slice())),
+                            password: (pq_active && pq_passphrase_active)
+                                .then_some(pq_passphrase_text.as_str()),
+                        };
+                        let pq_flags_out = if pq_active { pq_layers.flags() } else { 0 };
+                        if pq_flags_out != 0 {
+                            log::info!("cb: pq-compose flags={pq_flags_out}");
+                        }
+
                         if mode_auto {
                             // Byte-identical input selection to before this
                             // feature — change destination is still
@@ -2855,7 +3367,23 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 0,
                             )?;
                             let change_is_notebook = change_choice.choice != "custom";
-                            let note = if !recipients_vec.is_empty() {
+                            let note = if pq_active {
+                                let recipient = Recipient::parse(st.network(), &to_address)
+                                    .map_err(|e| e.to_string())?;
+                                compose_directed_note_pq_with_change_amount(
+                                    id,
+                                    &st.core_utxos(),
+                                    &text,
+                                    &recipient,
+                                    gift,
+                                    pq_layers,
+                                    Some(change_spk.as_slice()),
+                                    st.effective_chunk(),
+                                    rate,
+                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                    || generate_aux_rand(),
+                                )
+                            } else if !recipients_vec.is_empty() {
                                 compose_directed_note_multi_with_change(
                                     id,
                                     &st.core_utxos(),
@@ -2883,7 +3411,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 )
                             }
                             .map_err(|e| e.to_string())?;
-                            Ok((note, Vec::new(), None, change_is_notebook, false))
+                            Ok((note, Vec::new(), None, change_is_notebook, false, pq_flags_out))
                         } else if !sp_participates {
                             // Notebook-only coin control (a subset was
                             // explicitly picked, or explicitly re-confirmed).
@@ -2913,7 +3441,23 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 0,
                             )?;
                             let change_is_notebook = change_choice.choice != "custom";
-                            let note = if !recipients_vec.is_empty() {
+                            let note = if pq_active {
+                                let recipient = Recipient::parse(st.network(), &to_address)
+                                    .map_err(|e| e.to_string())?;
+                                compose_directed_note_pq_exact_amount(
+                                    id,
+                                    &inputs,
+                                    &text,
+                                    &recipient,
+                                    gift,
+                                    pq_layers,
+                                    Some(change_spk.as_slice()),
+                                    st.effective_chunk(),
+                                    rate,
+                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                    || generate_aux_rand(),
+                                )
+                            } else if !recipients_vec.is_empty() {
                                 compose_directed_note_multi_exact(
                                     id,
                                     &inputs,
@@ -2941,7 +3485,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 )
                             }
                             .map_err(|e| e.to_string())?;
-                            Ok((note, Vec::new(), None, change_is_notebook, false))
+                            Ok((note, Vec::new(), None, change_is_notebook, false, pq_flags_out))
                         } else {
                             // Spending-wallet participates (pure spending or
                             // mixed with notebook coins) — mixed builder. The
@@ -3096,12 +3640,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 change_addr,
                                 change_is_notebook,
                                 notebook_dust,
+                                0, // pq layers require notebook-only funding — guarded above
                             ))
                         }
                     });
                 ui.global::<Ui>().set_busy(false);
                 match result {
-                    Ok((note, spending_spent, spending_change_addr, change_is_notebook, notebook_dust)) => {
+                    Ok((note, spending_spent, spending_change_addr, change_is_notebook, notebook_dust, pq_flags_note)) => {
                         let chunks = note
                             .tx
                             .outputs
@@ -3297,6 +3842,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     spending_change_addr,
                                     change_is_notebook,
                                     notebook_dust,
+                                    pq_flags: pq_flags_note,
                                 });
                             }
                             Err(e) => {
@@ -3609,6 +4155,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             to: p.recipients.first().cloned(),
                             from: None,
                             recipients: p.recipients.clone(),
+                            pq_flags: p.pq_flags,
+                            // Own composed note: plaintext is already
+                            // known (it's `p.text` above) — never locked.
+                            locked: None,
                         };
 
                         // Export the signed tx for the companion to broadcast:
@@ -3750,6 +4300,34 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             set_view_qr(&view, n);
             view.set_show_qr(false);
 
+            // Post-quantum lock state (pq.rs) — mirrors the Mac app's
+            // `refresh_note_unlock_ui`: an own (sent) note carrying
+            // FLAG_MLKEM can NEVER be re-opened (the ct was encapsulated
+            // to the RECIPIENT only — checked first, unconditionally,
+            // even if FLAG_PW is also set); a received/unlockable note
+            // with FLAG_PW gets the password field; anything else locked
+            // (a received ML-KEM-only note this device somehow couldn't
+            // auto-decrypt at scan time) gets an explanatory caption only.
+            let locked = n.locked.is_some();
+            let sender_cannot_reopen =
+                locked && n.from.is_none() && n.pq_flags & notes_core::envelope::FLAG_MLKEM != 0;
+            let needs_password =
+                locked && !sender_cannot_reopen && n.pq_flags & notes_core::envelope::FLAG_PW != 0;
+            view.set_locked(locked);
+            view.set_needs_password(needs_password);
+            view.set_lock_caption(
+                if sender_cannot_reopen {
+                    "Can't re-read this note — it's sealed to the recipient's key."
+                } else if locked && !needs_password {
+                    "Sealed to a quantum key this device doesn't hold."
+                } else {
+                    ""
+                }
+                .into(),
+            );
+            view.set_unlock_password("".into());
+            view.set_unlock_error("".into());
+
             // Reply / Reply-all: a small local equivalent of notes-core's
             // `bundle::reply_set` operating on the persisted `NoteRec`
             // (plain display/UX logic, not a notes-core FROZEN invariant —
@@ -3798,6 +4376,92 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 view.get_has_qr()
             );
             ui.global::<Ui>().set_screen(2);
+        });
+    }
+
+    // Manual unlock of a locked pq note (FLAG_PW) — the note view's
+    // Unlock button. A received note tries every derived ML-KEM secret of
+    // the ACTIVE notebook alongside the typed password (covers a combined
+    // FLAG_MLKEM|FLAG_PW note, which `extract_notes_pq` never auto-tries);
+    // an own (sent) note goes through `unlock_sent` instead — already
+    // filtered to FLAG_PW-alone by `on_open_note`'s `needs_password` gate,
+    // so `unlock_sent`'s `SenderCannotReopen` is never actually reachable
+    // from here.
+    {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let fs = fs.clone();
+        let identity = identity.clone();
+        let notebooks = notebooks.clone();
+        let net = net.clone();
+        let active = active.clone();
+        let app_seed = app_seed.clone();
+        ui.global::<Callbacks>().on_unlock_note(move |password| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let id_str = ui.global::<View>().get_id().to_string();
+            let mut st = state.borrow_mut();
+            let Some(n) = st.notes.iter_mut().find(|n| n.id == id_str) else { return };
+            let Some(locked) = n.locked.clone() else { return };
+            let id_guard = identity.borrow();
+            let Some(ident) = id_guard.as_ref() else {
+                log::warn!("cb: unlock-note err=identity-unavailable");
+                return;
+            };
+            let pw = password.to_string();
+            let pw_opt = if pw.is_empty() { None } else { Some(pw.as_str()) };
+            let received = n.from.is_some();
+            let result: Result<Vec<u8>, notes_core::Error> = if received {
+                if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
+                    let ix = notebooks.borrow();
+                    let net_s = net.borrow().clone();
+                    let leaf = (*active.borrow())
+                        .and_then(|acc| ix.get(acc))
+                        .and_then(|meta| derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s));
+                    drop(ix);
+                    let mut last = notes_core::Error::DecryptFailed;
+                    let mut ok: Option<Vec<u8>> = None;
+                    if let Some(leaf) = leaf {
+                        for kp in derive_mlkem_keypairs(&leaf) {
+                            let secret = kp.secret();
+                            match pq::unlock_received(&locked, &ident.tweaked_seckey, Some(&secret), pw_opt)
+                            {
+                                Ok(pt) => {
+                                    ok = Some(pt);
+                                    break;
+                                }
+                                Err(e) => last = e,
+                            }
+                        }
+                    }
+                    ok.ok_or(last)
+                } else {
+                    pq::unlock_received(&locked, &ident.tweaked_seckey, None, pw_opt)
+                }
+            } else {
+                pq::unlock_sent(&locked, &ident.tweaked_seckey, &ident.output_x, pw_opt)
+            };
+            drop(id_guard);
+            match result {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes).to_string();
+                    n.text = text.clone();
+                    n.locked = None;
+                    log::info!("cb: unlock-note ok");
+                    save_state(&fs, &st);
+                    drop(st);
+                    let view = ui.global::<View>();
+                    view.set_text(text.into());
+                    view.set_locked(false);
+                    view.set_needs_password(false);
+                    view.set_lock_caption("".into());
+                    view.set_unlock_error("".into());
+                    view.set_unlock_password("".into());
+                }
+                Err(e) => {
+                    log::warn!("cb: unlock-note err={e}");
+                    ui.global::<View>().set_unlock_error(format!("{e}").into());
+                }
+            }
         });
     }
 
@@ -3890,6 +4554,20 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // archived notebook's input can never suppress a note in an
                 // active one.
                 let notebook_spks = wallet_notebook_spks(&ix, app_seed_get(&app_seed), &net_s, ctx);
+                // Post-quantum auto-unlock candidates: the ACTIVE notebook's
+                // three derived ML-KEM receive secrets (512/768/1024) — the
+                // only notebook whose received notes this scan could ever
+                // be decrypting (the scan itself is already scoped to `id`,
+                // this notebook's Identity). Empty when the leaf secret
+                // isn't derivable (device locked) — `extract_notes_pq` with
+                // no candidates behaves exactly like the pre-pq extraction,
+                // just leaving every pq note `locked`.
+                let mlkem_secrets: Vec<pq::MlKemSecret> =
+                    (*active.borrow()).and_then(|acc| ix.get(acc)).and_then(|meta| {
+                        derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s)
+                    }).map(|leaf| {
+                        derive_mlkem_keypairs(&leaf).into_iter().map(|kp| kp.secret()).collect()
+                    }).unwrap_or_default();
                 drop(ix);
                 let notebook_addr = id.address(st.network());
                 let self_spks: Vec<Vec<u8>> = {
@@ -3900,12 +4578,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     v
                 };
 
-                let recovered = extract_notes_multi_deduped(
+                let recovered = extract_notes_pq(
                     &bundle,
                     id,
                     st.network(),
                     &self_spks,
                     &notebook_spks,
+                    &mlkem_secrets,
                 );
                 let mut new_notes = 0usize;
                 let mut received_notes = 0usize;
@@ -3933,7 +4612,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             st.notes.push(NoteRec {
                                 id: id_hex.clone(),
                                 text: r.text.clone().unwrap_or_else(|| {
-                                    if r.received {
+                                    if r.pq_flags != 0 {
+                                        "(locked — unlock to read)".into()
+                                    } else if r.received {
                                         "(directed note — could not decrypt)".into()
                                     } else {
                                         "(sealed under another key)".into()
@@ -3956,6 +4637,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 to: r.recipient.clone(),
                                 from: r.sender.clone(),
                                 recipients: r.recipients.clone(),
+                                pq_flags: r.pq_flags,
+                                locked: r.locked.clone(),
                             });
                         }
                     }
