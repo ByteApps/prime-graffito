@@ -39,6 +39,10 @@ notes-core = { path = "notes-core" }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# post-quantum passphrase generator (src/passphrase.rs): entropy draws go
+# straight through getrandom 0.2, covered by the [patch.crates-io] TRNG
+# override above — same version pin as notes-core's own dependency.
+getrandom = "0.2"
 # KeyOS security API (vendored — see vendor/security-api/Cargo.toml header):
 # provides GetAppSeed for the notes identity + encryption keys.
 security = { path = "vendor/security-api" }
