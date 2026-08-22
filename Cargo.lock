@@ -4869,6 +4869,7 @@ name = "prime-graffito"
 version = "0.1.0"
 dependencies = [
  "foundation-themes",
+ "getrandom 0.2.10",
  "hex",
  "log",
  "notes-core",

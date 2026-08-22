@@ -88,6 +88,28 @@ fn main() {
         // "<address> <spk_hex>" so a bash caller can seed
         // notebooks.json's spending[].used entry with both fields
         // (`ui-automation/tests/graffito.sh`'s mixed-compose leg).
+        // pq-fingerprint <network> <seed_index> <account> <index> <512|768|1024>
+        // — the notebook's derived ML-KEM receive-key fingerprint, host-side.
+        // Byte-true cross-check surface for the device UI suite: the device
+        // logs the fingerprint it RENDERS (cb: pq-key fp=…) and the suite
+        // asserts equality with this independent derivation (the dense
+        // armor QR is optically unverifiable at device resolution — ~1.2px
+        // per module — so the fingerprint, not zbarimg, is the proof).
+        Some("pq-fingerprint") => {
+            let network = Network::from_str_opt(&args[2]).expect("network");
+            let seed_index: u32 = args[3].parse().expect("seed index");
+            let account: u32 = args[4].parse().expect("account");
+            let index: u32 = args[5].parse().expect("index");
+            let alg = match args[6].as_str() {
+                "512" => notes_core::pq::MlKemAlg::MlKem512,
+                "1024" => notes_core::pq::MlKemAlg::MlKem1024,
+                _ => notes_core::pq::MlKemAlg::MlKem768,
+            };
+            let leaf = notes_core::seeds::derive_leaf(&app_seed(), seed_index, network, account, index)
+                .expect("derive leaf");
+            let kp = notes_core::pq::mlkem_keypair_from_leaf(&leaf, alg);
+            println!("{}", kp.fingerprint());
+        }
         Some("spending-address") => {
             // spending-address <network> <seed_index> <account> <chain> <index>
             let network = Network::from_str_opt(&args[2]).expect("network");
