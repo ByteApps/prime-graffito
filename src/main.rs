@@ -2745,99 +2745,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let Some(ui) = ui_weak.upgrade() else { return };
             let compose = ui.global::<Compose>();
             let st = state.borrow();
-            // Tier pills drive the rate field; a manual edit set tier=3
-            // first, so we never overwrite the user's custom value.
-            let tier = compose.get_tier();
-            if tier != 3 {
-                compose.set_rate_text(format!("{}", st.fee_rate(tier)).into());
-            }
-            let rate = match resolve_rate(tier, compose.get_rate_text().as_str(), &st) {
-                Ok(r) => r,
-                Err(e) => {
-                    compose.set_cost_line(e.into());
-                    compose.set_can_continue(false);
-                    return;
-                }
-            };
-            // Keyboard Done: the system keyboard's Done key has no distinct
-            // signal — it sends a plain '\n' (gui-app-keyboard maps
-            // KeyAction::Return to Key::Char('\n')). A note is composed as
-            // one paragraph on-device, so ANY newline here means "done
-            // typing": strip it and bump dismiss-nonce, which the editor
-            // watches to drop focus (focus loss hides the keyboard).
-            let raw = compose.get_text();
-            if raw.as_str().contains('\n') {
-                let stripped: String = raw.as_str().replace('\n', "");
-                compose.set_text(stripped.into());
-                compose.set_dismiss_nonce(compose.get_dismiss_nonce() + 1);
-                log::info!("cb: compose keyboard-done");
-            }
-            let text = compose.get_text();
-            let text_len = text.as_str().len();
-            if text_len == 0 {
-                compose.set_cost_line("Type to see the cost.".into());
-                compose.set_can_continue(false);
-                compose_oversize.set(false); // clearing the draft re-arms the dialog
-                return;
-            }
-            let ix = notebooks.borrow();
-            let ctx = notebook_ctx(&ix, *active.borrow())
-                .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
-            let net_s = net.borrow().clone();
-            let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
-            drop(ix);
-            if st.utxos.is_empty() && section.as_ref().map(|s| s.balance()).unwrap_or(0) == 0 {
-                compose
-                    .set_cost_line("No funds — fund the address and import a sync bundle.".into());
-                compose.set_can_continue(false);
-                return;
-            }
-            // Directed = non-empty To field. Validate the recipient like
-            // resolve_rate validates the rate — errors land in the cost
-            // line, never a panic.
             let to_address = compose.get_to_address().trim().to_string();
             let directed = !to_address.is_empty();
-            let recipient_spk_len = if directed {
-                match Recipient::parse(st.network(), &to_address) {
-                    Ok(r) => {
-                        if compose.get_private_note() && r.p2tr_x.is_none() {
-                            compose.set_cost_line(
-                                "Private directed notes need a taproot (…1p…) recipient — or switch to Public.".into(),
-                            );
-                            compose.set_can_continue(false);
-                            return;
-                        }
-                        Some(r.spk.len())
-                    }
-                    Err(_) => {
-                        compose.set_cost_line(
-                            format!("Enter a valid {} recipient address.", st.network).into(),
-                        );
-                        compose.set_can_continue(false);
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-            let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
-            // Recipient count for THIS draft (primary + every "+ Add
-            // recipient" row); 0 for a self-note. Each recipient gets the
-            // SAME gift amount, so the real sats leaving to recipients is
-            // `gift * n_recipients`, not `gift` alone — the balance checks
-            // and cost-line suffix below both need the total, not the
-            // per-recipient amount.
-            let n_recipients: usize =
-                if directed { 1 + compose.get_to_extra().row_count() } else { 0 };
-            let total_gift: u64 = gift * n_recipients as u64;
             let private = compose.get_private_note();
-
-            // Post-quantum Security section (pq.rs) — directed private
-            // single-recipient notes only (envelope validity rule: pq
-            // layers are incompatible with FLAG_MULTI). Recomputed every
-            // keystroke so the section reacts immediately to the Private
-            // toggle, an extra recipient being added, or the recipient
-            // changing underneath an already-open draft.
+            // HOISTED to the handler TOP (2026-08-21): every early return below
+            // (bad rate, empty text, "No funds", recipient-parse) must NOT skip
+            // the pq section's visibility recompute — the "No funds"
+            // and recipient-parse branches return before the cost math, and
+            // the pq section's visibility must never depend on funding —
+            // an unfunded notebook still shows (and toggles) the Security
+            // section, exactly like the Mac app.
             let pq_eligible = directed && private && compose.get_to_extra().row_count() == 0;
             compose.set_pq_eligible(pq_eligible);
             let mlkem_parsed: Option<(pq::MlKemAlg, Vec<u8>)> = if pq_eligible {
@@ -2901,6 +2818,96 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 }
                 .into(),
             );
+            // Tier pills drive the rate field; a manual edit set tier=3
+            // first, so we never overwrite the user's custom value.
+            let tier = compose.get_tier();
+            if tier != 3 {
+                compose.set_rate_text(format!("{}", st.fee_rate(tier)).into());
+            }
+            let rate = match resolve_rate(tier, compose.get_rate_text().as_str(), &st) {
+                Ok(r) => r,
+                Err(e) => {
+                    compose.set_cost_line(e.into());
+                    compose.set_can_continue(false);
+                    return;
+                }
+            };
+            // Keyboard Done: the system keyboard's Done key has no distinct
+            // signal — it sends a plain '\n' (gui-app-keyboard maps
+            // KeyAction::Return to Key::Char('\n')). A note is composed as
+            // one paragraph on-device, so ANY newline here means "done
+            // typing": strip it and bump dismiss-nonce, which the editor
+            // watches to drop focus (focus loss hides the keyboard).
+            let raw = compose.get_text();
+            if raw.as_str().contains('\n') {
+                let stripped: String = raw.as_str().replace('\n', "");
+                compose.set_text(stripped.into());
+                compose.set_dismiss_nonce(compose.get_dismiss_nonce() + 1);
+                log::info!("cb: compose keyboard-done");
+            }
+            let text = compose.get_text();
+            let text_len = text.as_str().len();
+            if text_len == 0 {
+                compose.set_cost_line("Type to see the cost.".into());
+                compose.set_can_continue(false);
+                compose_oversize.set(false); // clearing the draft re-arms the dialog
+                return;
+            }
+            let ix = notebooks.borrow();
+            let ctx = notebook_ctx(&ix, *active.borrow())
+                .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
+            let net_s = net.borrow().clone();
+            let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
+            drop(ix);
+            if st.utxos.is_empty() && section.as_ref().map(|s| s.balance()).unwrap_or(0) == 0 {
+                compose
+                    .set_cost_line("No funds — fund the address and import a sync bundle.".into());
+                compose.set_can_continue(false);
+                return;
+            }
+            // Directed = non-empty To field. Validate the recipient like
+            // resolve_rate validates the rate — errors land in the cost
+            // line, never a panic.
+            let recipient_spk_len = if directed {
+                match Recipient::parse(st.network(), &to_address) {
+                    Ok(r) => {
+                        if compose.get_private_note() && r.p2tr_x.is_none() {
+                            compose.set_cost_line(
+                                "Private directed notes need a taproot (…1p…) recipient — or switch to Public.".into(),
+                            );
+                            compose.set_can_continue(false);
+                            return;
+                        }
+                        Some(r.spk.len())
+                    }
+                    Err(_) => {
+                        compose.set_cost_line(
+                            format!("Enter a valid {} recipient address.", st.network).into(),
+                        );
+                        compose.set_can_continue(false);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
+            // Recipient count for THIS draft (primary + every "+ Add
+            // recipient" row); 0 for a self-note. Each recipient gets the
+            // SAME gift amount, so the real sats leaving to recipients is
+            // `gift * n_recipients`, not `gift` alone — the balance checks
+            // and cost-line suffix below both need the total, not the
+            // per-recipient amount.
+            let n_recipients: usize =
+                if directed { 1 + compose.get_to_extra().row_count() } else { 0 };
+            let total_gift: u64 = gift * n_recipients as u64;
+
+            // Post-quantum Security section (pq.rs) — directed private
+            // single-recipient notes only (envelope validity rule: pq
+            // layers are incompatible with FLAG_MULTI). Recomputed every
+            // keystroke so the section reacts immediately to the Private
+            // toggle, an extra recipient being added, or the recipient
+            // changing underneath an already-open draft.
 
             let effective = st.effective_chunk();
             // `estimate_note_cost_pq` bakes `pq::pq_overhead` into the same
