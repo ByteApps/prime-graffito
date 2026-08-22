@@ -10,7 +10,9 @@
 // 23 = public-keys export, 24 = private-keys export (see Recovery below),
 // 25 = Pay-from (funding-unification: notebook / spending-wallet coin
 //      picker, reached from a compose nav row), 26 = Change (destination
-//      picker for the compose in progress).
+//      picker for the compose in progress), 27 = Quantum keys (post-
+//      quantum ML-KEM level picker + this notebook's public key QR, see
+//      QuantumKeys below).
 
 export global Ui {
     in-out property <int> screen: 0;
@@ -79,6 +81,26 @@ export global Compose {
     in-out property <string> pay-from-balance: "";            // "12,340 sats · 3 coin(s)"
     // Change (screen 26): compact nav row summary.
     in-out property <string> change-label: "back to you";
+
+    // ---- Post-quantum Security section (pq.rs FLAG_PW/FLAG_MLKEM) ----
+    // Shown ONLY for a directed private single-recipient draft (envelope
+    // validity: incompatible with FLAG_MULTI). Passphrase (Argon2id) and
+    // ML-KEM hybrid layers are composable — both, either, or neither.
+    in-out property <bool> pq-eligible: false;
+    // True once the resolved recipient's contact carries a usable
+    // (parseable) ML-KEM public key — gates the ML-KEM pill.
+    in-out property <bool> pq-mlkem-available: false;
+    in-out property <bool> pq-mlkem-active: false;
+    // "ML-KEM-768 · xxxx xxxx xxxx xxxx" when available, else an
+    // explanation ("recipient has no quantum key — add one in Contacts").
+    in-out property <string> pq-mlkem-caption: "";
+    in-out property <bool> pq-passphrase-active: false;
+    in-out property <string> pq-passphrase-text: "";
+    // "strength can't be verified — use Generate" (typed) or "132-bit
+    // generated phrase" (fresh, byte-unmodified Generate output).
+    in-out property <string> pq-passphrase-strength: "";
+    // The security_label status line — "" while neither layer is active.
+    in-out property <string> pq-security-label: "";
 }
 
 export global Confirm {
@@ -150,6 +172,10 @@ export struct ContactRow {
     name: string,     // "" = unnamed
     label: string,    // name, or short address (Rust-formatted)
     meta: string,     // short address (Rust-formatted)
+    // "" = no quantum key on file; else "ML-KEM-768 · xxxx xxxx xxxx xxxx"
+    // — doubles as the PQ badge condition (non-"") and the naming modal's
+    // caption.
+    pq-caption: string,
 }
 
 export global Contacts {
@@ -176,6 +202,11 @@ export global Contacts {
     in-out property <string> naming-address: "";
     in-out property <string> naming-label: "";   // "Name for <short addr>"
     in-out property <string> name-text: "";      // the name being edited
+    // Quantum key ("Scan quantum key" in the naming modal): "" = none on
+    // file, else "ML-KEM-768 · xxxx xxxx xxxx xxxx" (set from the row's
+    // pq-caption on open, refreshed on a successful scan).
+    in-out property <string> naming-pq-caption: "";
+    in-out property <string> naming-pq-error: "";
 }
 
 export global View {
@@ -194,6 +225,20 @@ export global View {
     // them. Both computed by on-open-note from the note's from/recipients.
     in-out property <string> reply-address: "";
     in-out property <[string]> reply-set;
+
+    // Post-quantum lock state (pq.rs) — set by open-note from the note's
+    // persisted pq_flags/locked fields.
+    in-out property <bool> locked: false;
+    // FLAG_PW is set and this isn't the sender-cannot-reopen case below —
+    // show the passphrase field + Unlock button.
+    in-out property <bool> needs-password: false;
+    // Explanatory caption for a locked note with NO manual unlock path:
+    // an own (sent) ML-KEM note ("sealed to the recipient's key") or a
+    // received ML-KEM-only note this device couldn't auto-decrypt
+    // ("sealed to a quantum key this device doesn't hold"). "" otherwise.
+    in-out property <string> lock-caption: "";
+    in-out property <string> unlock-password: "";
+    in-out property <string> unlock-error: "";
 }
 
 // A bundle file found in an inbox, for the import picker.
@@ -297,6 +342,19 @@ export global Settings {
     // deposit straight to a not-yet-shown address).
     in-out property <string> spending-window-text: "";
     in-out property <image> spending-window-qr;
+}
+
+// Screen 27 — Quantum keys: the active notebook's post-quantum (ML-KEM)
+// receive identity. Public-key export only — device backup is the 24
+// recovery words (Settings → "Recovery words…"), which already
+// reconstructs every derived key including this one, so a separate
+// private-key export is deliberately not offered here.
+export global QuantumKeys {
+    in-out property <int> level: 1;   // 0 = ML-KEM-512 · 1 = 768 · 2 = 1024
+    in-out property <string> level-caption: "";  // describe() text for the picked level
+    in-out property <string> fingerprint: "";
+    in-out property <image> public-qr;
+    in-out property <string> public-armor;
 }
 
 // One coin on the Pay-from screen (screen 25) — a notebook OR spending-
@@ -483,4 +541,15 @@ export global Callbacks {
     // Reply / Reply-all (note view, screen 2).
     callback reply-to-note();      // View.reply-address → fresh compose draft
     callback reply-all-to-note();  // View.reply-set → fresh compose draft, all addressed
+
+    // Post-quantum layers (pq.rs) — locked-note unlock (screen 2), compose
+    // Security section (screen 3), contact quantum-key scan, Quantum-keys
+    // settings screen (27).
+    callback unlock-note(string);         // typed passphrase → pq::unlock_received/_sent
+    callback pq-passphrase-changed();     // typed edit → re-derive verified/strength
+    callback pq-generate-passphrase();    // "Generate" → a fresh certified 12-word phrase
+    callback scan-contact-pq();           // naming modal "Scan quantum key" → system scanner
+    callback open-quantum-keys();         // Settings → screen 27
+    callback quantum-key-level(int);      // level pill tapped → re-derive fingerprint/QR
+    callback quantum-keys-close();        // Back → settings
 }

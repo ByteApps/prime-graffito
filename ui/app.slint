@@ -1,8 +1,8 @@
 import { Theme, UISize, ButtonVariant, ButtonState, ControlSize, Images } from "@ui/theme.slint";
-import { Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, ConfirmRow, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow, Funding, FundingCoinRow, ChangePick } from "callbacks.slint";
+import { Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, ConfirmRow, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow, Funding, FundingCoinRow, ChangePick, QuantumKeys } from "callbacks.slint";
 import { Button } from "@ui/button.slint";
 
-export { Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, Theme, ButtonVariant, ButtonState, ControlSize, Images }
+export { Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, Theme, ButtonVariant, ButtonState, ControlSize, Images }
 
 component PrimaryAction inherits Button {
     background: Theme.palette-primary;
@@ -325,6 +325,22 @@ component ContactEntry inherits Rectangle {
                 font-family: "SourceCodePro";
                 font-size: 13px;
                 overflow: elide;
+            }
+        }
+        if root.entry.pq-caption != "": Rectangle {
+            width: 30px;
+            border-radius: 8px;
+            background: Theme.palette-primary;
+            Text {
+                text: "PQ";
+                color: #ffffff;
+                font-family: "Montserrat";
+                font-size: 11px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
             }
         }
         Rectangle {
@@ -722,6 +738,72 @@ export component AppWindow inherits Window {
                 wrap: char-wrap;
             }
 
+            // Post-quantum lock state (pq.rs). Exactly one of the three
+            // blocks below shows: an explanatory caption (no manual unlock
+            // possible), a password field + Unlock (FLAG_PW), or neither
+            // when the note isn't locked.
+            if View.locked && View.lock-caption != "": Text {
+                vertical-stretch: 0;
+                text: View.lock-caption;
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+            if View.locked && View.needs-password: VerticalLayout {
+                vertical-stretch: 0;
+                spacing: 6px;
+                Text {
+                    text: "This note needs a password to unlock.";
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    height: 44px;
+                    spacing: 8px;
+                    Rectangle {
+                        height: 44px;
+                        horizontal-stretch: 1;
+                        background: Theme.palette-surface;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: unlock-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                        clip: true;
+                        unlock-input := TextInput {
+                            x: 14px;
+                            width: parent.width - 28px;
+                            height: 24px;
+                            y: (parent.height - self.height) / 2;
+                            text <=> View.unlock-password;
+                            color: Theme.palette-foreground;
+                            font-family: "SourceCodePro";
+                            font-size: 16px;
+                            single-line: true;
+                            input-type: password;
+                            accepted => { self.clear-focus(); Callbacks.unlock-note(View.unlock-password); }
+                        }
+                    }
+                    PillOption {
+                        width: 90px;
+                        label: "Unlock";
+                        selected: true;
+                        tapped => {
+                            unlock-input.clear-focus();
+                            Callbacks.unlock-note(View.unlock-password);
+                        }
+                    }
+                }
+                if View.unlock-error != "": Text {
+                    text: View.unlock-error;
+                    color: Theme.palette-danger;
+                    font-family: "Montserrat";
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+
             if View.reply-address != "" || View.reply-set.length > 1: HorizontalLayout {
                 vertical-stretch: 0;
                 spacing: 8px;
@@ -1001,6 +1083,105 @@ export component AppWindow inherits Window {
                             edited => { Callbacks.compose-changed(); }
                             accepted => { self.clear-focus(); }
                         }
+                    }
+                }
+            }
+
+            // Post-quantum Security section — directed private single-
+            // recipient notes only (envelope validity: pq::SealLayers
+            // needs FLAG_DIRECTED|FLAG_PRIVATE, incompatible with
+            // FLAG_MULTI). Passphrase (Argon2id) and ML-KEM hybrid layers
+            // are independently toggleable and composable.
+            if Compose.pq-eligible: Rectangle {
+                vertical-stretch: 0;
+                border-radius: 12px;
+                background: Theme.palette-surface;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                height: security-col.preferred-height;
+                security-col := VerticalLayout {
+                    padding: 10px;
+                    spacing: 8px;
+                    Text {
+                        text: "Quantum-safe security";
+                        color: Theme.palette-foreground;
+                        font-family: "Montserrat";
+                        font-size: 14px;
+                        font-weight: 600;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        PillOption {
+                            label: "Passphrase";
+                            selected: Compose.pq-passphrase-active;
+                            horizontal-stretch: 1;
+                            tapped => {
+                                Compose.pq-passphrase-active = !Compose.pq-passphrase-active;
+                                Callbacks.compose-changed();
+                            }
+                        }
+                        PillOption {
+                            label: "ML-KEM";
+                            selected: Compose.pq-mlkem-active;
+                            horizontal-stretch: 1;
+                            opacity: Compose.pq-mlkem-available ? 1.0 : 0.4;
+                            tapped => {
+                                Compose.pq-mlkem-active = !Compose.pq-mlkem-active;
+                                Callbacks.compose-changed();
+                            }
+                        }
+                    }
+                    if Compose.pq-passphrase-active: HorizontalLayout {
+                        height: 44px;
+                        spacing: 8px;
+                        Rectangle {
+                            height: 44px;
+                            horizontal-stretch: 1;
+                            background: Theme.palette-background;
+                            border-radius: 12px;
+                            border-width: 1px;
+                            border-color: pq-pass-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                            clip: true;
+                            pq-pass-input := TextInput {
+                                x: 14px;
+                                width: parent.width - 28px;
+                                height: 24px;
+                                y: (parent.height - self.height) / 2;
+                                text <=> Compose.pq-passphrase-text;
+                                color: Theme.palette-foreground;
+                                font-family: "SourceCodePro";
+                                font-size: 15px;
+                                single-line: true;
+                                edited => { Callbacks.pq-passphrase-changed(); }
+                                accepted => { self.clear-focus(); }
+                            }
+                        }
+                        SecondaryAction {
+                            width: 90px;
+                            text: "Generate";
+                            clicked => { Callbacks.pq-generate-passphrase(); }
+                        }
+                    }
+                    if Compose.pq-passphrase-active: Text {
+                        text: Compose.pq-passphrase-strength;
+                        color: Theme.palette-muted;
+                        font-family: "SourceCodePro";
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    if Compose.pq-mlkem-active || !Compose.pq-mlkem-available: Text {
+                        text: Compose.pq-mlkem-caption;
+                        color: Theme.palette-muted;
+                        font-family: "SourceCodePro";
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    if Compose.pq-security-label != "": Text {
+                        text: Compose.pq-security-label;
+                        color: Theme.palette-primary;
+                        font-family: "SourceCodePro";
+                        font-size: 12px;
+                        wrap: word-wrap;
                     }
                 }
             }
@@ -1802,6 +1983,15 @@ export component AppWindow inherits Window {
                 width: 100%;
                 text: "Accounts…";
                 clicked => { Ui.screen = 21; }
+            }
+
+            // Post-quantum (pq.rs): this notebook's ML-KEM receive
+            // identity — level picker, fingerprint, public-key QR to hand
+            // to a contact. Public-key export only.
+            SecondaryAction {
+                width: 100%;
+                text: "Quantum keys…";
+                clicked => { Callbacks.open-quantum-keys(); Ui.screen = 27; }
             }
 
             // Spending wallet (funding-unification): an optional BIP-84
@@ -2684,6 +2874,108 @@ export component AppWindow inherits Window {
             Rectangle { vertical-stretch: 1; }
         }
 
+        // --------------------------------- screen 27: Quantum keys (pq.rs)
+        // This notebook's post-quantum (ML-KEM) receive identity: level
+        // picker, fingerprint, and a scannable QR of the armored public
+        // key for a contact to import. Public-key export only — the 24
+        // recovery words (Settings → "Recovery words…") already
+        // reconstruct every derived key, so no separate private-key
+        // export lives here.
+        if Ui.screen == 27: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 12px;
+
+            ScreenHeader {
+                title: "Quantum keys";
+                back => { Callbacks.quantum-keys-close(); Ui.screen = 6; }
+            }
+
+            Text {
+                text: "This notebook's ML-KEM receive key — derived from your seed, same on every device restored from it. Share the QR with a contact so they can send you quantum-resistant directed notes.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                PillOption {
+                    label: "512";
+                    selected: QuantumKeys.level == 0;
+                    horizontal-stretch: 1;
+                    tapped => { Callbacks.quantum-key-level(0); }
+                }
+                PillOption {
+                    label: "768";
+                    selected: QuantumKeys.level == 1;
+                    horizontal-stretch: 1;
+                    tapped => { Callbacks.quantum-key-level(1); }
+                }
+                PillOption {
+                    label: "1024";
+                    selected: QuantumKeys.level == 2;
+                    horizontal-stretch: 1;
+                    tapped => { Callbacks.quantum-key-level(2); }
+                }
+            }
+            Text {
+                text: QuantumKeys.level-caption;
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: "Fingerprint";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                font-weight: 600;
+            }
+            Rectangle {
+                background: Theme.palette-surface;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                VerticalLayout {
+                    padding: 12px;
+                    Text {
+                        text: QuantumKeys.fingerprint;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 15px;
+                        wrap: char-wrap;
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                alignment: center;
+                Image {
+                    source: QuantumKeys.public-qr;
+                    width: 176px;
+                    height: 176px;
+                    image-rendering: pixelated;
+                }
+            }
+            Text {
+                text: "This is your PUBLIC key — safe to share. Your device backup is the 24 recovery words (Settings → \"Recovery words…\"), which reconstruct this key too.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+
         // ------------------------------------ screen 7: contacts (send-to)
         // The one input slot doubles as manual address entry and, when a
         // row's "name" zone was tapped, the contact-name editor. Errors go
@@ -2828,6 +3120,8 @@ export component AppWindow inherits Window {
                             Contacts.naming-address = entry.address;
                             Contacts.name-text = entry.name;
                             Contacts.naming-label = "Name for " + entry.meta;
+                            Contacts.naming-pq-caption = entry.pq-caption;
+                            Contacts.naming-pq-error = "";
                         }
                     }
                 }
@@ -3085,7 +3379,7 @@ export component AppWindow inherits Window {
                 x: 24px;
                 y: 90px + UISize.control-center-status-bar-height;
                 width: parent.width - 48px;
-                height: 176px;
+                height: 254px;
                 background: Theme.palette-surface;
                 border-radius: 16px;
                 border-width: 1px;
@@ -3133,6 +3427,25 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                         }
                     }
+                    // Quantum key (pq.rs): scan an armored ML-KEM public
+                    // key for this contact — enables the ML-KEM layer on
+                    // directed private notes addressed to them.
+                    Text {
+                        height: 16px;
+                        text: Contacts.naming-pq-error != "" ? Contacts.naming-pq-error
+                            : Contacts.naming-pq-caption != "" ? Contacts.naming-pq-caption
+                            : "No quantum key on file";
+                        color: Contacts.naming-pq-error != "" ? Theme.palette-danger : Theme.palette-muted;
+                        font-family: "SourceCodePro";
+                        font-size: 12px;
+                        overflow: elide;
+                    }
+                    SecondaryAction {
+                        height: 40px;
+                        width: 100%;
+                        text: "Scan quantum key";
+                        clicked => { Callbacks.scan-contact-pq(); }
+                    }
                     HorizontalLayout {
                         height: 48px;
                         spacing: 8px;
@@ -3142,6 +3455,8 @@ export component AppWindow inherits Window {
                             clicked => {
                                 Contacts.naming-address = "";
                                 Contacts.name-text = "";
+                                Contacts.naming-pq-caption = "";
+                                Contacts.naming-pq-error = "";
                             }
                         }
                         PrimaryAction {
