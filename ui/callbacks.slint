@@ -12,7 +12,11 @@
 //      picker, reached from a compose nav row), 26 = Change (destination
 //      picker for the compose in progress), 27 = Quantum keys (post-
 //      quantum ML-KEM level picker + this notebook's public key QR, see
-//      QuantumKeys below).
+//      QuantumKeys below), 28 = My quantum key — a single, NON-seed-
+//      derived personal ML-KEM keypair (generate/import, fingerprint,
+//      export QRs, replace/delete; see DeviceQuantumKey below). Distinct
+//      from 27: that screen's keys are seed-derived (one per notebook);
+//      this screen's key has no seed ancestry at all.
 
 export global Ui {
     in-out property <int> screen: 0;
@@ -390,6 +394,40 @@ export global QuantumKeys {
     in-out property <string> nb-name: "";
 }
 
+// Screen 28 — My quantum key: a single, non-seed-derived personal ML-KEM
+// keypair (PLAN-graffito-quantum-key.md). `view` picks which panel of the
+// "key present" state is shown ("" = summary/buttons, "public" = share
+// QR, "private-warn" = the reveal warning step, "private" = the export
+// QR/text) — meaningless while `has-key` is false, when the screen shows
+// the generate-or-import form instead.
+export global DeviceQuantumKey {
+    in-out property <bool> has-key: false;
+    in-out property <string> fingerprint: "";
+    in-out property <string> level-name: "";   // "ML-KEM-768" once has-key
+    in-out property <string> view: "";         // "" | "public" | "private-warn" | "private"
+    in-out property <bool> qr-zoom: false;
+
+    // ---- Generate/import form (shown while !has-key) ----
+    in-out property <int> gen-level: 1;        // 0 = 512 · 1 = 768 (default) · 2 = 1024
+    in-out property <string> gen-level-caption: "";
+    in-out property <string> gen-extra-text: "";
+    in-out property <string> gen-error: "";
+    in-out property <string> import-error: "";
+
+    // ---- Share public key (view == "public") ----
+    in-out property <image> public-qr;
+    in-out property <string> public-armor: "";
+
+    // ---- Export private key (view == "private-warn" / "private") ----
+    in-out property <bool> private-fits-qr: true;
+    in-out property <image> private-qr;
+    in-out property <string> private-armor: "";
+
+    // ---- Replace / Delete confirm dialogs ----
+    in-out property <bool> show-replace-confirm: false;
+    in-out property <bool> show-delete-confirm: false;
+}
+
 // One coin on the Pay-from screen (screen 25) — a notebook OR spending-
 // wallet UTXO with a stable key for the toggle callback.
 export struct FundingCoinRow {
@@ -582,4 +620,16 @@ export global Callbacks {
     callback quantum-key-pick-notebook(int); // notebook row tapped → re-derive for that index
     callback quantum-keys-close();        // Back → settings
     callback quantum-qr-zoom(bool);       // fullscreen QR opened/closed (log only)
+
+    // Personal device quantum key (PLAN-graffito-quantum-key.md, screen 28).
+    callback open-device-quantum-key();          // Settings → screen 28
+    callback device-quantum-key-close();         // Back → settings; wipes the private view
+    callback device-quantum-key-gen-level(int);  // generate-form level pill
+    callback device-quantum-key-generate();      // Generate button
+    callback device-quantum-key-import();        // "Import…" → system scanner
+    callback device-quantum-key-reveal-private(); // warning "I understand" → compute + show
+    callback device-quantum-key-hide-private();  // Close on the private view → summary
+    callback device-quantum-key-replace-confirm(); // Replace dialog confirm → delete + reset
+    callback device-quantum-key-delete-confirm();  // Delete dialog confirm
+    callback device-quantum-key-qr-zoom(bool);   // fullscreen QR opened/closed (log only)
 }

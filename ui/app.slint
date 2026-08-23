@@ -1,8 +1,8 @@
 import { Theme, UISize, ButtonVariant, ButtonState, ControlSize, Images } from "@ui/theme.slint";
-import { Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, ConfirmRow, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow, Funding, FundingCoinRow, ChangePick, QuantumKeys } from "callbacks.slint";
+import { Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, ConfirmRow, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow, Funding, FundingCoinRow, ChangePick, QuantumKeys, DeviceQuantumKey } from "callbacks.slint";
 import { Button } from "@ui/button.slint";
 
-export { Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, Theme, ButtonVariant, ButtonState, ControlSize, Images }
+export { Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, DeviceQuantumKey, Theme, ButtonVariant, ButtonState, ControlSize, Images }
 
 component PrimaryAction inherits Button {
     background: Theme.palette-primary;
@@ -2035,6 +2035,17 @@ export component AppWindow inherits Window {
                 clicked => { Callbacks.open-quantum-keys(); Ui.screen = 27; }
             }
 
+            // Personal device quantum key (PLAN-graffito-quantum-key.md):
+            // a single NON-seed-derived ML-KEM keypair — generate/import,
+            // export, replace, delete. Distinct from "Quantum keys…"
+            // above (those are per-notebook and seed-derived); this one
+            // is what a private SELF-note's ML-KEM pill seals against.
+            SecondaryAction {
+                width: 100%;
+                text: "Quantum key…";
+                clicked => { Callbacks.open-device-quantum-key(); Ui.screen = 28; }
+            }
+
             // Spending wallet (funding-unification): an optional BIP-84
             // native-segwit wallet (same seed) that holds funds instead of
             // the notebook, scoped to the active (network, seed, account).
@@ -3113,6 +3124,361 @@ export component AppWindow inherits Window {
             }
         }
 
+        // -------------------------------- screen 28: my quantum key
+        // PLAN-graffito-quantum-key.md: a single, NON-seed-derived
+        // personal ML-KEM keypair — generate-or-import while none exists,
+        // else fingerprint + share/export/replace/delete. `DeviceQuantumKey
+        // .view` picks which panel of the "key present" state shows.
+        if Ui.screen == 28: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 0;
+            spacing: 12px;
+
+            ScreenHeader {
+                title: "My quantum key";
+                back => { Callbacks.device-quantum-key-close(); Ui.screen = 6; }
+            }
+
+            Flickable {
+                vertical-stretch: 1;
+                viewport-width: self.width;
+                viewport-height: dqk-content.preferred-height;
+                dqk-content := VerticalLayout {
+                    spacing: 12px;
+                    padding-bottom: 24px;
+
+                    // ---- No key yet: generate or import ----
+                    if !DeviceQuantumKey.has-key: VerticalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "A personal quantum key, separate from your seed. It is NOT recovered by your 24 recovery words, and it dies if this app is ever uninstalled — losing it loses every note sealed to it. Export a backup once you've created one.";
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+
+                        Text {
+                            text: "Level:";
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 13px;
+                            font-weight: 600;
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            PillOption {
+                                label: "512";
+                                selected: DeviceQuantumKey.gen-level == 0;
+                                horizontal-stretch: 1;
+                                tapped => { Callbacks.device-quantum-key-gen-level(0); }
+                            }
+                            PillOption {
+                                label: "768";
+                                selected: DeviceQuantumKey.gen-level == 1;
+                                horizontal-stretch: 1;
+                                tapped => { Callbacks.device-quantum-key-gen-level(1); }
+                            }
+                            PillOption {
+                                label: "1024";
+                                selected: DeviceQuantumKey.gen-level == 2;
+                                horizontal-stretch: 1;
+                                tapped => { Callbacks.device-quantum-key-gen-level(2); }
+                            }
+                        }
+                        Text {
+                            text: (DeviceQuantumKey.gen-level == 1 ? "Recommended. " : "") + DeviceQuantumKey.gen-level-caption;
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        Text {
+                            text: "Optional: type anything — a passphrase, dice rolls. Mixed WITH the device's hardware randomness; it can only add strength, never replace it.";
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle {
+                            height: 44px;
+                            background: Theme.palette-surface;
+                            border-radius: 12px;
+                            border-width: 1px;
+                            border-color: dqk-extra-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                            clip: true;
+                            dqk-extra-input := TextInput {
+                                x: 14px;
+                                width: parent.width - 28px;
+                                height: 24px;
+                                y: (parent.height - self.height) / 2;
+                                text <=> DeviceQuantumKey.gen-extra-text;
+                                color: Theme.palette-foreground;
+                                font-family: "SourceCodePro";
+                                font-size: 16px;
+                                single-line: true;
+                                accepted => { self.clear-focus(); }
+                            }
+                        }
+
+                        if DeviceQuantumKey.gen-error != "": Text {
+                            text: DeviceQuantumKey.gen-error;
+                            color: Theme.palette-danger;
+                            font-family: "Montserrat";
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+
+                        PrimaryAction {
+                            width: 100%;
+                            text: "Generate";
+                            clicked => { Callbacks.device-quantum-key-generate(); }
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            background: Theme.palette-border;
+                        }
+
+                        SecondaryAction {
+                            width: 100%;
+                            text: "Import…";
+                            clicked => { Callbacks.device-quantum-key-import(); }
+                        }
+                        Text {
+                            text: "From a backup, another device's export, or the graffito Mac app — the PRIVATE key armor, not the public one.";
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        if DeviceQuantumKey.import-error != "": Text {
+                            text: DeviceQuantumKey.import-error;
+                            color: Theme.palette-danger;
+                            font-family: "Montserrat";
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    // ---- Key present: summary + actions ----
+                    if DeviceQuantumKey.has-key && DeviceQuantumKey.view == "": VerticalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "Fingerprint";
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 13px;
+                            font-weight: 600;
+                        }
+                        Rectangle {
+                            background: Theme.palette-surface;
+                            border-radius: 12px;
+                            border-width: 1px;
+                            border-color: Theme.palette-border;
+                            VerticalLayout {
+                                padding: 12px;
+                                spacing: 4px;
+                                Text {
+                                    text: DeviceQuantumKey.level-name;
+                                    color: Theme.palette-muted;
+                                    font-family: "Montserrat";
+                                    font-size: 12px;
+                                    font-weight: 600;
+                                }
+                                Text {
+                                    text: DeviceQuantumKey.fingerprint;
+                                    color: Theme.palette-foreground;
+                                    font-family: "SourceCodePro";
+                                    font-size: 15px;
+                                    wrap: char-wrap;
+                                }
+                            }
+                        }
+
+                        SecondaryAction {
+                            width: 100%;
+                            text: "Share public key";
+                            clicked => { DeviceQuantumKey.view = "public"; }
+                        }
+                        SecondaryAction {
+                            width: 100%;
+                            text: "Export private key…";
+                            clicked => { DeviceQuantumKey.view = "private-warn"; }
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            background: Theme.palette-danger;
+                        }
+                        Text {
+                            text: "Dangerous area";
+                            color: Theme.palette-danger;
+                            font-family: "Montserrat";
+                            font-size: 13px;
+                            font-weight: 700;
+                        }
+                        SecondaryAction {
+                            width: 100%;
+                            text: "Replace…";
+                            clicked => { DeviceQuantumKey.show-replace-confirm = true; }
+                        }
+                        SecondaryAction {
+                            width: 100%;
+                            text: "Delete…";
+                            clicked => { DeviceQuantumKey.show-delete-confirm = true; }
+                        }
+                    }
+
+                    // ---- Share public key (safe, no warning) ----
+                    if DeviceQuantumKey.has-key && DeviceQuantumKey.view == "public": VerticalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "Safe to share — anyone can seal a note to this key, but never decrypt one. Scan it into the graffito Mac app to mirror the same key there.";
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 176px;
+                                height: 176px;
+                                Image {
+                                    source: DeviceQuantumKey.public-qr;
+                                    width: 176px;
+                                    height: 176px;
+                                    image-rendering: pixelated;
+                                }
+                                TouchArea {
+                                    clicked => {
+                                        DeviceQuantumKey.qr-zoom = true;
+                                        Callbacks.device-quantum-key-qr-zoom(true);
+                                    }
+                                }
+                            }
+                        }
+                        Text {
+                            text: "Dense QR — tap to fill the screen, hold steady and well-lit.";
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        SecondaryAction {
+                            width: 100%;
+                            text: "Close";
+                            clicked => { DeviceQuantumKey.view = ""; }
+                        }
+                    }
+
+                    // ---- Export private key: warning step ----
+                    if DeviceQuantumKey.has-key && DeviceQuantumKey.view == "private-warn": VerticalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "Anyone who scans this can read every note sealed to this quantum key — treat it like a private key, because it is one. Use this only to back it up, or to mirror the same key onto the graffito Mac app.";
+                            color: Theme.palette-foreground;
+                            font-family: "Montserrat";
+                            font-size: 14px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            SecondaryAction {
+                                horizontal-stretch: 1;
+                                text: "Cancel";
+                                clicked => { DeviceQuantumKey.view = ""; }
+                            }
+                            PrimaryAction {
+                                horizontal-stretch: 1;
+                                text: "I understand — show it";
+                                clicked => { Callbacks.device-quantum-key-reveal-private(); }
+                            }
+                        }
+                    }
+
+                    // ---- Export private key: revealed ----
+                    if DeviceQuantumKey.has-key && DeviceQuantumKey.view == "private": VerticalLayout {
+                        spacing: 12px;
+                        if DeviceQuantumKey.private-fits-qr: HorizontalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 176px;
+                                height: 176px;
+                                Image {
+                                    source: DeviceQuantumKey.private-qr;
+                                    width: 176px;
+                                    height: 176px;
+                                    image-rendering: pixelated;
+                                }
+                                TouchArea {
+                                    clicked => {
+                                        DeviceQuantumKey.qr-zoom = true;
+                                        Callbacks.device-quantum-key-qr-zoom(true);
+                                    }
+                                }
+                            }
+                        }
+                        if !DeviceQuantumKey.private-fits-qr: Text {
+                            text: "Too large for one QR — copy the text below instead.";
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle {
+                            background: Theme.palette-surface;
+                            border-radius: 12px;
+                            border-width: 1px;
+                            border-color: Theme.palette-border;
+                            VerticalLayout {
+                                padding: 12px;
+                                Text {
+                                    text: DeviceQuantumKey.private-armor;
+                                    color: Theme.palette-foreground;
+                                    font-family: "SourceCodePro";
+                                    font-size: 12px;
+                                    wrap: char-wrap;
+                                }
+                            }
+                        }
+                        SecondaryAction {
+                            width: 100%;
+                            text: "Close";
+                            clicked => { Callbacks.device-quantum-key-hide-private(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fullscreen armor-QR overlay (screen 28's tap-to-zoom) — mirrors
+        // screen 27's; picks the public or private QR by which panel is
+        // showing.
+        if Ui.screen == 28 && DeviceQuantumKey.qr-zoom: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #ffffff;
+            Image {
+                source: DeviceQuantumKey.view == "private" ? DeviceQuantumKey.private-qr : DeviceQuantumKey.public-qr;
+                width: min(parent.width, parent.height) - 24px;
+                height: self.width;
+                image-rendering: pixelated;
+            }
+            TouchArea {
+                clicked => {
+                    DeviceQuantumKey.qr-zoom = false;
+                    Callbacks.device-quantum-key-qr-zoom(false);
+                }
+            }
+        }
+
         // ------------------------------------ screen 7: contacts (send-to)
         // The one input slot doubles as manual address entry and, when a
         // row's "name" zone was tapped, the contact-name editor. Errors go
@@ -3666,6 +4032,105 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                             text: "Switch to Standard";
                             clicked => { Callbacks.oversize-bump(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Quantum-key Replace confirm — nested in root (sibling-app
+        // overlay gotcha, same as the oversize dialog above).
+        if DeviceQuantumKey.show-replace-confirm: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #00000088;
+            TouchArea { }
+            Rectangle {
+                x: 24px;
+                y: 90px + UISize.control-center-status-bar-height;
+                width: parent.width - 48px;
+                height: dqk-replace-panel.preferred-height;
+                background: Theme.palette-surface;
+                border-radius: 16px;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                dqk-replace-panel := VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    Text {
+                        text: "Replace this quantum key?";
+                        color: Theme.palette-foreground;
+                        font-family: "Montserrat";
+                        font-size: 16px;
+                        font-weight: 600;
+                    }
+                    Text {
+                        text: "Notes sealed to the CURRENT key become permanently unreadable unless you already exported it. This can't be undone.";
+                        color: Theme.palette-danger;
+                        font-family: "Montserrat";
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        SecondaryAction {
+                            horizontal-stretch: 1;
+                            text: "Cancel";
+                            clicked => { DeviceQuantumKey.show-replace-confirm = false; }
+                        }
+                        PrimaryAction {
+                            horizontal-stretch: 1;
+                            text: "Replace";
+                            clicked => { Callbacks.device-quantum-key-replace-confirm(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Quantum-key Delete confirm.
+        if DeviceQuantumKey.show-delete-confirm: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #00000088;
+            TouchArea { }
+            Rectangle {
+                x: 24px;
+                y: 90px + UISize.control-center-status-bar-height;
+                width: parent.width - 48px;
+                height: dqk-delete-panel.preferred-height;
+                background: Theme.palette-surface;
+                border-radius: 16px;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                dqk-delete-panel := VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    Text {
+                        text: "Delete this quantum key?";
+                        color: Theme.palette-foreground;
+                        font-family: "Montserrat";
+                        font-size: 16px;
+                        font-weight: 600;
+                    }
+                    Text {
+                        text: "Notes sealed to it become permanently unreadable unless you already exported it. This can't be undone.";
+                        color: Theme.palette-danger;
+                        font-family: "Montserrat";
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        SecondaryAction {
+                            horizontal-stretch: 1;
+                            text: "Cancel";
+                            clicked => { DeviceQuantumKey.show-delete-confirm = false; }
+                        }
+                        PrimaryAction {
+                            horizontal-stretch: 1;
+                            text: "Delete";
+                            clicked => { Callbacks.device-quantum-key-delete-confirm(); }
                         }
                     }
                 }
