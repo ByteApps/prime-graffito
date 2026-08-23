@@ -1121,3 +1121,49 @@ fn foreign_and_watch_self_pq_notes_have_no_locked_body() {
     assert_eq!(watch.len(), 1);
     assert!(watch[0].locked.is_none());
 }
+
+/// `estimate_note_cost_pq` must stay byte-exact vs real signed pq txs —
+/// the same invariant roundtrip.rs::cost_estimator_is_exact enforces for
+/// the plain estimator, here for BOTH pq shapes: directed and (self-pq
+/// extension) self. This closes a gap: the pq estimator previously had
+/// no exactness pin at all.
+#[test]
+fn pq_cost_estimator_is_exact() {
+    let me = identity(45);
+    let b = identity(46);
+    // Self-pw shape (no recipient output).
+    for (text_len, max_or) in [(5usize, 80usize), (200, 80), (600, 10_000)] {
+        let text = "x".repeat(text_len);
+        let layers = SealLayers { mlkem_ek: None, password: Some("estimate pw") };
+        let note = notes_core::bundle::compose_note_pq_with_change(
+            &me, &utxos(), &text, layers, None, max_or, 2.0, 0, || Ok(AUX),
+        )
+        .unwrap();
+        assert!(note.change > 0, "fixture should produce change");
+        let (chunks, est_vsize) = notes_core::bundle::estimate_note_cost_pq(
+            text_len, max_or, note.tx.inputs.len(), None, FLAG_PW, None,
+        )
+        .unwrap();
+        assert_eq!(est_vsize, note.vsize, "self-pw text_len={text_len} max={max_or}");
+        let n_payloads = note
+            .tx
+            .outputs
+            .iter()
+            .filter(|o| op_return_payload(&o.script_pubkey).is_some())
+            .count();
+        assert_eq!(chunks, n_payloads, "self-pw chunk count");
+    }
+    // Directed-pw shape (dust recipient output modeled byte-exactly).
+    let recipient = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let text = "y".repeat(120);
+    let layers = SealLayers { mlkem_ek: None, password: Some("estimate pw") };
+    let note = compose_directed_note_pq_with_change_amount(
+        &me, &utxos(), &text, &recipient, DUST_LIMIT, layers, None, 80, 2.0, 0, || Ok(AUX),
+    )
+    .unwrap();
+    let (_, est_vsize) = notes_core::bundle::estimate_note_cost_pq(
+        120, 80, note.tx.inputs.len(), Some(recipient.spk.len()), FLAG_PW, None,
+    )
+    .unwrap();
+    assert_eq!(est_vsize, note.vsize, "directed-pw");
+}

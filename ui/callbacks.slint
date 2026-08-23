@@ -83,10 +83,16 @@ export global Compose {
     in-out property <string> change-label: "back to you";
 
     // ---- Post-quantum Security section (pq.rs FLAG_PW/FLAG_MLKEM) ----
-    // Shown ONLY for a directed private single-recipient draft (envelope
-    // validity: incompatible with FLAG_MULTI). Passphrase (Argon2id) and
-    // ML-KEM hybrid layers are composable — both, either, or neither.
+    // Shown for a directed private single-recipient draft OR a private
+    // SELF-note (no recipient — PLAN-graffito-self-pw.md), either way
+    // with no extra ("+ Add recipient") rows (envelope validity:
+    // incompatible with FLAG_MULTI). Passphrase (Argon2id) is available
+    // either way; ML-KEM stays DIRECTED-ONLY (a self-note's KEM receive
+    // key would derive from the same leaf as its enc key — security
+    // theater, pq.rs's module doc) — `pq-mlkem-eligible` gates just that
+    // pill/caption.
     in-out property <bool> pq-eligible: false;
+    in-out property <bool> pq-mlkem-eligible: false;
     // True once the resolved recipient's contact carries a usable
     // (parseable) ML-KEM public key — gates the ML-KEM pill.
     in-out property <bool> pq-mlkem-available: false;

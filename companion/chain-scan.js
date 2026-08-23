@@ -37,9 +37,18 @@ const FLAG_MULTI = 0x04;
 // transactions). Never emitted; a header with this bit set is undecodable
 // today (forward-compat guard — see envelope.rs).
 const FLAG_CONT = 0x08;
-// Every flag bit this decoder understands — any other set bit (4-7, or
+// flags bits 4-5: post-quantum sealing layers (notes-core/src/pq.rs) — an
+// Argon2id password layer (FLAG_PW) and/or an ML-KEM layer (FLAG_MLKEM),
+// on a PRIVATE note, directed or (since 2026-08-22, the self-pq
+// extension) not. The browser can never decrypt any private body, so a
+// pq note renders the same encrypted placeholder as any other private
+// note — these bits only need to be DECODABLE here, or the viewer would
+// drop pq notes as foreign data instead of showing the placeholder.
+const FLAG_PW = 0x10;
+const FLAG_MLKEM = 0x20;
+// Every flag bit this decoder understands — any other set bit (6-7, or
 // FLAG_CONT until it ships) makes the header undecodable.
-const KNOWN_FLAGS = FLAG_PRIVATE | FLAG_DIRECTED | FLAG_MULTI;
+const KNOWN_FLAGS = FLAG_PRIVATE | FLAG_DIRECTED | FLAG_MULTI | FLAG_PW | FLAG_MLKEM;
 
 const P2TR_RE = /^(bc|tb|bcrt)1p/;
 
@@ -127,6 +136,12 @@ function parseHeader(payload) {
   if (flags & ~KNOWN_FLAGS) return null; // unassigned bits
   const multi = (flags & FLAG_MULTI) !== 0;
   if (multi && (flags & FLAG_DIRECTED) === 0) return null;
+  // pq bits require FLAG_PRIVATE and exclude FLAG_MULTI (envelope.rs
+  // validate_pq — DIRECTED is optional since the self-pq extension).
+  if (flags & (FLAG_PW | FLAG_MLKEM)) {
+    if ((flags & FLAG_PRIVATE) === 0) return null;
+    if (multi) return null;
+  }
   let idx = 7;
   let multiCount = null;
   if (multi) {
