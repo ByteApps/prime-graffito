@@ -640,6 +640,21 @@ fn extract_notes_inner(
         if pq_body_flags != 0 {
             let locked = keys.and_then(|identity| {
                 let outpoint = outpoint?;
+                if !directed {
+                    // SELF-note pq layers (PLAN-graffito-self-pw.md): the
+                    // sealing key mixes the AUTHOR's enc_key, so only the
+                    // author's own wallet can ever unlock. A RECEIVED
+                    // foreign self-pq note therefore gets NO LockedBody —
+                    // never present an unlock prompt that cannot succeed.
+                    if received {
+                        return None;
+                    }
+                    return Some(crate::pq::LockedBody::new_self(
+                        pq_body_flags,
+                        body.clone(),
+                        outpoint,
+                    ));
+                }
                 let (sender_x, recipient_x) = if received {
                     let sx = sender.as_deref().and_then(|a| p2tr_x_of_address(network, a))?;
                     (sx, identity.output_x)
@@ -1163,6 +1178,93 @@ pub fn compose_directed_note_with_change_amount(
 /// `compose_note_with_change` sibling — there's no two-phase dance:
 /// `inputs[0]` IS the tx's first input, so the outpoint (crypt.rs's
 /// uniform AAD rule) is known immediately.
+/// Self-note pq compose (PLAN-graffito-self-pw.md): like the private
+/// branch of [`compose_note_with_change`], but the body is sealed by
+/// [`crate::pq::seal_self_pq`] under one or both extra layers (password
+/// and/or ML-KEM — see that function's doc, including the
+/// seed-derived-ek warning for the KEM layer). At least one layer is
+/// required — plain private self-notes keep using the existing
+/// functions.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_note_pq_with_change(
+    identity: &Identity,
+    utxos: &[Utxo],
+    text: &str,
+    layers: crate::pq::SealLayers,
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    lock_time: u32,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let pq_flags_guess = layers.flags();
+    if pq_flags_guess == 0 {
+        return Err(Error::Envelope("pq compose requires at least one seal layer"));
+    }
+    let alg = layers.mlkem_ek.map(|(a, _)| a);
+    let flags = FLAG_PRIVATE | pq_flags_guess;
+    let body_len =
+        text.len() + crypt::SEAL_OVERHEAD + crate::pq::pq_overhead(pq_flags_guess, alg);
+    let payload_lens = envelope::payload_lens_for(flags, None, body_len, max_op_return_bytes)?;
+    let selected = select_note_inputs(utxos, &payload_lens, None, 0, fee_rate)?;
+    let outpoint = outpoint_bytes(selected.first().ok_or(Error::InsufficientFunds)?);
+    let (pq_flags, full_body) =
+        crate::pq::seal_self_pq(&identity.enc_key, &outpoint, text.as_bytes(), layers)?;
+    let flags = FLAG_PRIVATE | pq_flags;
+    let payloads = envelope::encode_outputs(flags, None, &full_body, max_op_return_bytes)?;
+    build_note_tx_exact(
+        &selected,
+        &identity.output_x,
+        &payloads,
+        None,
+        crate::DUST_LIMIT,
+        change_spk,
+        fee_rate,
+        lock_time,
+        &identity.tweaked_seckey,
+        aux,
+    )
+}
+
+/// Coin-control (`_exact`) analog of [`compose_note_pq_with_change`]:
+/// spend EXACTLY `inputs`. `inputs[0]` is the tx's first input
+/// immediately (coin control fixes the input set), mirroring
+/// [`compose_note_exact`].
+#[allow(clippy::too_many_arguments)]
+pub fn compose_note_pq_exact(
+    identity: &Identity,
+    inputs: &[Utxo],
+    text: &str,
+    layers: crate::pq::SealLayers,
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    lock_time: u32,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let pq_flags_guess = layers.flags();
+    if pq_flags_guess == 0 {
+        return Err(Error::Envelope("pq compose requires at least one seal layer"));
+    }
+    let outpoint = outpoint_bytes(inputs.first().ok_or(Error::InsufficientFunds)?);
+    let (pq_flags, full_body) =
+        crate::pq::seal_self_pq(&identity.enc_key, &outpoint, text.as_bytes(), layers)?;
+    let flags = FLAG_PRIVATE | pq_flags;
+    let payloads = envelope::encode_outputs(flags, None, &full_body, max_op_return_bytes)?;
+    build_note_tx_exact(
+        inputs,
+        &identity.output_x,
+        &payloads,
+        None,
+        crate::DUST_LIMIT,
+        change_spk,
+        fee_rate,
+        lock_time,
+        &identity.tweaked_seckey,
+        aux,
+    )
+}
+
 pub fn compose_note_exact(
     identity: &Identity,
     inputs: &[Utxo],
