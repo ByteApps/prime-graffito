@@ -523,18 +523,29 @@ fn envelope_pq_flags_decode_when_valid() {
 }
 
 #[test]
-fn envelope_pq_flag_without_private_directed_is_undecodable() {
-    // FLAG_PW alone (no FLAG_PRIVATE, no FLAG_DIRECTED): header-level
-    // encode_outputs must reject it...
+fn envelope_pq_flag_without_private_is_undecodable() {
+    // FLAG_PW alone (no FLAG_PRIVATE): header-level encode_outputs must
+    // reject it...
     assert!(envelope::encode_outputs(FLAG_PW, None, b"x", 80).is_err());
     // ...and a hand-built header (bypassing the encoder) must decode to
     // None, matching the FLAG_MULTI-without-FLAG_DIRECTED guard.
     assert!(envelope::decode_note(&[b"PNTE110 hi".to_vec()]).is_none());
-    // FLAG_PRIVATE set but not FLAG_DIRECTED is still not enough.
-    assert!(envelope::decode_note(&[b"PNTE111 hi".to_vec()]).is_none());
-    // FLAG_MLKEM alone, same story.
+    // FLAG_PRIVATE without FLAG_DIRECTED is now the SELF-pq form
+    // (PLAN-graffito-self-pw.md) and DOES decode — flags 0x11 = PW|PRIVATE.
+    let d = envelope::decode_note(&[b"PNTE111 hi".to_vec()]).expect("self-pw decodes");
+    assert_eq!(d.flags, FLAG_PRIVATE | FLAG_PW);
+    // FLAG_MLKEM alone, same story as PW alone.
     assert!(envelope::encode_outputs(FLAG_MLKEM, None, b"x", 80).is_err());
     assert!(envelope::decode_note(&[b"PNTE120 hi".to_vec()]).is_none());
+    // Self-KEM (0x21) and self-both (0x31) decode.
+    assert_eq!(
+        envelope::decode_note(&[b"PNTE121 hi".to_vec()]).expect("self-kem decodes").flags,
+        FLAG_PRIVATE | FLAG_MLKEM
+    );
+    assert_eq!(
+        envelope::decode_note(&[b"PNTE131 hi".to_vec()]).expect("self-both decodes").flags,
+        FLAG_PRIVATE | FLAG_MLKEM | FLAG_PW
+    );
 }
 
 #[test]
@@ -910,4 +921,249 @@ fn pinned_derivation_vectors_per_level() {
              (must match app-core/src/pqkeys.rs in the graffito repo)"
         );
     }
+}
+
+
+// ---------------------------------------------------------------------
+// Self-note pq layers (PLAN-graffito-self-pw.md, 2026-08-22)
+// ---------------------------------------------------------------------
+
+/// Envelope validity for the self-pq extension: pq bits need FLAG_PRIVATE
+/// (DIRECTED no longer required for either), MULTI stays excluded, PW
+/// without PRIVATE stays undecodable.
+#[test]
+fn self_pq_envelope_validity_matrix() {
+    let ok = |flags| envelope::payload_lens_for(flags, None, 64, 80).is_ok();
+    // Newly valid: self-note pq layers.
+    assert!(ok(FLAG_PRIVATE | FLAG_PW), "PW|PRIVATE (self-pw)");
+    assert!(ok(FLAG_PRIVATE | FLAG_MLKEM), "MLKEM|PRIVATE (self-kem)");
+    assert!(ok(FLAG_PRIVATE | FLAG_PW | FLAG_MLKEM), "both layers, self");
+    // Directed forms unchanged.
+    assert!(ok(FLAG_PRIVATE | FLAG_DIRECTED | FLAG_PW), "directed pw");
+    assert!(ok(FLAG_PRIVATE | FLAG_DIRECTED | FLAG_MLKEM), "directed kem");
+    // Still invalid.
+    assert!(!ok(FLAG_PW), "PW without PRIVATE");
+    assert!(!ok(FLAG_MLKEM), "MLKEM without PRIVATE");
+    assert!(!ok(FLAG_DIRECTED | FLAG_PW), "PW public directed");
+    assert!(!ok(FLAG_MLKEM | FLAG_PW), "both without PRIVATE");
+    // MULTI exclusion (count supplied so the multi check itself passes).
+    assert!(
+        envelope::payload_lens_for(
+            FLAG_PRIVATE | FLAG_DIRECTED | FLAG_MULTI | FLAG_PW, Some(2), 64, 80
+        ).is_err(),
+        "PW with MULTI"
+    );
+    assert!(
+        envelope::payload_lens_for(FLAG_PRIVATE | FLAG_MULTI | FLAG_PW, Some(2), 64, 80)
+            .is_err(),
+        "self PW with MULTI"
+    );
+}
+
+/// Body growth arithmetic for the self path mirrors the directed one.
+#[test]
+fn self_pq_overhead_matches_actual_body_growth() {
+    let me = identity(40);
+    let outpoint = [0x21u8; 36];
+    let plaintext = b"self overhead check";
+    for alg in ALL_ALGS {
+        let kp = MlKemKeypair::generate(alg).unwrap();
+        let layers = SealLayers { mlkem_ek: Some((alg, kp.ek())), password: Some("pw") };
+        let (pq_flags, body) =
+            pq::seal_self_pq(&me.enc_key, &outpoint, plaintext, layers).unwrap();
+        assert_eq!(pq_flags, FLAG_MLKEM | FLAG_PW);
+        let expected = plaintext.len()
+            + notes_core::crypt::SEAL_OVERHEAD
+            + pq::pq_overhead(pq_flags, Some(alg));
+        assert_eq!(body.len(), expected, "{alg:?}");
+    }
+}
+
+/// Full password-layer round-trip through compose -> bundle -> extract ->
+/// unlock_self, plus the failure modes.
+#[test]
+fn self_pw_note_round_trip() {
+    let me = identity(41);
+    let layers = SealLayers { mlkem_ek: None, password: Some("self note pw") };
+    let note = notes_core::bundle::compose_note_pq_with_change(
+        &me, &utxos(), "personal secret", layers, None, 80, 2.0, 0, || Ok(AUX),
+    )
+    .unwrap();
+
+    let bundle = bundle_from_txs(&[(&note, true, Some(500))]);
+    let notes = extract_notes(&bundle, &me, NET);
+    assert_eq!(notes.len(), 1);
+    let n = &notes[0];
+    assert!(n.private && !n.directed && !n.received);
+    assert_eq!(n.pq_flags, FLAG_PW);
+    assert_eq!(n.text, None, "self-pq notes never auto-decrypt");
+    let locked = n.locked.clone().expect("keyed self scan populates locked");
+    assert!(locked.is_self());
+
+    let pt = pq::unlock_self(&locked, &me.enc_key, None, Some("self note pw")).unwrap();
+    assert_eq!(pt, b"personal secret");
+    // Wrong password / missing password / wrong unlock path.
+    assert!(matches!(
+        pq::unlock_self(&locked, &me.enc_key, None, Some("wrong")).unwrap_err(),
+        Error::DecryptFailed
+    ));
+    assert!(matches!(
+        pq::unlock_self(&locked, &me.enc_key, None, None).unwrap_err(),
+        Error::NeedsPassword
+    ));
+    assert!(matches!(
+        unlock_received(&locked, &me.tweaked_seckey, None, Some("self note pw")).unwrap_err(),
+        Error::Decode(_)
+    ));
+    assert!(matches!(
+        unlock_sent(&locked, &me.tweaked_seckey, &me.output_x, Some("self note pw"))
+            .unwrap_err(),
+        Error::Decode(_)
+    ));
+    // The seed alone is NOT enough: the plain enc_key path can't open it.
+    assert!(notes_core::crypt::open(&me.enc_key, &locked.outpoint, &locked.body).is_err());
+    // Tamper.
+    let mut tampered = locked.clone();
+    let last = tampered.body.len() - 1;
+    tampered.body[last] ^= 0xff;
+    assert!(matches!(
+        pq::unlock_self(&tampered, &me.enc_key, None, Some("self note pw")).unwrap_err(),
+        Error::DecryptFailed
+    ));
+}
+
+/// KEM-layer (and combined) round-trip on a self note. The keypair stands
+/// in for a NON-seed-derived quantum key (the only kind the app may
+/// legitimately encapsulate to — pq.rs section doc).
+#[test]
+fn self_kem_note_round_trip() {
+    let me = identity(42);
+    let kp = MlKemKeypair::generate(MlKemAlg::MlKem768).unwrap();
+    let other_kp = MlKemKeypair::generate(MlKemAlg::MlKem768).unwrap();
+
+    // KEM alone, via the coin-control compose.
+    let inputs = utxos();
+    let layers = SealLayers { mlkem_ek: Some((MlKemAlg::MlKem768, kp.ek())), password: None };
+    let note = notes_core::bundle::compose_note_pq_exact(
+        &me, &inputs, "quantum locked", layers, None, 80, 2.0, 0, || Ok(AUX),
+    )
+    .unwrap();
+    assert_eq!(note.tx.inputs.len(), inputs.len());
+    let bundle = bundle_from_txs(&[(&note, true, Some(501))]);
+    let notes = extract_notes(&bundle, &me, NET);
+    assert_eq!(notes[0].pq_flags, FLAG_MLKEM);
+    let locked = notes[0].locked.clone().unwrap();
+    assert!(locked.is_self());
+
+    let pt = pq::unlock_self(&locked, &me.enc_key, Some(&kp.secret()), None).unwrap();
+    assert_eq!(pt, b"quantum locked");
+    assert!(matches!(
+        pq::unlock_self(&locked, &me.enc_key, None, None).unwrap_err(),
+        Error::NeedsMlKemKey
+    ));
+    assert!(matches!(
+        pq::unlock_self(&locked, &me.enc_key, Some(&other_kp.secret()), None).unwrap_err(),
+        Error::DecryptFailed
+    ));
+
+    // Both layers combined.
+    let layers = SealLayers {
+        mlkem_ek: Some((MlKemAlg::MlKem768, kp.ek())),
+        password: Some("belt and braces"),
+    };
+    let note2 = notes_core::bundle::compose_note_pq_with_change(
+        &me, &utxos(), "double locked", layers, None, 80, 2.0, 0, || Ok(AUX),
+    )
+    .unwrap();
+    let bundle2 = bundle_from_txs(&[(&note2, true, Some(502))]);
+    let locked2 = extract_notes(&bundle2, &me, NET)[0].locked.clone().unwrap();
+    assert_eq!(locked2.pq_flags, FLAG_MLKEM | FLAG_PW);
+    let pt2 = pq::unlock_self(&locked2, &me.enc_key, Some(&kp.secret()), Some("belt and braces"))
+        .unwrap();
+    assert_eq!(pt2, b"double locked");
+    // Each layer individually missing.
+    assert!(matches!(
+        pq::unlock_self(&locked2, &me.enc_key, None, Some("belt and braces")).unwrap_err(),
+        Error::NeedsMlKemKey
+    ));
+    assert!(matches!(
+        pq::unlock_self(&locked2, &me.enc_key, Some(&kp.secret()), None).unwrap_err(),
+        Error::NeedsPassword
+    ));
+}
+
+/// A FOREIGN self-pq note (someone else's tx paying us) can never be
+/// unlocked by us — extraction records the note but populates NO
+/// LockedBody. Watch-only scans get none either (no keys at all).
+#[test]
+fn foreign_and_watch_self_pq_notes_have_no_locked_body() {
+    let author = identity(43);
+    let me = identity(44);
+    let layers = SealLayers { mlkem_ek: None, password: Some("their pw") };
+    let note = notes_core::bundle::compose_note_pq_with_change(
+        &author, &utxos(), "not ours", layers, None, 80, 2.0, 0, || Ok(AUX),
+    )
+    .unwrap();
+
+    // Foreign: pays us, doesn't spend from us.
+    let mut bundle = bundle_from_txs(&[(&note, false, Some(503))]);
+    bundle.notes_onchain[0].pays_self = true;
+    bundle.notes_onchain[0].sender = Some(author.address(NET));
+    let notes = extract_notes(&bundle, &me, NET);
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].received);
+    assert_eq!(notes[0].pq_flags, FLAG_PW);
+    assert!(notes[0].locked.is_none(), "foreign self-pq must not offer an unlock");
+
+    // Watch-only scan of the author's own tx: no keys, no locked body.
+    let bundle2 = bundle_from_txs(&[(&note, true, Some(503))]);
+    let watch = notes_core::bundle::extract_notes_watch(&bundle2, NET);
+    assert_eq!(watch.len(), 1);
+    assert!(watch[0].locked.is_none());
+}
+
+/// `estimate_note_cost_pq` must stay byte-exact vs real signed pq txs —
+/// the same invariant roundtrip.rs::cost_estimator_is_exact enforces for
+/// the plain estimator, here for BOTH pq shapes: directed and (self-pq
+/// extension) self. This closes a gap: the pq estimator previously had
+/// no exactness pin at all.
+#[test]
+fn pq_cost_estimator_is_exact() {
+    let me = identity(45);
+    let b = identity(46);
+    // Self-pw shape (no recipient output).
+    for (text_len, max_or) in [(5usize, 80usize), (200, 80), (600, 10_000)] {
+        let text = "x".repeat(text_len);
+        let layers = SealLayers { mlkem_ek: None, password: Some("estimate pw") };
+        let note = notes_core::bundle::compose_note_pq_with_change(
+            &me, &utxos(), &text, layers, None, max_or, 2.0, 0, || Ok(AUX),
+        )
+        .unwrap();
+        assert!(note.change > 0, "fixture should produce change");
+        let (chunks, est_vsize) = notes_core::bundle::estimate_note_cost_pq(
+            text_len, max_or, note.tx.inputs.len(), None, FLAG_PW, None,
+        )
+        .unwrap();
+        assert_eq!(est_vsize, note.vsize, "self-pw text_len={text_len} max={max_or}");
+        let n_payloads = note
+            .tx
+            .outputs
+            .iter()
+            .filter(|o| op_return_payload(&o.script_pubkey).is_some())
+            .count();
+        assert_eq!(chunks, n_payloads, "self-pw chunk count");
+    }
+    // Directed-pw shape (dust recipient output modeled byte-exactly).
+    let recipient = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let text = "y".repeat(120);
+    let layers = SealLayers { mlkem_ek: None, password: Some("estimate pw") };
+    let note = compose_directed_note_pq_with_change_amount(
+        &me, &utxos(), &text, &recipient, DUST_LIMIT, layers, None, 80, 2.0, 0, || Ok(AUX),
+    )
+    .unwrap();
+    let (_, est_vsize) = notes_core::bundle::estimate_note_cost_pq(
+        120, 80, note.tx.inputs.len(), Some(recipient.spk.len()), FLAG_PW, None,
+    )
+    .unwrap();
+    assert_eq!(est_vsize, note.vsize, "directed-pw");
 }

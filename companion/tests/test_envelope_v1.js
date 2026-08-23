@@ -76,7 +76,9 @@ const negatives = [
   ["PNTE1zz hi", "non-hex flags"],
   ["PNTE100hi", "missing separator"],
   ["PNTE108 1/1 hi", "reserved FLAG_CONT bit (0x08) set"],
-  ["PNTE110 hi", "unassigned bit (0x10) set"],
+  ["PNTE110 hi", "FLAG_PW (0x10) without FLAG_PRIVATE"],
+  ["PNTE120 hi", "FLAG_MLKEM (0x20) without FLAG_PRIVATE"],
+  ["PNTE140 hi", "unassigned bit (0x40) set"],
   // Rust's literal vector for this case is labeled "FLAG_MULTI without
   // FLAG_DIRECTED" in roundtrip.rs, but byte-for-byte it's ALSO a wrong
   // version (payload[4] is '0', not the VERSION byte '1') — copied
@@ -98,6 +100,26 @@ console.log("PASS all roundtrip.rs::envelope_rejects_bad_shapes negative vectors
   const d = ctx.decodeNote_("PNTE104 hi");
   assert(d === null, "FLAG_MULTI (0x04) without FLAG_DIRECTED must be undecodable");
   console.log("PASS FLAG_MULTI without FLAG_DIRECTED is undecodable (envelope.rs parse_header rule)");
+}
+
+// Self-pq extension (PLAN-graffito-self-pw.md, 2026-08-22): pq bits are
+// valid with FLAG_PRIVATE alone — the viewer must DECODE these (rendering
+// the ordinary private placeholder), not drop them as foreign. Mirrors
+// envelope.rs validate_pq + tests/pq.rs's decode vectors.
+{
+  for (const [hex, flags, why] of [
+    ["11", 0x11, "self-pw (PW|PRIVATE)"],
+    ["21", 0x21, "self-kem (MLKEM|PRIVATE)"],
+    ["31", 0x31, "self both layers"],
+    ["13", 0x13, "directed pw"],
+    ["23", 0x23, "directed kem"],
+  ]) {
+    const d = ctx.decodeNote_(`PNTE1${hex} hi`);
+    assert(d !== null && d.flags === flags, `${why} (0x${hex}) must decode`);
+  }
+  const bad = ctx.decodeNote_("PNTE11702 hi"); // PW|MULTI|DIRECTED|PRIVATE
+  assert(bad === null, "pq with FLAG_MULTI must stay undecodable");
+  console.log("PASS pq flag validity matches envelope.rs (self + directed forms, MULTI excluded)");
 }
 
 // Empty payload list.

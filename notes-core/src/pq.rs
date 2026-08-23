@@ -17,8 +17,12 @@
 //!   party who knows the password (including sender re-read), since it adds
 //!   no asymmetric secret.
 //!
-//! Both are valid only on a DIRECTED PRIVATE SINGLE-recipient note (FLAG_MULTI
-//! is incompatible — see envelope.rs's validity rule) and can be combined.
+//! Both layers are valid on a PRIVATE SINGLE-recipient DIRECTED note and —
+//! since 2026-08-22 (PLAN-graffito-self-pw.md, the additive extension) — on
+//! a PRIVATE SELF-note too (see the "Self-note pq layers" section below for
+//! that variant's own domain, threat model, and the seed-derived-ek
+//! warning). FLAG_MULTI stays incompatible with both; the layers can be
+//! combined. The doc above this line describes the DIRECTED form.
 //!
 //! ## Wire format
 //!
@@ -648,6 +652,180 @@ fn derive_pq_key(
 }
 
 // ---------------------------------------------------------------------
+// Self-note pq layers (PLAN-graffito-self-pw.md, 2026-08-22) — FROZEN
+// once shipped, same rule as every domain above.
+// ---------------------------------------------------------------------
+//
+// A PRIVATE SELF-note (no recipient) can carry the same two optional,
+// composable layers a directed note can (`FLAG_PW` and/or `FLAG_MLKEM`,
+// without `FLAG_DIRECTED` — envelope.rs's additive validity extension),
+// hybrid ON TOP of the notebook's ordinary self enc key (never a
+// replacement for it):
+//
+// ```text
+// sealing_key = HKDF-SHA256(
+//     salt = "prime-graffito/self-pq/v1",
+//     ikm  = enc_key(32) || [mlkem_ss(32) if FLAG_MLKEM] || [pw_key(32) if FLAG_PW],
+// ).expand(info = "self-enc-pq/v1" || pq_flags_byte || [alg_id if FLAG_MLKEM], 32)
+// ```
+//
+// — the exact shape of the directed `derive_pq_key` domain with `enc_key`
+// standing in for `ecdh_shared_x`. Wire body: the same prefix blocks in
+// the same order (`[alg(1)||kem_ct]` iff FLAG_MLKEM, then
+// `[salt(16)||t(1)||m_log2(1)||p(1)]` iff FLAG_PW), then the ordinary
+// sealed blob. AAD = the tx's first input's outpoint(36) — the uniform
+// SELF-note AAD rule from crypt.rs, unchanged. The Argon2 decode caps and
+// fallible arena apply here exactly as on the directed path.
+//
+// WHAT EACH LAYER BUYS ON A SELF-NOTE (the threat model differs from the
+// directed case — read before wiring UI):
+//
+// - **Password**: a KNOWLEDGE factor. The seed alone no longer reads the
+//   note — protection against seed compromise, and against quantum
+//   recovery of the leaf secret from an exported xpub/descriptor.
+//   Forgetting the password makes the note UNRECOVERABLE, seed or no
+//   seed; caller UI copy must say so.
+// - **ML-KEM**: a POSSESSION factor — but ONLY when the encapsulation key
+//   belongs to a NON-seed-derived keypair (an imported/randomly-generated
+//   quantum key held outside the seed tree, e.g. the Mac app's Keychain
+//   slot). Encapsulating to the notebook's own SEED-DERIVED receive key
+//   (`mlkem_keypair_from_leaf`) is SECURITY THEATER: that secret derives
+//   from the same leaf as `enc_key`, so every attacker who reaches one
+//   reaches both. This module cannot see which ek the caller passes —
+//   the rule is a COMPOSE-SIDE app obligation. Losing the keypair makes
+//   the note unrecoverable, same as a forgotten password.
+//
+// Unlike a directed KEM note, the AUTHOR holds the decapsulation secret,
+// so self-KEM notes have no `SenderCannotReopen` case — `unlock_self`
+// covers every re-read.
+
+const SELF_PQ_SALT: &[u8] = b"prime-graffito/self-pq/v1";
+const SELF_PQ_INFO_PREFIX: &[u8] = b"self-enc-pq/v1";
+
+/// FROZEN: the self-note sealing key. Mirrors [`derive_pq_key`] exactly,
+/// with the notebook enc key in place of the ECDH shared secret; all IKM
+/// components are fixed 32 bytes and presence is encoded in `info`, so
+/// plain concatenation is unambiguous.
+fn derive_self_pq_key(
+    pq_flags: u8,
+    alg: Option<MlKemAlg>,
+    enc_key: &[u8; 32],
+    mlkem_ss: Option<&[u8; 32]>,
+    pw_key_bytes: Option<&[u8; 32]>,
+) -> [u8; 32] {
+    let mut ikm = Vec::with_capacity(96);
+    ikm.extend_from_slice(enc_key);
+    if let Some(ss) = mlkem_ss {
+        ikm.extend_from_slice(ss);
+    }
+    if let Some(pw) = pw_key_bytes {
+        ikm.extend_from_slice(pw);
+    }
+    let mut info = Vec::with_capacity(SELF_PQ_INFO_PREFIX.len() + 2);
+    info.extend_from_slice(SELF_PQ_INFO_PREFIX);
+    info.push(pq_flags & (FLAG_PW | FLAG_MLKEM));
+    if let Some(a) = alg {
+        info.push(a.id());
+    }
+    let hk = Hkdf::<Sha256>::new(Some(SELF_PQ_SALT), &ikm);
+    let mut okm = [0u8; 32];
+    hk.expand(&info, &mut okm).expect("32 bytes is a valid HKDF length");
+    okm
+}
+
+/// Seal a pq-layered private SELF-note body. `enc_key` is the notebook's
+/// ordinary self encryption key (`keys::derive_encryption_key` /
+/// `keys::enc_key_from_leaf` — whichever the identity carries);
+/// `outpoint` the carrying tx's first input's prevout (uniform AAD rule).
+/// At least one layer must be set. Returns `(pq_flags, full_body)`; the
+/// caller envelopes it under `FLAG_PRIVATE | pq_flags` (no
+/// FLAG_DIRECTED). See the section doc for the seed-derived-ek warning
+/// on the KEM layer.
+pub fn seal_self_pq(
+    enc_key: &[u8; 32],
+    outpoint: &[u8; 36],
+    plaintext: &[u8],
+    layers: SealLayers,
+) -> Result<(u8, Vec<u8>), Error> {
+    let pq_flags = layers.flags();
+    if pq_flags == 0 {
+        return Err(Error::Envelope("pq: at least one seal layer required"));
+    }
+
+    let mut prefix = Vec::new();
+    let mut mlkem_ss: Option<[u8; 32]> = None;
+    let mut alg_used: Option<MlKemAlg> = None;
+    if let Some((alg, ek)) = layers.mlkem_ek {
+        let (ct, ss) = encapsulate(alg, ek)?;
+        prefix.push(alg.id());
+        prefix.extend_from_slice(&ct);
+        mlkem_ss = Some(ss);
+        alg_used = Some(alg);
+    }
+
+    let mut pw_key_bytes: Option<[u8; 32]> = None;
+    if let Some(password) = layers.password {
+        let mut salt = [0u8; 16];
+        getrandom::getrandom(&mut salt).map_err(|_| Error::Entropy)?;
+        let key = pw_key(password, &salt, PW_PROD_T, PW_PROD_M_LOG2, PW_PROD_P)?;
+        prefix.extend_from_slice(&salt);
+        prefix.push(PW_PROD_T as u8);
+        prefix.push(PW_PROD_M_LOG2);
+        prefix.push(PW_PROD_P as u8);
+        pw_key_bytes = Some(key);
+    }
+
+    let key = derive_self_pq_key(pq_flags, alg_used, enc_key, mlkem_ss.as_ref(), pw_key_bytes.as_ref());
+    let sealed = crypt::seal_aad(&key, outpoint, plaintext)?;
+
+    let mut full_body = prefix;
+    full_body.extend_from_slice(&sealed);
+    Ok((pq_flags, full_body))
+}
+
+/// Open a pq-layered SELF-note recovered from chain data.
+/// `mlkem_secret`/`password` are required exactly when `locked.pq_flags`
+/// carries the corresponding bit ([`Error::NeedsMlKemKey`] /
+/// [`Error::NeedsPassword`] otherwise). A supplied-but-wrong secret is
+/// indistinguishable from tampering — both are [`Error::DecryptFailed`].
+/// Refuses a directed locked body ([`LockedBody::is_self`]
+/// discriminates) so the two unlock paths can never be crossed.
+pub fn unlock_self(
+    locked: &LockedBody,
+    enc_key: &[u8; 32],
+    mlkem_secret: Option<&MlKemSecret>,
+    password: Option<&str>,
+) -> Result<Vec<u8>, Error> {
+    if !locked.is_self() {
+        return Err(Error::Decode("pq: directed locked body — use unlock_received/unlock_sent"));
+    }
+    let mut body: &[u8] = &locked.body;
+    let mut mlkem_ss: Option<[u8; 32]> = None;
+    let mut alg_for_info: Option<MlKemAlg> = None;
+
+    if locked.pq_flags & FLAG_MLKEM != 0 {
+        let (prefix, rest) = parse_mlkem_prefix(body)?;
+        body = rest;
+        alg_for_info = Some(prefix.alg);
+        let secret = mlkem_secret.ok_or(Error::NeedsMlKemKey)?;
+        mlkem_ss = Some(decapsulate(prefix.alg, secret, prefix.ct)?);
+    }
+
+    let mut pw_key_bytes: Option<[u8; 32]> = None;
+    if locked.pq_flags & FLAG_PW != 0 {
+        let (params, rest) = parse_pw_prefix(body)?;
+        body = rest;
+        let pw = password.ok_or(Error::NeedsPassword)?;
+        pw_key_bytes = Some(pw_key(pw, &params.salt, params.t, params.m_log2, params.p)?);
+    }
+
+    let key = derive_self_pq_key(
+        locked.pq_flags, alg_for_info, enc_key, mlkem_ss.as_ref(), pw_key_bytes.as_ref(),
+    );
+    crypt::open_aad(&key, &locked.outpoint, body)
+}
+
+// ---------------------------------------------------------------------
 // Seal / unlock
 // ---------------------------------------------------------------------
 
@@ -786,6 +964,24 @@ pub struct LockedBody {
     pub outpoint: [u8; 36],
 }
 
+impl LockedBody {
+    /// A SELF-note locked body (PLAN-graffito-self-pw.md): there is no
+    /// sender/recipient pair, so both x slots hold the all-zero sentinel
+    /// (not a valid secp256k1 x-coordinate for any key either app
+    /// derives; `is_self` discriminates). Store-compatible with the
+    /// directed form — both apps persist `LockedBody` verbatim.
+    pub fn new_self(pq_flags: u8, body: Vec<u8>, outpoint: [u8; 36]) -> Self {
+        LockedBody { pq_flags, body, sender_x: [0u8; 32], recipient_x: [0u8; 32], outpoint }
+    }
+
+    /// True for a SELF-note locked body ([`Self::new_self`]) — unlock via
+    /// [`unlock_self`]; false for a directed one — unlock via
+    /// [`unlock_received`]/[`unlock_sent`].
+    pub fn is_self(&self) -> bool {
+        self.sender_x == [0u8; 32] && self.recipient_x == [0u8; 32]
+    }
+}
+
 mod locked_body_serde {
     use super::LockedBody;
     use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
@@ -845,6 +1041,9 @@ pub fn unlock_received(
     mlkem_secret: Option<&MlKemSecret>,
     password: Option<&str>,
 ) -> Result<Vec<u8>, Error> {
+    if locked.is_self() {
+        return Err(Error::Decode("pq: self locked body — use unlock_self"));
+    }
     let mut body: &[u8] = &locked.body;
     let mut mlkem_ss: Option<[u8; 32]> = None;
     let mut alg_for_info: Option<MlKemAlg> = None;
@@ -884,6 +1083,9 @@ pub fn unlock_sent(
     my_output_x: &[u8; 32],
     password: Option<&str>,
 ) -> Result<Vec<u8>, Error> {
+    if locked.is_self() {
+        return Err(Error::Decode("pq: self locked body — use unlock_self"));
+    }
     if locked.pq_flags & FLAG_MLKEM != 0 {
         return Err(Error::SenderCannotReopen);
     }
@@ -904,6 +1106,38 @@ pub fn unlock_sent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FROZEN-domain pin for the self-pq sealing key
+    /// (PLAN-graffito-self-pw.md): fixed inputs -> pinned output for every
+    /// layer combination, plus domain separation from the directed
+    /// dm-pq/v1 derivation. A mismatch means shipped self-pq notes stop
+    /// unlocking — SHIP-BLOCKING, never "fix the hex".
+    #[test]
+    fn self_pq_kdf_vectors_are_pinned() {
+        let enc_key = [0x11u8; 32];
+        let ss = [0x22u8; 32];
+        let pwk = [0x33u8; 32];
+        let pw_only = derive_self_pq_key(FLAG_PW, None, &enc_key, None, Some(&pwk));
+        let kem_only =
+            derive_self_pq_key(FLAG_MLKEM, Some(MlKemAlg::MlKem768), &enc_key, Some(&ss), None);
+        let both = derive_self_pq_key(
+            FLAG_PW | FLAG_MLKEM,
+            Some(MlKemAlg::MlKem768),
+            &enc_key,
+            Some(&ss),
+            Some(&pwk),
+        );
+        assert_eq!(hex::encode(pw_only), "0d42392195f8dcab2de87f820b587cbb40b29c3f87d3ae0add6475f6b95b70d0");
+        assert_eq!(hex::encode(kem_only), "c7a7163bf544199735ce832ed0b473cc21b136a5d1650a076e2670ae3aa7611a");
+        assert_eq!(hex::encode(both), "d0b5d5c6e3459752082a68343f561e2ad60b4a8e3fc1c956851b906088eee345");
+        // Same inputs through the DIRECTED domain must land elsewhere.
+        let directed = derive_pq_key(FLAG_PW, None, &enc_key, None, Some(&pwk));
+        assert_ne!(pw_only, directed);
+        // Alg id folds into info: 768 vs 1024 differ even with equal ss.
+        let kem_1024 =
+            derive_self_pq_key(FLAG_MLKEM, Some(MlKemAlg::MlKem1024), &enc_key, Some(&ss), None);
+        assert_ne!(kem_only, kem_1024);
+    }
 
     /// A FLAG_PW note sealed under the ORIGINAL production params
     /// (t=3, m_log2=16, p=1 — what every PW note carried before the

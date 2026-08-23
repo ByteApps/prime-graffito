@@ -12,8 +12,9 @@ use notes_core::address::Recipient;
 use notes_core::bundle::{
     compose_directed_note_multi_exact, compose_directed_note_multi_with_change,
     compose_directed_note_pq_exact_amount, compose_directed_note_pq_with_change_amount,
-    compose_note_exact, decode_scanned, estimate_note_cost, estimate_note_cost_pq,
-    extract_notes_pq, sealed_note_payloads, sealed_note_payloads_multi, Identity, SyncBundle,
+    compose_note_exact, compose_note_pq_exact, compose_note_pq_with_change, decode_scanned,
+    estimate_note_cost, estimate_note_cost_pq, extract_notes_pq, sealed_note_payloads,
+    sealed_note_payloads_multi, Identity, SyncBundle,
 };
 use notes_core::address::p2tr_script_pubkey;
 use notes_core::keys::generate_aux_rand;
@@ -479,13 +480,15 @@ fn contact_pq_caption(armor: &str) -> String {
 
 /// Post-quantum status line for the compose Security section — mirrors the
 /// Mac app's `passphrase::security_label` wording verbatim (ported for
-/// cross-platform copy parity), restricted to the cases reachable here:
-/// this device only calls it for a directed private single-recipient
-/// draft, so the public-note/self-note branches never fire in practice but
-/// are kept for completeness. `passphrase_verified` = the typed text is
-/// byte-identical to the last `passphrase::generate()` output (the ONLY
-/// way a passphrase counts toward quantum resistance — an unverified
-/// typed/pasted phrase never does, however long).
+/// cross-platform copy parity). Reachable from two shapes: a directed
+/// private single-recipient draft (`directed == true`, both layers
+/// possible) and a private SELF-note (`directed == false`,
+/// PLAN-graffito-self-pw.md — passphrase only; `mlkem_level` is always
+/// `None` there, since the device never offers a self-KEM control).
+/// `passphrase_verified` = the typed text is byte-identical to the last
+/// `passphrase::generate()` output (the ONLY way a passphrase counts
+/// toward quantum resistance — an unverified typed/pasted phrase never
+/// does, however long).
 fn pq_security_label(
     private: bool,
     directed: bool,
@@ -496,12 +499,32 @@ fn pq_security_label(
     if !private {
         return "Public note: anyone can read it on the blockchain, forever.".to_string();
     }
-    if !directed {
-        return "Private note: sealed with a key derived from your seed. Already \
-                quantum-resistant — no public-key material ever touches the chain."
-            .to_string();
-    }
     let passphrase_counts = passphrase_active && passphrase_verified;
+    if !directed {
+        // Self-note (PLAN-graffito-self-pw.md): already sealed with a
+        // seed-derived key, so a passphrase here guards a DIFFERENT
+        // threat than the directed case's on-chain-ECDH harvest-now-
+        // decrypt-later — seed compromise, or a quantum-recovered leaf
+        // secret from an exported xpub/descriptor. Forgetting the
+        // password makes the note unrecoverable, seed or no seed, which
+        // every password-mentioning branch below says plainly.
+        return if !passphrase_active {
+            "Private note: sealed with a key derived from your seed. Already \
+             quantum-resistant — no public-key material ever touches the chain."
+                .to_string()
+        } else if passphrase_counts {
+            format!(
+                "Password-protected: not even your seed reads this back without it \
+                 (~{:.0}-bit passphrase). Forget it and the note is gone forever, seed \
+                 or no seed.",
+                passphrase::GENERATED_BITS
+            )
+        } else {
+            "Password added — strength unverifiable. Forget it and the note is gone \
+             forever, seed or no seed."
+                .to_string()
+        };
+    }
     match (mlkem_level, passphrase_active) {
         (None, false) => {
             "Directed note: end-to-end encrypted (~128-bit ECDH), but NOT quantum-resistant."
@@ -1229,6 +1252,36 @@ fn confirm_note_preview(outputs: &[notes_core::tx::TxOut]) -> Option<String> {
         return Some("Private note (encrypted)".to_string());
     }
     Some(String::from_utf8(decoded.body).unwrap_or_else(|_| "(unreadable note)".to_string()))
+}
+
+/// Self-pw note (PLAN-graffito-self-pw.md): the `pq::LockedBody` to
+/// persist for a just-signed self-note (`p.recipients.is_empty()`) that
+/// carries a pq layer — a self-pw note is stored LOCKED from the moment
+/// it's signed, never with a plaintext cache. Re-decodes the tx's own
+/// OP_RETURN payloads (byte-truth, same technique as
+/// `confirm_note_preview`) rather than re-deriving anything, and binds
+/// the outpoint to the tx's FIRST input exactly like
+/// `compose_note_pq_with_change`/`compose_note_pq_exact` did when sealing
+/// it. `None` when the tx carries no pq layer (nothing to lock — an
+/// ordinary self-note keeps its existing plaintext-cached behavior
+/// byte-identically) or its header doesn't decode (unreachable for a tx
+/// this device just built and signed itself).
+fn self_pw_locked_body(note: &NoteTx) -> Option<pq::LockedBody> {
+    let payloads: Vec<Vec<u8>> = note
+        .tx
+        .outputs
+        .iter()
+        .filter_map(|o| notes_core::tx::op_return_payload(&o.script_pubkey))
+        .map(<[u8]>::to_vec)
+        .collect();
+    let decoded = notes_core::envelope::decode_note(&payloads)?;
+    let pq_bits =
+        decoded.flags & (notes_core::envelope::FLAG_PW | notes_core::envelope::FLAG_MLKEM);
+    if pq_bits == 0 {
+        return None;
+    }
+    let outpoint = notes_core::tx::outpoint_bytes(note.tx.inputs.first()?);
+    Some(pq::LockedBody::new_self(pq_bits, decoded.body, outpoint))
 }
 
 /// Populate `ConfirmSign` from notes-core's byte-truth decode of `raw_hex`
@@ -2854,9 +2907,21 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             // the pq section's visibility must never depend on funding —
             // an unfunded notebook still shows (and toggles) the Security
             // section, exactly like the Mac app.
-            let pq_eligible = directed && private && compose.get_to_extra().row_count() == 0;
+            //
+            // Self-pw notes (PLAN-graffito-self-pw.md, 2026-08-22): the
+            // passphrase layer is also available for a PRIVATE SELF-note
+            // (no recipient) — `pq_eligible` gates the whole Security
+            // section and the passphrase control for either shape.
+            // ML-KEM stays DIRECTED-ONLY (a self-note's KEM receive key
+            // would derive from the same leaf as its enc key — security
+            // theater, pq.rs's module doc) — `pq_mlkem_eligible` gates
+            // just that pill/caption, keeping every directed-only
+            // computation below byte-identical to before this feature.
+            let pq_mlkem_eligible = directed && private && compose.get_to_extra().row_count() == 0;
+            let pq_eligible = private && compose.get_to_extra().row_count() == 0;
             compose.set_pq_eligible(pq_eligible);
-            let mlkem_parsed: Option<(pq::MlKemAlg, Vec<u8>)> = if pq_eligible {
+            compose.set_pq_mlkem_eligible(pq_mlkem_eligible);
+            let mlkem_parsed: Option<(pq::MlKemAlg, Vec<u8>)> = if pq_mlkem_eligible {
                 st.contacts
                     .iter()
                     .find(|c| c.address == to_address)
@@ -2867,11 +2932,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             };
             let mlkem_available = mlkem_parsed.is_some();
             compose.set_pq_mlkem_available(mlkem_available);
-            if (!pq_eligible || !mlkem_available) && compose.get_pq_mlkem_active() {
+            if (!pq_mlkem_eligible || !mlkem_available) && compose.get_pq_mlkem_active() {
                 compose.set_pq_mlkem_active(false);
             }
             compose.set_pq_mlkem_caption(
-                if !pq_eligible {
+                if !pq_mlkem_eligible {
                     String::new()
                 } else if let Some((alg, ek)) = &mlkem_parsed {
                     format!("{} · {}", mlkem_alg_name(*alg), pq::fingerprint(*alg, ek))
@@ -2884,7 +2949,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 compose.set_pq_passphrase_active(false);
             }
             let pq_passphrase_active = pq_eligible && compose.get_pq_passphrase_active();
-            let pq_mlkem_active = pq_eligible && mlkem_available && compose.get_pq_mlkem_active();
+            let pq_mlkem_active = pq_mlkem_eligible && mlkem_available && compose.get_pq_mlkem_active();
             let pq_passphrase_text = compose.get_pq_passphrase_text().to_string();
             let pq_passphrase_verified = pq_passphrase_active
                 && !pq_passphrase_text.is_empty()
@@ -3420,11 +3485,15 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         let mode_auto = !pick.touched && !sp_participates;
 
                         // Post-quantum layers (pq.rs) — single-recipient
-                        // directed-private notes only (envelope validity),
-                        // and notebook-funded only: the pq compose
-                        // primitives seal against `id.tweaked_seckey`
-                        // directly and have no mixed/spending-wallet
-                        // variant (unlike the ordinary/`_multi` builders).
+                        // directed-private notes AND private self-notes
+                        // (PLAN-graffito-self-pw.md; `pq_mlkem_active` is
+                        // always false for a self-note — compose-changed
+                        // never lets the ML-KEM pill activate off
+                        // `directed`), notebook-funded only either way: the
+                        // pq compose primitives seal against
+                        // `id.tweaked_seckey`/`id.enc_key` directly and
+                        // have no mixed/spending-wallet variant (unlike the
+                        // ordinary/`_multi` builders).
                         let pq_wanted = pq_passphrase_active || pq_mlkem_active;
                         if pq_wanted && sp_participates {
                             return Err(
@@ -3433,7 +3502,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     .to_string(),
                             );
                         }
-                        let pq_active = pq_wanted && directed && private && extra_addrs.is_empty();
+                        let pq_active = pq_wanted && private && extra_addrs.is_empty();
                         let pq_mlkem_pair: Option<(pq::MlKemAlg, Vec<u8>)> = if pq_active
                             && pq_mlkem_active
                         {
@@ -3473,7 +3542,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 0,
                             )?;
                             let change_is_notebook = change_choice.choice != "custom";
-                            let note = if pq_active {
+                            let note = if pq_active && directed {
                                 let recipient = Recipient::parse(st.network(), &to_address)
                                     .map_err(|e| e.to_string())?;
                                 compose_directed_note_pq_with_change_amount(
@@ -3482,6 +3551,24 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     &text,
                                     &recipient,
                                     gift,
+                                    pq_layers,
+                                    Some(change_spk.as_slice()),
+                                    st.effective_chunk(),
+                                    rate,
+                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                    || generate_aux_rand(),
+                                )
+                            } else if pq_active {
+                                // Self-pw note (PLAN-graffito-self-pw.md):
+                                // sealed under the notebook's enc key, not
+                                // a directed ECDH — `directed` is false
+                                // here (no recipient), so `pq_layers` can
+                                // only carry the password (ML-KEM is
+                                // never active off a self-note).
+                                compose_note_pq_with_change(
+                                    id,
+                                    &st.core_utxos(),
+                                    &text,
                                     pq_layers,
                                     Some(change_spk.as_slice()),
                                     st.effective_chunk(),
@@ -3547,7 +3634,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 0,
                             )?;
                             let change_is_notebook = change_choice.choice != "custom";
-                            let note = if pq_active {
+                            let note = if pq_active && directed {
                                 let recipient = Recipient::parse(st.network(), &to_address)
                                     .map_err(|e| e.to_string())?;
                                 compose_directed_note_pq_exact_amount(
@@ -3556,6 +3643,20 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     &text,
                                     &recipient,
                                     gift,
+                                    pq_layers,
+                                    Some(change_spk.as_slice()),
+                                    st.effective_chunk(),
+                                    rate,
+                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                    || generate_aux_rand(),
+                                )
+                            } else if pq_active {
+                                // Self-pw note, coin-control funding — see
+                                // the mode_auto branch's comment above.
+                                compose_note_pq_exact(
+                                    id,
+                                    &inputs,
+                                    &text,
                                     pq_layers,
                                     Some(change_spk.as_slice()),
                                     st.effective_chunk(),
@@ -4245,9 +4346,26 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             save_notebooks(&fs, &ix);
                         }
 
+                        // Self-pw note (PLAN-graffito-self-pw.md): a
+                        // self-note (no recipient) carrying a pq layer is
+                        // stored LOCKED from the moment it's signed —
+                        // never a plaintext cache, and re-derived here
+                        // from the tx's own bytes rather than trusted from
+                        // `p.pq_flags`/`p.text`, so a bug in the compose
+                        // path can't accidentally leak plaintext into
+                        // state.json. `None` for every other note (a
+                        // directed note, or a self-note with no pq layer),
+                        // which keeps their existing plaintext-cached
+                        // behavior byte-identical.
+                        let self_locked =
+                            if p.recipients.is_empty() { self_pw_locked_body(&p.note) } else { None };
                         let rec = NoteRec {
                             id: p.note.txid_hex.clone(),
-                            text: p.text.clone(),
+                            text: if self_locked.is_some() {
+                                String::new()
+                            } else {
+                                p.text.clone()
+                            },
                             private: p.private,
                             txid: p.note.txid_hex.clone(),
                             raw_hex: p.note.raw_hex.clone(),
@@ -4262,9 +4380,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             from: None,
                             recipients: p.recipients.clone(),
                             pq_flags: p.pq_flags,
-                            // Own composed note: plaintext is already
-                            // known (it's `p.text` above) — never locked.
-                            locked: None,
+                            // A directed own composed note (or an ordinary
+                            // self-note): plaintext is already known
+                            // (`p.text` above) — never locked. A self-pw
+                            // note: `self_locked` above, view-only unlock.
+                            locked: self_locked,
                         };
 
                         // Export the signed tx for the companion to broadcast:
@@ -4407,23 +4527,43 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             view.set_show_qr(false);
 
             // Post-quantum lock state (pq.rs) — mirrors the Mac app's
-            // `refresh_note_unlock_ui`: an own (sent) note carrying
-            // FLAG_MLKEM can NEVER be re-opened (the ct was encapsulated
-            // to the RECIPIENT only — checked first, unconditionally,
-            // even if FLAG_PW is also set); a received/unlockable note
-            // with FLAG_PW gets the password field; anything else locked
-            // (a received ML-KEM-only note this device somehow couldn't
-            // auto-decrypt at scan time) gets an explanatory caption only.
+            // `refresh_note_unlock_ui`: an own (sent) DIRECTED note
+            // carrying FLAG_MLKEM can NEVER be re-opened (the ct was
+            // encapsulated to the RECIPIENT only — checked first,
+            // unconditionally, even if FLAG_PW is also set); a
+            // received/unlockable note with FLAG_PW gets the password
+            // field; anything else locked (a received ML-KEM-only note
+            // this device somehow couldn't auto-decrypt at scan time)
+            // gets an explanatory caption only.
+            //
+            // Self-notes (PLAN-graffito-self-pw.md) have no sender OR
+            // recipient, so `n.from.is_none()` alone can't disambiguate a
+            // self-locked body from an own directed-sent one the way it
+            // used to — `is_self_locked` (`LockedBody::is_self`) does:
+            // a self body can only ever need a password (device v1 never
+            // composes self-ML-KEM), and a self body sealed under
+            // FLAG_MLKEM (e.g. by a future peer) is an honest "can't
+            // unlock here", never the directed "sealed to the
+            // recipient's key" message (there IS no recipient).
             let locked = n.locked.is_some();
-            let sender_cannot_reopen =
-                locked && n.from.is_none() && n.pq_flags & notes_core::envelope::FLAG_MLKEM != 0;
-            let needs_password =
-                locked && !sender_cannot_reopen && n.pq_flags & notes_core::envelope::FLAG_PW != 0;
+            let is_self_locked = n.locked.as_ref().map(pq::LockedBody::is_self).unwrap_or(false);
+            let sender_cannot_reopen = locked
+                && !is_self_locked
+                && n.from.is_none()
+                && n.pq_flags & notes_core::envelope::FLAG_MLKEM != 0;
+            let self_kem_locked =
+                locked && is_self_locked && n.pq_flags & notes_core::envelope::FLAG_MLKEM != 0;
+            let needs_password = locked
+                && !sender_cannot_reopen
+                && !self_kem_locked
+                && n.pq_flags & notes_core::envelope::FLAG_PW != 0;
             view.set_locked(locked);
             view.set_needs_password(needs_password);
             view.set_lock_caption(
                 if sender_cannot_reopen {
                     "Can't re-read this note — it's sealed to the recipient's key."
+                } else if self_kem_locked {
+                    "Locked with a quantum key this device doesn't hold."
                 } else if locked && !needs_password {
                     "Sealed to a quantum key this device doesn't hold."
                 } else {
@@ -4486,13 +4626,17 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
 
     // Manual unlock of a locked pq note (FLAG_PW) — the note view's
-    // Unlock button. A received note tries every derived ML-KEM secret of
-    // the ACTIVE notebook alongside the typed password (covers a combined
+    // Unlock button. A self-locked body (`LockedBody::is_self`,
+    // PLAN-graffito-self-pw.md) always goes through `unlock_self` — the
+    // author holds the enc key it was sealed under, so there's no
+    // received-vs-sent split the way a directed body has. Otherwise: a
+    // received note tries every derived ML-KEM secret of the ACTIVE
+    // notebook alongside the typed password (covers a combined
     // FLAG_MLKEM|FLAG_PW note, which `extract_notes_pq` never auto-tries);
-    // an own (sent) note goes through `unlock_sent` instead — already
-    // filtered to FLAG_PW-alone by `on_open_note`'s `needs_password` gate,
-    // so `unlock_sent`'s `SenderCannotReopen` is never actually reachable
-    // from here.
+    // an own (sent) DIRECTED note goes through `unlock_sent` instead —
+    // already filtered to FLAG_PW-alone by `on_open_note`'s
+    // `needs_password` gate, so `unlock_sent`'s `SenderCannotReopen` is
+    // never actually reachable from here.
     {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
@@ -4515,45 +4659,63 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             };
             let pw = password.to_string();
             let pw_opt = if pw.is_empty() { None } else { Some(pw.as_str()) };
-            let received = n.from.is_some();
-            let result: Result<Vec<u8>, notes_core::Error> = if received {
-                if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
-                    let ix = notebooks.borrow();
-                    let net_s = net.borrow().clone();
-                    let leaf = (*active.borrow())
-                        .and_then(|acc| ix.get(acc))
-                        .and_then(|meta| derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s));
-                    drop(ix);
-                    let mut last = notes_core::Error::DecryptFailed;
-                    let mut ok: Option<Vec<u8>> = None;
-                    if let Some(leaf) = leaf {
-                        for kp in derive_mlkem_keypairs(&leaf) {
-                            let secret = kp.secret();
-                            match pq::unlock_received(&locked, &ident.tweaked_seckey, Some(&secret), pw_opt)
-                            {
-                                Ok(pt) => {
-                                    ok = Some(pt);
-                                    break;
+            let is_self = locked.is_self();
+            let result: Result<Vec<u8>, notes_core::Error> = if is_self {
+                // Device v1 composes self-notes password-only, so no
+                // ML-KEM secret is ever supplied here — a self body
+                // sealed (in part) under FLAG_MLKEM is caught earlier by
+                // `on_open_note`'s `self_kem_locked` and never reaches
+                // the Unlock button at all.
+                pq::unlock_self(&locked, &ident.enc_key, None, pw_opt)
+            } else {
+                let received = n.from.is_some();
+                if received {
+                    if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
+                        let ix = notebooks.borrow();
+                        let net_s = net.borrow().clone();
+                        let leaf = (*active.borrow())
+                            .and_then(|acc| ix.get(acc))
+                            .and_then(|meta| derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s));
+                        drop(ix);
+                        let mut last = notes_core::Error::DecryptFailed;
+                        let mut ok: Option<Vec<u8>> = None;
+                        if let Some(leaf) = leaf {
+                            for kp in derive_mlkem_keypairs(&leaf) {
+                                let secret = kp.secret();
+                                match pq::unlock_received(&locked, &ident.tweaked_seckey, Some(&secret), pw_opt)
+                                {
+                                    Ok(pt) => {
+                                        ok = Some(pt);
+                                        break;
+                                    }
+                                    Err(e) => last = e,
                                 }
-                                Err(e) => last = e,
                             }
                         }
+                        ok.ok_or(last)
+                    } else {
+                        pq::unlock_received(&locked, &ident.tweaked_seckey, None, pw_opt)
                     }
-                    ok.ok_or(last)
                 } else {
-                    pq::unlock_received(&locked, &ident.tweaked_seckey, None, pw_opt)
+                    pq::unlock_sent(&locked, &ident.tweaked_seckey, &ident.output_x, pw_opt)
                 }
-            } else {
-                pq::unlock_sent(&locked, &ident.tweaked_seckey, &ident.output_x, pw_opt)
             };
             drop(id_guard);
             match result {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes).to_string();
-                    n.text = text.clone();
-                    n.locked = None;
+                    // Self-pw unlock is VIEW-ONLY (PLAN-graffito-self-pw.md):
+                    // the plaintext is shown for THIS viewing only —
+                    // `n.text`/`n.locked` in the persisted store are left
+                    // untouched, so re-opening the note (or a fresh boot)
+                    // asks for the password again. A directed note's
+                    // unlock keeps its existing fill-and-clear semantics.
+                    if !is_self {
+                        n.text = text.clone();
+                        n.locked = None;
+                        save_state(&fs, &st);
+                    }
                     log::info!("cb: unlock-note ok");
-                    save_state(&fs, &st);
                     drop(st);
                     let view = ui.global::<View>();
                     view.set_text(text.into());

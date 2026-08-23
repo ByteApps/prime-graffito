@@ -1115,11 +1115,13 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // Post-quantum Security section — directed private single-
-            // recipient notes only (envelope validity: pq::SealLayers
-            // needs FLAG_DIRECTED|FLAG_PRIVATE, incompatible with
-            // FLAG_MULTI). Passphrase (Argon2id) and ML-KEM hybrid layers
-            // are independently toggleable and composable.
+            // Post-quantum Security section — a directed private single-
+            // recipient note, OR a private self-note (no recipient —
+            // PLAN-graffito-self-pw.md; notebook-funded only, same as the
+            // directed case). Passphrase (Argon2id) is available either
+            // way; ML-KEM stays directed-only (Compose.pq-mlkem-eligible),
+            // since a self-note's KEM receive key would derive from the
+            // same leaf as its enc key.
             if Compose.pq-eligible: Rectangle {
                 vertical-stretch: 0;
                 border-radius: 12px;
@@ -1148,7 +1150,7 @@ export component AppWindow inherits Window {
                                 Callbacks.compose-changed();
                             }
                         }
-                        PillOption {
+                        if Compose.pq-mlkem-eligible: PillOption {
                             label: "ML-KEM";
                             selected: Compose.pq-mlkem-active;
                             horizontal-stretch: 1;
@@ -1208,7 +1210,7 @@ export component AppWindow inherits Window {
                         font-size: 12px;
                         wrap: word-wrap;
                     }
-                    if Compose.pq-mlkem-active || !Compose.pq-mlkem-available: Text {
+                    if Compose.pq-mlkem-eligible && (Compose.pq-mlkem-active || !Compose.pq-mlkem-available): Text {
                         text: Compose.pq-mlkem-caption;
                         color: Theme.palette-muted;
                         font-family: "SourceCodePro";
