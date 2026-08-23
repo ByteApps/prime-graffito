@@ -186,12 +186,55 @@ impl Drop for MlKemKeypair {
     }
 }
 
+/// Generation-seed mixing domain (PLAN-graffito-quantum-key.md). NOT
+/// FROZEN in the re-derivation sense — nothing ever re-derives this seed
+/// (it is stored/exported whole) — but shared verbatim by both apps so
+/// one audited implementation covers them.
+const MLKEM_GEN_SALT: &[u8] = b"graffito/mlkem-gen/v1";
+const MLKEM_GEN_INFO: &[u8] = b"gen/v1";
+
+/// A fresh 64-byte ML-KEM `(d, z)` generation seed: ALWAYS a full 64-byte
+/// TRNG draw, optionally MIXED with caller-supplied extra entropy (a typed
+/// passphrase, dice rolls — any bytes). The extra input can only ever ADD
+/// unpredictability: the TRNG draw rides in the HKDF ikm whole, so even a
+/// fully attacker-known `extra` leaves the output exactly as strong as the
+/// TRNG alone (the same belt-and-suspenders rule as the Mac app's
+/// `generate_mnemonic_with_salt`). Empty `extra` returns the raw TRNG draw
+/// — byte-equivalent to [`MlKemKeypair::generate`]'s own draw.
+///
+/// There is deliberately NO RNG-free dice-only mode here (unlike the
+/// bitcoin dice-seed path): ML-KEM keygen is not hand-verifiable off
+/// device, so an RNG-free mode would buy auditability nobody can actually
+/// exercise while giving up the TRNG floor. Mixing is the honest offer.
+pub fn generate_mlkem_seed(extra: &[u8]) -> Result<Zeroizing<[u8; 64]>, Error> {
+    let mut trng = Zeroizing::new([0u8; 64]);
+    getrandom::getrandom(&mut *trng).map_err(|_| Error::Entropy)?;
+    if extra.is_empty() {
+        return Ok(trng);
+    }
+    let mut ikm = Zeroizing::new(Vec::with_capacity(64 + extra.len()));
+    ikm.extend_from_slice(&*trng);
+    ikm.extend_from_slice(extra);
+    let hk = Hkdf::<Sha256>::new(Some(MLKEM_GEN_SALT), &ikm);
+    let mut okm = Zeroizing::new([0u8; 64]);
+    hk.expand(MLKEM_GEN_INFO, &mut *okm).expect("64 bytes is a valid HKDF length");
+    Ok(okm)
+}
+
 impl MlKemKeypair {
     /// Fresh keypair: draws 64 bytes from the TRNG (`getrandom`, per the
     /// module's RNG rule) and derives deterministically from them.
     pub fn generate(alg: MlKemAlg) -> Result<Self, Error> {
         let mut seed = [0u8; 64];
         getrandom::getrandom(&mut seed).map_err(|_| Error::Entropy)?;
+        Ok(Self::from_seed(alg, &seed))
+    }
+
+    /// [`Self::generate`] with optional user-supplied extra entropy mixed
+    /// into the generation seed — see [`generate_mlkem_seed`] for the
+    /// mixing rule and why there is no RNG-free mode.
+    pub fn generate_with_extra(alg: MlKemAlg, extra: &[u8]) -> Result<Self, Error> {
+        let seed = generate_mlkem_seed(extra)?;
         Ok(Self::from_seed(alg, &seed))
     }
 

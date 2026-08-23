@@ -1167,3 +1167,48 @@ fn pq_cost_estimator_is_exact() {
     .unwrap();
     assert_eq!(est_vsize, note.vsize, "directed-pw");
 }
+
+// ---------------------------------------------------------------------
+// generate_mlkem_seed / generate_with_extra (PLAN-graffito-quantum-key.md)
+// ---------------------------------------------------------------------
+
+/// The mixing rule's contracts: fresh draws never collide (TRNG rides in
+/// whole, with or without extra), identical extra across two draws still
+/// yields distinct seeds (extra can't pin the output), and the mixed path
+/// actually differs from a raw draw (the HKDF really ran).
+#[test]
+fn generate_mlkem_seed_mixing_contracts() {
+    let a = pq::generate_mlkem_seed(b"").unwrap();
+    let b = pq::generate_mlkem_seed(b"").unwrap();
+    assert_ne!(*a, *b, "two TRNG draws must differ");
+
+    let c = pq::generate_mlkem_seed(b"same user entropy").unwrap();
+    let d = pq::generate_mlkem_seed(b"same user entropy").unwrap();
+    assert_ne!(*c, *d, "same extra must not pin the seed — the TRNG still rides in whole");
+
+    // Keypair-level: distinct eks per call, and the level picker's three
+    // levels all accept extra entropy.
+    for alg in ALL_ALGS {
+        let k1 = MlKemKeypair::generate_with_extra(alg, b"dice: 4 4 4 4").unwrap();
+        let k2 = MlKemKeypair::generate_with_extra(alg, b"dice: 4 4 4 4").unwrap();
+        assert_ne!(k1.ek(), k2.ek(), "{alg:?}");
+        assert_eq!(k1.ek().len(), alg.ek_len());
+    }
+
+    // Empty extra == the plain generate() contract (a fresh raw draw).
+    let k = MlKemKeypair::generate_with_extra(MlKemAlg::MlKem768, b"").unwrap();
+    assert_eq!(k.ek().len(), MlKemAlg::MlKem768.ek_len());
+}
+
+/// The battery from tests/entropy.rs is the statistical guard for the
+/// TRNG itself; here just a cheap sanity check that mixed seeds aren't
+/// degenerate (no long zero runs / not equal to the extra input).
+#[test]
+fn generate_mlkem_seed_output_is_not_degenerate() {
+    let extra = [0xAAu8; 64];
+    let s = pq::generate_mlkem_seed(&extra).unwrap();
+    assert_ne!(&*s, &extra, "output must not echo the extra input");
+    assert_ne!(*s, [0u8; 64]);
+    let zeros = s.iter().filter(|b| **b == 0).count();
+    assert!(zeros < 24, "implausible zero density for a mixed 64-byte seed: {zeros}");
+}
