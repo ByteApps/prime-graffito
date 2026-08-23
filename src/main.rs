@@ -483,12 +483,14 @@ fn contact_pq_caption(armor: &str) -> String {
 /// cross-platform copy parity). Reachable from two shapes: a directed
 /// private single-recipient draft (`directed == true`, both layers
 /// possible) and a private SELF-note (`directed == false`,
-/// PLAN-graffito-self-pw.md — passphrase only; `mlkem_level` is always
-/// `None` there, since the device never offers a self-KEM control).
-/// `passphrase_verified` = the typed text is byte-identical to the last
-/// `passphrase::generate()` output (the ONLY way a passphrase counts
-/// toward quantum resistance — an unverified typed/pasted phrase never
-/// does, however long).
+/// PLAN-graffito-self-pw.md for the passphrase layer; PLAN-graffito-
+/// quantum-key.md for `mlkem_level`, which is `Some` on a self-note ONLY
+/// when the device's personal quantum key is active for this draft — a
+/// self-note never offers a seed-derived KEM, so `Some` here always means
+/// the non-seed device key). `passphrase_verified` = the typed text is
+/// byte-identical to the last `passphrase::generate()` output (the ONLY
+/// way a passphrase counts toward quantum resistance — an unverified
+/// typed/pasted phrase never does, however long).
 fn pq_security_label(
     private: bool,
     directed: bool,
@@ -501,28 +503,48 @@ fn pq_security_label(
     }
     let passphrase_counts = passphrase_active && passphrase_verified;
     if !directed {
-        // Self-note (PLAN-graffito-self-pw.md): already sealed with a
-        // seed-derived key, so a passphrase here guards a DIFFERENT
-        // threat than the directed case's on-chain-ECDH harvest-now-
-        // decrypt-later — seed compromise, or a quantum-recovered leaf
-        // secret from an exported xpub/descriptor. Forgetting the
-        // password makes the note unrecoverable, seed or no seed, which
-        // every password-mentioning branch below says plainly.
-        return if !passphrase_active {
-            "Private note: sealed with a key derived from your seed. Already \
-             quantum-resistant — no public-key material ever touches the chain."
-                .to_string()
-        } else if passphrase_counts {
-            format!(
+        // Self-note: already sealed with a seed-derived key, so a
+        // passphrase here guards a DIFFERENT threat than the directed
+        // case's on-chain-ECDH harvest-now-decrypt-later — seed
+        // compromise, or a quantum-recovered leaf secret from an exported
+        // xpub/descriptor. Forgetting the password makes the note
+        // unrecoverable, seed or no seed, which every password-mentioning
+        // branch below says plainly. `mlkem_level` (PLAN-graffito-
+        // quantum-key.md): the device's own non-seed quantum key — unlike
+        // the password, losing THIS key (not just forgetting it) makes
+        // the note unrecoverable, so the copy below says "readable only
+        // where this quantum key is present" rather than reusing the
+        // directed case's "hybrid encryption" framing.
+        return match (mlkem_level, passphrase_active) {
+            (None, false) => "Private note: sealed with a key derived from your seed. Already \
+                 quantum-resistant — no public-key material ever touches the chain."
+                .to_string(),
+            (None, true) if passphrase_counts => format!(
                 "Password-protected: not even your seed reads this back without it \
                  (~{:.0}-bit passphrase). Forget it and the note is gone forever, seed \
                  or no seed.",
                 passphrase::GENERATED_BITS
-            )
-        } else {
-            "Password added — strength unverifiable. Forget it and the note is gone \
-             forever, seed or no seed."
-                .to_string()
+            ),
+            (None, true) => "Password added — strength unverifiable. Forget it and the note is \
+                 gone forever, seed or no seed."
+                .to_string(),
+            (Some(level), false) => format!(
+                "Quantum-resistant: readable only on this device — or another holding your \
+                 {} personal quantum key. Losing that key loses the note, seed or no seed.",
+                mlkem_alg_name(level)
+            ),
+            (Some(level), true) if passphrase_counts => format!(
+                "Quantum-resistant: readable only where your {} personal quantum key is \
+                 present, plus a strong passphrase (~{:.0} bits). Losing either loses the \
+                 note.",
+                mlkem_alg_name(level),
+                passphrase::GENERATED_BITS
+            ),
+            (Some(level), true) => format!(
+                "Quantum-resistant: readable only where your {} personal quantum key is \
+                 present — passphrase layer added but unverified.",
+                mlkem_alg_name(level)
+            ),
         };
     }
     match (mlkem_level, passphrase_active) {
@@ -817,6 +839,71 @@ fn ensure_dir(fs: &Fs, path: &str, loc: Location) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Personal device quantum key (PLAN-graffito-quantum-key.md) — a single,
+// non-seed-derived ML-KEM keypair stored plain in app-sandboxed AppData.
+// Unlike the per-notebook seed-derived keys (`derive_mlkem_keypairs`),
+// this key has NO seed ancestry: it is NOT recovered by the 24 words, and
+// it dies with app uninstall (KeyOS wipes AppData). One slot, v1 — see
+// the plan for the replace/export/delete lifecycle. Loaded LAZILY only
+// (never at boot): a screen open, a compose eligibility check, or an
+// unlock attempt is what first touches this file.
+// ---------------------------------------------------------------------
+
+const QUANTUM_KEY_PATH: &str = "/.graffito/quantum-key.asc";
+
+/// Read + parse the stored device quantum key, if any. `None` covers both
+/// "no file" and "file present but undecodable" — either way there is no
+/// usable key, and the caller falls back to the generate/import state.
+fn load_device_quantum_key(fs: &Fs) -> Option<pq::MlKemKeypair> {
+    let armor = read_text(fs, QUANTUM_KEY_PATH, Location::User).ok()?;
+    let (alg, seed) = pq::import_private(&armor).ok()?;
+    Some(pq::MlKemKeypair::from_seed(alg, &seed))
+}
+
+fn save_device_quantum_key(fs: &Fs, alg: pq::MlKemAlg, seed: &[u8; 64]) -> Result<(), String> {
+    let armor = pq::export_private(alg, seed);
+    ensure_dir(fs, STATE_DIR, Location::User)
+        .and_then(|_| write_file(fs, QUANTUM_KEY_PATH, Location::User, armor.as_bytes()))
+}
+
+fn delete_device_quantum_key(fs: &Fs) -> Result<(), String> {
+    fs.remove(QUANTUM_KEY_PATH, Location::User).map_err(|e| format!("{e:?}"))
+}
+
+/// Cached lookup: `None` = not checked yet, `Some(None)` = checked, no
+/// file, `Some(Some(kp))` = loaded. Reads disk at most once per cache
+/// lifetime; every mutating caller (generate/import/replace/delete)
+/// writes the new value straight into the cache itself rather than
+/// invalidating it, since each already has the fresh keypair (or its
+/// absence) in hand.
+fn device_quantum_key(
+    fs: &Fs,
+    cache: &Rc<RefCell<Option<Option<pq::MlKemKeypair>>>>,
+) -> Option<pq::MlKemKeypair> {
+    if let Some(cached) = cache.borrow().as_ref() {
+        return cached.clone();
+    }
+    let kp = load_device_quantum_key(fs);
+    *cache.borrow_mut() = Some(kp.clone());
+    kp
+}
+
+/// A single QR (v40, EcLevel::M byte mode) holds up to 2331 bytes —
+/// `slint_keyos_platform::qrcode::render` PANICS past that (`QrCode::new`
+/// is `.expect`ed inside it), so anything landing in a QR must be checked
+/// first. An armored ML-KEM PRIVATE key is always tiny (a fixed 64-byte
+/// seed regardless of level) and never approaches this; the armored
+/// PUBLIC key at ML-KEM-1024 (~2213 chars) is the one shape that gets
+/// close, which is exactly why this guard exists — mirrors the
+/// `MAX_QR_HEX_CHARS` pattern used for signed-tx QRs, sized for byte-mode
+/// text (base64 armor) rather than uppercase-hex alphanumeric mode.
+const MAX_QR_ARMOR_CHARS: usize = 2300;
+
+fn qr_fits(text: &str) -> bool {
+    text.len() <= MAX_QR_ARMOR_CHARS
 }
 
 /// Lazy Airlock mount with format-on-failed-mount recovery (nothing mounts
@@ -1390,6 +1477,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // the user picks a specific notebook from the picker.
     let quantum_nb: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
     let active: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+    // Personal device quantum key (PLAN-graffito-quantum-key.md, screen
+    // 28): lazily-loaded/cached — see `device_quantum_key`. NOT read here
+    // at boot; the first touch is a screen open, a compose eligibility
+    // check, or an unlock attempt.
+    let device_pq_key: Rc<RefCell<Option<Option<pq::MlKemKeypair>>>> = Rc::new(RefCell::new(None));
 
     // Persist the device config from the current cells (single source of
     // truth — inline DeviceConfig constructions drift as fields grow).
@@ -2529,6 +2621,291 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
+    // ---------------------------------------------------------------------
+    // Personal device quantum key (PLAN-graffito-quantum-key.md, screen
+    // 28) — Settings → "Quantum key…". A single, NON-seed-derived ML-KEM
+    // keypair, generated on-device (fresh TRNG mixed with optional user
+    // entropy — `pq::MlKemKeypair::generate_with_extra`) or imported,
+    // stored plain in AppData (`QUANTUM_KEY_PATH`). Distinct from the
+    // per-notebook seed-derived keys the "Quantum keys" screen above
+    // shows: this key is NOT recovered by the 24 words and dies with app
+    // uninstall — it is what makes the self-note ML-KEM compose pill
+    // (compose-changed, earlier) meaningful at all (pq.rs's module doc:
+    // encapsulating to a seed-derived receive key on a self-note is
+    // security theater, since that key shares the enc key's root).
+    // ---------------------------------------------------------------------
+    let refresh_device_quantum_key = {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let device_pq_key = device_pq_key.clone();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let dq = ui.global::<DeviceQuantumKey>();
+            match device_quantum_key(&fs, &device_pq_key) {
+                Some(kp) => {
+                    dq.set_has_key(true);
+                    dq.set_fingerprint(kp.fingerprint().into());
+                    dq.set_level_name(mlkem_alg_name(kp.alg()).into());
+                    let armor = pq::export_public(kp.alg(), kp.ek());
+                    dq.set_public_qr(qr_image(&armor));
+                    dq.set_public_armor(armor.into());
+                }
+                None => {
+                    dq.set_has_key(false);
+                    dq.set_fingerprint("".into());
+                    dq.set_level_name("".into());
+                    dq.set_public_armor("".into());
+                    dq.set_public_qr(Image::default());
+                }
+            }
+        }
+    };
+
+    {
+        let ui_weak = ui_weak.clone();
+        let refresh_device_quantum_key = refresh_device_quantum_key.clone();
+        ui.global::<Callbacks>().on_open_device_quantum_key(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let dq = ui.global::<DeviceQuantumKey>();
+            // Reopening always starts at the summary/generate-or-import
+            // state, never wherever the last visit left off.
+            dq.set_view("".into());
+            dq.set_gen_level(1);
+            dq.set_gen_level_caption(mlkem_alg_describe(pq::MlKemAlg::MlKem768).into());
+            dq.set_gen_extra_text("".into());
+            dq.set_gen_error("".into());
+            dq.set_import_error("".into());
+            dq.set_qr_zoom(false);
+            dq.set_show_replace_confirm(false);
+            dq.set_show_delete_confirm(false);
+            refresh_device_quantum_key();
+        });
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_close(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let dq = ui.global::<DeviceQuantumKey>();
+            // Wipe the sensitive private-key view (armor + QR) on the way
+            // out — never lingers in a UI prop after the screen closes,
+            // same hygiene as reveal-close/export-close.
+            dq.set_private_armor("".into());
+            dq.set_private_qr(Image::default());
+            dq.set_view("".into());
+            dq.set_qr_zoom(false);
+        });
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_gen_level(move |level_idx| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let dq = ui.global::<DeviceQuantumKey>();
+            let alg = match level_idx {
+                0 => pq::MlKemAlg::MlKem512,
+                2 => pq::MlKemAlg::MlKem1024,
+                _ => pq::MlKemAlg::MlKem768,
+            };
+            dq.set_gen_level(level_idx);
+            dq.set_gen_level_caption(mlkem_alg_describe(alg).into());
+        });
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let device_pq_key = device_pq_key.clone();
+        let refresh_device_quantum_key = refresh_device_quantum_key.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_generate(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let dq = ui.global::<DeviceQuantumKey>();
+            let alg = match dq.get_gen_level() {
+                0 => pq::MlKemAlg::MlKem512,
+                2 => pq::MlKemAlg::MlKem1024,
+                _ => pq::MlKemAlg::MlKem768,
+            };
+            let extra = dq.get_gen_extra_text().to_string();
+            let result = pq::MlKemKeypair::generate_with_extra(alg, extra.as_bytes())
+                .map_err(|e| e.to_string())
+                .and_then(|kp| save_device_quantum_key(&fs, kp.alg(), kp.seed()).map(|_| kp));
+            match result {
+                Ok(kp) => {
+                    *device_pq_key.borrow_mut() = Some(Some(kp));
+                    dq.set_gen_error("".into());
+                    dq.set_gen_extra_text("".into());
+                    log::info!("cb: quantum-key generate level={} ok", mlkem_alg_name(alg));
+                    refresh_device_quantum_key();
+                }
+                Err(e) => {
+                    log::warn!("cb: quantum-key generate level={} err={e}", mlkem_alg_name(alg));
+                    dq.set_gen_error(format!("Couldn't generate a key: {e}").into());
+                }
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let device_pq_key = device_pq_key.clone();
+        let refresh_device_quantum_key = refresh_device_quantum_key.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_import(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let dq = ui.global::<DeviceQuantumKey>();
+            let opts = ScanQrOptions {
+                header_title: "Import quantum key".into(),
+                message: "Point at an armored GRAFFITO ML-KEM PRIVATE KEY QR — from a backup, \
+                          this device's own export, or the graffito Mac app."
+                    .into(),
+                ..ScanQrOptions::default()
+            };
+            let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
+                Ok(Some(ScanQrResult::Qr { data, .. })) | Ok(Some(ScanQrResult::Ur2 { data, .. })) => {
+                    data
+                }
+                Ok(_) => {
+                    log::info!("cb: quantum-key import cancelled");
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("cb: quantum-key import err=scanner {e:?}");
+                    dq.set_import_error(format!("QR scanner unavailable: {e:?}").into());
+                    return;
+                }
+            };
+            let armor = String::from_utf8(data).unwrap_or_default();
+            match pq::import_private(&armor) {
+                Ok((alg, seed)) => match save_device_quantum_key(&fs, alg, &seed) {
+                    Ok(()) => {
+                        *device_pq_key.borrow_mut() =
+                            Some(Some(pq::MlKemKeypair::from_seed(alg, &seed)));
+                        dq.set_import_error("".into());
+                        log::info!("cb: quantum-key import ok");
+                        refresh_device_quantum_key();
+                    }
+                    Err(e) => {
+                        log::warn!("cb: quantum-key import err={e}");
+                        dq.set_import_error(format!("Couldn't save the key: {e}").into());
+                    }
+                },
+                Err(e) => {
+                    // A clearer message for the common mix-up: scanning a
+                    // PUBLIC key armor (this screen's own "Share public
+                    // key" QR, or a contact's) instead of a private one.
+                    let msg = if pq::import_public(&armor).is_ok() {
+                        "That's a PUBLIC quantum key — this needs the PRIVATE key armor \
+                         instead (\"Export private key…\" on the device that holds it)."
+                            .to_string()
+                    } else {
+                        format!("Not a private quantum key: {e}")
+                    };
+                    log::warn!("cb: quantum-key import err={e}");
+                    dq.set_import_error(msg.into());
+                }
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let device_pq_key = device_pq_key.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_reveal_private(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let dq = ui.global::<DeviceQuantumKey>();
+            let Some(kp) = device_quantum_key(&fs, &device_pq_key) else {
+                // Shouldn't be reachable (the button only shows when
+                // has-key is true) — fail safe back to the summary view.
+                dq.set_view("".into());
+                return;
+            };
+            let armor = pq::export_private(kp.alg(), kp.seed());
+            dq.set_private_armor(armor.clone().into());
+            if qr_fits(&armor) {
+                dq.set_private_fits_qr(true);
+                dq.set_private_qr(qr_image(&armor));
+            } else {
+                // Never reachable in practice — a private armor is always
+                // a fixed 66-byte payload regardless of level — but this
+                // is the same size guard `qr_image` needs everywhere else
+                // (it panics past capacity), so it stays generic rather
+                // than assuming the current sizes forever.
+                dq.set_private_fits_qr(false);
+                dq.set_private_qr(Image::default());
+            }
+            dq.set_view("private".into());
+            log::info!("cb: quantum-key export-private ok fp={}", kp.fingerprint());
+        });
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_hide_private(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let dq = ui.global::<DeviceQuantumKey>();
+            dq.set_private_armor("".into());
+            dq.set_private_qr(Image::default());
+            dq.set_view("".into());
+            dq.set_qr_zoom(false);
+        });
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let device_pq_key = device_pq_key.clone();
+        let refresh_device_quantum_key = refresh_device_quantum_key.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_replace_confirm(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let dq = ui.global::<DeviceQuantumKey>();
+            // "Replace…" = delete the current key, then land back on the
+            // generate/import state — the confirm dialog is what named the
+            // consequence (notes sealed to it become unreadable) before
+            // this ran.
+            if let Err(e) = delete_device_quantum_key(&fs) {
+                log::warn!("cb: quantum-key replace err={e}");
+            }
+            *device_pq_key.borrow_mut() = Some(None);
+            dq.set_show_replace_confirm(false);
+            dq.set_view("".into());
+            dq.set_private_armor("".into());
+            dq.set_private_qr(Image::default());
+            dq.set_gen_level(1);
+            dq.set_gen_level_caption(mlkem_alg_describe(pq::MlKemAlg::MlKem768).into());
+            dq.set_gen_extra_text("".into());
+            log::info!("cb: quantum-key replace ok");
+            refresh_device_quantum_key();
+        });
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let device_pq_key = device_pq_key.clone();
+        let refresh_device_quantum_key = refresh_device_quantum_key.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_delete_confirm(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let dq = ui.global::<DeviceQuantumKey>();
+            if let Err(e) = delete_device_quantum_key(&fs) {
+                log::warn!("cb: quantum-key delete err={e}");
+            }
+            *device_pq_key.borrow_mut() = Some(None);
+            dq.set_show_delete_confirm(false);
+            dq.set_view("".into());
+            dq.set_private_armor("".into());
+            dq.set_private_qr(Image::default());
+            log::info!("cb: quantum-key delete ok");
+            refresh_device_quantum_key();
+        });
+    }
+
+    {
+        ui.global::<Callbacks>().on_device_quantum_key_qr_zoom(move |open| {
+            log::info!("cb: quantum-key qr-zoom={}", if open { "open" } else { "closed" });
+        });
+    }
+
     {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
@@ -2893,6 +3270,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let bip_account = bip_account.clone();
         let active = active.clone();
         let pq_generated = pq_generated.clone();
+        let fs = fs.clone();
+        let device_pq_key = device_pq_key.clone();
         ui.global::<Callbacks>().on_compose_changed(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let compose = ui.global::<Compose>();
@@ -2912,23 +3291,36 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             // passphrase layer is also available for a PRIVATE SELF-note
             // (no recipient) — `pq_eligible` gates the whole Security
             // section and the passphrase control for either shape.
-            // ML-KEM stays DIRECTED-ONLY (a self-note's KEM receive key
-            // would derive from the same leaf as its enc key — security
-            // theater, pq.rs's module doc) — `pq_mlkem_eligible` gates
-            // just that pill/caption, keeping every directed-only
-            // computation below byte-identical to before this feature.
-            let pq_mlkem_eligible = directed && private && compose.get_to_extra().row_count() == 0;
-            let pq_eligible = private && compose.get_to_extra().row_count() == 0;
+            // ML-KEM on a DIRECTED note encapsulates to the contact's
+            // seed-derived receive key; on a SELF-note (PLAN-graffito-
+            // quantum-key.md) it instead encapsulates to THIS device's
+            // personal, non-seed quantum key — a self-note's seed-derived
+            // key would derive from the same leaf as its enc key (security
+            // theater, pq.rs's module doc), so `pq_mlkem_eligible` for a
+            // self-note additionally requires the device key file to
+            // exist. Directed eligibility/computation stays byte-identical
+            // to before this feature.
+            let base_pq_eligible = private && compose.get_to_extra().row_count() == 0;
+            let device_kp = if base_pq_eligible && !directed {
+                device_quantum_key(&fs, &device_pq_key)
+            } else {
+                None
+            };
+            let pq_mlkem_eligible =
+                base_pq_eligible && (directed || device_kp.is_some());
+            let pq_eligible = base_pq_eligible;
             compose.set_pq_eligible(pq_eligible);
             compose.set_pq_mlkem_eligible(pq_mlkem_eligible);
-            let mlkem_parsed: Option<(pq::MlKemAlg, Vec<u8>)> = if pq_mlkem_eligible {
+            let mlkem_parsed: Option<(pq::MlKemAlg, Vec<u8>)> = if !pq_mlkem_eligible {
+                None
+            } else if directed {
                 st.contacts
                     .iter()
                     .find(|c| c.address == to_address)
                     .and_then(|c| c.mlkem_ek.as_deref())
                     .and_then(|a| pq::import_public(a).ok())
             } else {
-                None
+                device_kp.as_ref().map(|kp| (kp.alg(), kp.ek().to_vec()))
             };
             let mlkem_available = mlkem_parsed.is_some();
             compose.set_pq_mlkem_available(mlkem_available);
@@ -2939,6 +3331,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 if !pq_mlkem_eligible {
                     String::new()
                 } else if let Some((alg, ek)) = &mlkem_parsed {
+                    // Same "LEVEL · fingerprint" line either way — for a
+                    // self-note this names the device's own quantum key
+                    // (PLAN-graffito-quantum-key.md).
                     format!("{} · {}", mlkem_alg_name(*alg), pq::fingerprint(*alg, ek))
                 } else {
                     "recipient has no quantum key — add one in Contacts".to_string()
@@ -3383,6 +3778,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let funding_pick = funding_pick.clone();
         let change_pick = change_pick.clone();
         let lock_policy = lock_policy.clone();
+        let fs = fs.clone();
+        let device_pq_key = device_pq_key.clone();
         ui.global::<Callbacks>().on_compose_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
@@ -3399,6 +3796,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let funding_pick = funding_pick.clone();
             let change_pick = change_pick.clone();
             let lock_policy = lock_policy.clone();
+            let fs = fs.clone();
+            let device_pq_key = device_pq_key.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
@@ -3485,15 +3884,19 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         let mode_auto = !pick.touched && !sp_participates;
 
                         // Post-quantum layers (pq.rs) — single-recipient
-                        // directed-private notes AND private self-notes
-                        // (PLAN-graffito-self-pw.md; `pq_mlkem_active` is
-                        // always false for a self-note — compose-changed
-                        // never lets the ML-KEM pill activate off
-                        // `directed`), notebook-funded only either way: the
-                        // pq compose primitives seal against
+                        // directed-private notes AND private self-notes,
+                        // notebook-funded only either way: the pq compose
+                        // primitives seal against
                         // `id.tweaked_seckey`/`id.enc_key` directly and
                         // have no mixed/spending-wallet variant (unlike the
-                        // ordinary/`_multi` builders).
+                        // ordinary/`_multi` builders). A self-note's
+                        // ML-KEM layer (PLAN-graffito-quantum-key.md)
+                        // encapsulates to THIS device's own personal
+                        // quantum key instead of a contact's — compose-
+                        // changed only lets the pill activate off
+                        // `directed` when that device key exists, so the
+                        // lookup below can only fail if the key was
+                        // deleted between the pill lighting up and Sign.
                         let pq_wanted = pq_passphrase_active || pq_mlkem_active;
                         if pq_wanted && sp_participates {
                             return Err(
@@ -3506,13 +3909,20 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         let pq_mlkem_pair: Option<(pq::MlKemAlg, Vec<u8>)> = if pq_active
                             && pq_mlkem_active
                         {
-                            let armor = st
-                                .contacts
-                                .iter()
-                                .find(|c| c.address == to_address)
-                                .and_then(|c| c.mlkem_ek.clone())
-                                .ok_or("recipient has no quantum key — add one in Contacts")?;
-                            Some(pq::import_public(&armor).map_err(|e| e.to_string())?)
+                            if directed {
+                                let armor = st
+                                    .contacts
+                                    .iter()
+                                    .find(|c| c.address == to_address)
+                                    .and_then(|c| c.mlkem_ek.clone())
+                                    .ok_or("recipient has no quantum key — add one in Contacts")?;
+                                Some(pq::import_public(&armor).map_err(|e| e.to_string())?)
+                            } else {
+                                let kp = device_quantum_key(&fs, &device_pq_key).ok_or(
+                                    "no quantum key on this device — create one in Settings",
+                                )?;
+                                Some((kp.alg(), kp.ek().to_vec()))
+                            }
                         } else {
                             None
                         };
@@ -4497,6 +4907,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let identity = identity.clone();
+        let fs = fs.clone();
+        let device_pq_key = device_pq_key.clone();
         ui.global::<Callbacks>().on_open_note(move |id| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
@@ -4536,15 +4948,21 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             // this device somehow couldn't auto-decrypt at scan time)
             // gets an explanatory caption only.
             //
-            // Self-notes (PLAN-graffito-self-pw.md) have no sender OR
-            // recipient, so `n.from.is_none()` alone can't disambiguate a
-            // self-locked body from an own directed-sent one the way it
-            // used to — `is_self_locked` (`LockedBody::is_self`) does:
-            // a self body can only ever need a password (device v1 never
-            // composes self-ML-KEM), and a self body sealed under
-            // FLAG_MLKEM (e.g. by a future peer) is an honest "can't
-            // unlock here", never the directed "sealed to the
-            // recipient's key" message (there IS no recipient).
+            // Self-notes have no sender OR recipient, so `n.from.is_none()`
+            // alone can't disambiguate a self-locked body from an own
+            // directed-sent one the way it used to — `is_self_locked`
+            // (`LockedBody::is_self`) does. A self body sealed under
+            // FLAG_MLKEM (PLAN-graffito-quantum-key.md) is now tried
+            // against this device's own personal quantum key, if one is
+            // stored: KEM-only unlocks automatically (view-only — nothing
+            // persisted, matching every other self-pq unlock); KEM+FLAG_PW
+            // still needs the typed password too, so it falls through to
+            // the normal password field with the stored key supplied
+            // alongside it at Unlock (`on_unlock_note`). No device key, or
+            // a present key that doesn't decrypt (e.g. after a Replace),
+            // falls back to an honest caption — never the directed
+            // "sealed to the recipient's key" message (there IS no
+            // recipient).
             let locked = n.locked.is_some();
             let is_self_locked = n.locked.as_ref().map(pq::LockedBody::is_self).unwrap_or(false);
             let sender_cannot_reopen = locked
@@ -4553,15 +4971,47 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 && n.pq_flags & notes_core::envelope::FLAG_MLKEM != 0;
             let self_kem_locked =
                 locked && is_self_locked && n.pq_flags & notes_core::envelope::FLAG_MLKEM != 0;
-            let needs_password = locked
+            let self_kem_also_pw =
+                self_kem_locked && n.pq_flags & notes_core::envelope::FLAG_PW != 0;
+            let mut kem_auto_text: Option<String> = None;
+            let mut kem_key_present = false;
+            let mut kem_key_wrong = false;
+            if self_kem_locked {
+                if let Some(kp) = device_quantum_key(&fs, &device_pq_key) {
+                    kem_key_present = true;
+                    if !self_kem_also_pw {
+                        if let (Some(locked_body), Some(ident)) =
+                            (n.locked.as_ref(), identity.borrow().as_ref())
+                        {
+                            match pq::unlock_self(
+                                locked_body,
+                                &ident.enc_key,
+                                Some(&kp.secret()),
+                                None,
+                            ) {
+                                Ok(bytes) => {
+                                    kem_auto_text = Some(String::from_utf8_lossy(&bytes).to_string())
+                                }
+                                Err(_) => kem_key_wrong = true,
+                            }
+                        }
+                    }
+                }
+            }
+            let needs_password = (locked
                 && !sender_cannot_reopen
                 && !self_kem_locked
-                && n.pq_flags & notes_core::envelope::FLAG_PW != 0;
-            view.set_locked(locked);
+                && n.pq_flags & notes_core::envelope::FLAG_PW != 0)
+                || (self_kem_also_pw && kem_key_present);
+            view.set_locked(locked && kem_auto_text.is_none());
             view.set_needs_password(needs_password);
             view.set_lock_caption(
                 if sender_cannot_reopen {
                     "Can't re-read this note — it's sealed to the recipient's key."
+                } else if self_kem_locked && (kem_auto_text.is_some() || needs_password) {
+                    ""
+                } else if self_kem_locked && kem_key_wrong {
+                    "This note's quantum key doesn't match the one stored on this device."
                 } else if self_kem_locked {
                     "Locked with a quantum key this device doesn't hold."
                 } else if locked && !needs_password {
@@ -4571,6 +5021,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 }
                 .into(),
             );
+            if let Some(text) = &kem_auto_text {
+                view.set_text(text.clone().into());
+            }
             view.set_unlock_password("".into());
             view.set_unlock_error("".into());
 
@@ -4646,6 +5099,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let net = net.clone();
         let active = active.clone();
         let app_seed = app_seed.clone();
+        let device_pq_key = device_pq_key.clone();
         ui.global::<Callbacks>().on_unlock_note(move |password| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let id_str = ui.global::<View>().get_id().to_string();
@@ -4661,12 +5115,17 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let pw_opt = if pw.is_empty() { None } else { Some(pw.as_str()) };
             let is_self = locked.is_self();
             let result: Result<Vec<u8>, notes_core::Error> = if is_self {
-                // Device v1 composes self-notes password-only, so no
-                // ML-KEM secret is ever supplied here — a self body
-                // sealed (in part) under FLAG_MLKEM is caught earlier by
-                // `on_open_note`'s `self_kem_locked` and never reaches
-                // the Unlock button at all.
-                pq::unlock_self(&locked, &ident.enc_key, None, pw_opt)
+                // PLAN-graffito-quantum-key.md: a self body carrying
+                // FLAG_MLKEM only reaches here (needs_password set by
+                // `on_open_note`) when it ALSO carries FLAG_PW and the
+                // device key is present — KEM-only self bodies are tried
+                // automatically on open and never show the Unlock button.
+                let mlkem_secret = if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
+                    device_quantum_key(&fs, &device_pq_key).map(|kp| kp.secret())
+                } else {
+                    None
+                };
+                pq::unlock_self(&locked, &ident.enc_key, mlkem_secret.as_ref(), pw_opt)
             } else {
                 let received = n.from.is_some();
                 if received {
