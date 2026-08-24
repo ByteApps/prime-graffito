@@ -4990,9 +4990,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 None,
                             ) {
                                 Ok(bytes) => {
+                                    // Log-contract line for the UI suite
+                                    // (graffito-selfpq.sh): the auto-unlock
+                                    // is otherwise invisible to log greps.
+                                    log::info!("cb: unlock-note auto=kem ok");
                                     kem_auto_text = Some(String::from_utf8_lossy(&bytes).to_string())
                                 }
-                                Err(_) => kem_key_wrong = true,
+                                Err(_) => {
+                                    log::warn!("cb: unlock-note auto=kem err=mismatch");
+                                    kem_key_wrong = true;
+                                }
                             }
                         }
                     }
