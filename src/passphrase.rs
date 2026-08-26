@@ -57,3 +57,52 @@ fn sample_index(bound: u16) -> Result<u16, notes_core::Error> {
         }
     }
 }
+
+/// Conservative "obviously weak" gate for a TYPED (non-generated)
+/// passphrase — NOT an entropy estimate. The device deliberately ships no
+/// zxcvbn-equivalent (see the module doc), so this flags only what is
+/// weak under ANY charitable reading: too few characters, or too few
+/// words to plausibly be a diceware-style phrase. The Mac app's zxcvbn
+/// estimator remains the richer readout; this gate exists so the device
+/// warns while the user is still typing instead of certifying nothing
+/// silently. Thresholds err toward warning: a 4-word/16-char phrase drawn
+/// from a wordlist is ~44 bits — thin, but past "trivially brute-forced";
+/// anything under that gets the explicit weak warning.
+pub fn typed_is_weak(phrase: &str) -> bool {
+    let trimmed = phrase.trim();
+    let chars = trimmed.chars().count();
+    let words = trimmed.split_whitespace().count();
+    !(chars >= 24 || (chars >= 16 && words >= 4))
+}
+
+#[cfg(test)]
+mod weak_tests {
+    use super::typed_is_weak;
+
+    #[test]
+    fn short_or_few_words_is_weak() {
+        for p in ["", "hunter2", "password123", "correct horse", "tiny words here"] {
+            assert!(typed_is_weak(p), "{p:?} should be weak");
+        }
+    }
+
+    #[test]
+    fn long_or_wordy_is_not_flagged() {
+        for p in [
+            "correct horse battery staple",
+            "brown provide arrest stairs hybrid hymn",
+            "aVeryLongSingleRunOfChars24!",
+        ] {
+            assert!(!typed_is_weak(p), "{p:?} should not be flagged");
+        }
+    }
+
+    #[test]
+    fn generated_phrases_are_never_flagged() {
+        // 12 words joined by spaces always clears both thresholds.
+        let p = super::generate();
+        if let Ok(p) = p {
+            assert!(!typed_is_weak(&p));
+        }
+    }
+}

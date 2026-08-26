@@ -1205,7 +1205,7 @@ export component AppWindow inherits Window {
                     }
                     if Compose.pq-passphrase-active: Text {
                         text: Compose.pq-passphrase-strength;
-                        color: Theme.palette-muted;
+                        color: Compose.pq-passphrase-weak ? Theme.palette-danger : Theme.palette-muted;
                         font-family: "SourceCodePro";
                         font-size: 12px;
                         wrap: word-wrap;

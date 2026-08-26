@@ -109,6 +109,10 @@ export global Compose {
     // "strength can't be verified — use Generate" (typed) or "132-bit
     // generated phrase" (fresh, byte-unmodified Generate output).
     in-out property <string> pq-passphrase-strength: "";
+    // true while a TYPED phrase trips the conservative weak gate
+    // (passphrase::typed_is_weak) — renders the strength line in the
+    // danger color so the warning lands while the user is still typing.
+    in-out property <bool> pq-passphrase-weak: false;
     // The security_label status line — "" while neither layer is active.
     in-out property <string> pq-security-label: "";
 }

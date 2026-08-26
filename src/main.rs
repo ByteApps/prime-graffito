@@ -3349,11 +3349,19 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let pq_passphrase_verified = pq_passphrase_active
                 && !pq_passphrase_text.is_empty()
                 && pq_generated.borrow().as_deref() == Some(pq_passphrase_text.as_str());
+            let pq_passphrase_weak = pq_passphrase_active
+                && !pq_passphrase_verified
+                && !pq_passphrase_text.is_empty()
+                && passphrase::typed_is_weak(&pq_passphrase_text);
+            compose.set_pq_passphrase_weak(pq_passphrase_weak);
             compose.set_pq_passphrase_strength(
                 if !pq_passphrase_active {
                     String::new()
                 } else if pq_passphrase_verified {
                     format!("{:.0}-bit generated phrase", passphrase::GENERATED_BITS)
+                } else if pq_passphrase_weak {
+                    "weak — short passphrases are easy to brute-force; use Generate or add more words"
+                        .to_string()
                 } else {
                     "strength can't be verified — use Generate for a certified phrase".to_string()
                 }
