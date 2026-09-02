@@ -1,0 +1,190 @@
+// Screen.confirm-sign — extracted verbatim from app.slint on 2026-09-01
+// (PLAN-graffito-arch.md phase 4a). The instantiation site in app.slint
+// still sets width/height to the window; everything else is the
+// original block body.
+// ----------------------------------- screen 4: universal Confirm & sign
+// Shared by compose/sweep/consolidate/external-PSBT: every fact shown
+// here is decoded from the actual (un)signed tx bytes by notes-core's
+// `confirm::summarize_signed_tx` — never from the app's own intent —
+// so it's the last line of defense before anything hits the wire.
+// The Flickable stretches so the Sign button stays pinned at the
+// screen's true bottom regardless of how many rows there are.
+
+import { Theme, UISize } from "@ui/theme.slint";
+import { Callbacks, Confirm, ConfirmSign } from "../callbacks.slint";
+import { PrimaryAction, ScreenHeader, ConfirmRowEntry } from "../components.slint";
+
+export component ConfirmSignScreen inherits VerticalLayout {
+    padding-left: 24px;
+    padding-right: 24px;
+    padding-top: 16px + UISize.control-center-status-bar-height;
+    padding-bottom: 24px;
+    spacing: 10px;
+
+    ScreenHeader {
+        vertical-stretch: 0;
+        title: "Confirm & sign";
+        back => { Callbacks.confirm-cancel(); }
+    }
+
+    Flickable {
+        vertical-stretch: 1;
+        viewport-width: self.width;
+        viewport-height: confirm-content.preferred-height;
+        confirm-content := VerticalLayout {
+            width: parent.width;
+            spacing: 12px;
+
+            Text {
+                text: ConfirmSign.context;
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 14px;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: "txid: " + ConfirmSign.txid;
+                color: Theme.palette-muted;
+                font-family: "SourceCodePro";
+                font-size: 12px;
+                wrap: char-wrap;
+            }
+
+            if ConfirmSign.warn != "": Rectangle {
+                background: #332400;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: #eab308;
+                VerticalLayout {
+                    padding: 12px;
+                    Text {
+                        text: "Heads up: " + ConfirmSign.warn;
+                        color: #eab308;
+                        font-family: "Montserrat";
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            if ConfirmSign.note != "": Rectangle {
+                background: Theme.palette-surface;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 4px;
+                    Text {
+                        text: "NOTE";
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 12px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: ConfirmSign.note;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            Text {
+                text: "INPUTS";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 12px;
+                font-weight: 700;
+            }
+            VerticalLayout {
+                spacing: 6px;
+                for row in ConfirmSign.inputs: ConfirmRowEntry { entry: row; }
+            }
+
+            Text {
+                text: "OUTPUTS";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 12px;
+                font-weight: 700;
+            }
+            VerticalLayout {
+                spacing: 6px;
+                for row in ConfirmSign.outputs: ConfirmRowEntry { entry: row; }
+            }
+
+            Rectangle {
+                background: Theme.palette-surface;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                VerticalLayout {
+                    padding: 12px;
+                    Text {
+                        text: "Fee: " + ConfirmSign.fee-line;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 14px;
+                        font-weight: 600;
+                    }
+                }
+            }
+
+            // Honest-fee-label (2026-07-19): the fee row above is
+            // ALREADY the real network fee at this rate — this row
+            // names the separate sub-dust leftover riding on top of
+            // it (folded into the fee because it's too small to be
+            // its own change output), so the total never reads as
+            // an unexplained/inflated fee. Warn-tinted like the
+            // banner above, but its own key:value row (a specific
+            // fact, not a general advisory).
+            if ConfirmSign.fold != "": Rectangle {
+                background: Theme.palette-surface;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: #eab308;
+                VerticalLayout {
+                    padding: 12px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Leftover (dust rule)";
+                            color: #eab308;
+                            font-family: "Montserrat";
+                            font-size: 13px;
+                            horizontal-stretch: 1;
+                        }
+                        Text {
+                            text: ConfirmSign.fold;
+                            color: #eab308;
+                            font-family: "SourceCodePro";
+                            font-size: 13px;
+                            font-weight: 600;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Text {
+        vertical-stretch: 0;
+        text: "Signing spends real sats and writes this to the blockchain forever.";
+        color: Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 13px;
+        wrap: word-wrap;
+        horizontal-alignment: center;
+    }
+
+    PrimaryAction {
+        vertical-stretch: 0;
+        width: 100%;
+        text: ConfirmSign.sign-label;
+        clicked => { Callbacks.confirm-sign(); }
+    }
+}
