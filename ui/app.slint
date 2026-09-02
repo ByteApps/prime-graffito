@@ -21,6 +21,7 @@ import { ChangeScreen } from "screens/change.slint";
 import { QuantumKeysScreen } from "screens/quantum-keys.slint";
 import { DeviceQuantumKeyScreen } from "screens/device-quantum-key.slint";
 import { ContactsScreen } from "screens/contacts.slint";
+import { NotebooksScreen } from "screens/notebooks.slint";
 
 export { Screen, Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, DeviceQuantumKey, Theme, ButtonVariant, ButtonState, ControlSize, Images }
 
@@ -243,160 +244,9 @@ export component AppWindow inherits Window {
         // ------------------------------------ screen 20: notebooks (MAIN)
         // A notebook = an indexed identity; tapping a row opens its home
         // (screen 0). Boot lands here. Fresh install = empty list.
-        if Ui.screen == Screen.notebooks: VerticalLayout {
+        if Ui.screen == Screen.notebooks: NotebooksScreen {
             width: parent.width;
             height: parent.height;
-            padding-left: 24px;
-            padding-right: 24px;
-            padding-top: 24px + UISize.control-center-status-bar-height;
-            padding-bottom: 24px;
-            spacing: 14px;
-
-            Text {
-                text: "Graffito";
-                color: Theme.palette-foreground;
-                font-family: "Montserrat";
-                font-size: 26px;
-                font-weight: 700;
-                horizontal-alignment: center;
-            }
-
-            PrimaryAction {
-                width: 100%;
-                text: "+  New notebook";
-                clicked => { NotebookCb.create(); }
-            }
-            SecondaryAction {
-                width: 100%;
-                text: "Settings";
-                clicked => { Callbacks.refresh-home(); Callbacks.funding-open(); Ui.screen = Screen.settings; }
-            }
-
-            if Ui.error != "": Text {
-                text: Ui.error;
-                color: Theme.palette-muted;
-                font-family: "Montserrat";
-                font-size: 13px;
-                wrap: word-wrap;
-                horizontal-alignment: center;
-            }
-
-            if NotebooksUi.empty-line != "": Text {
-                text: NotebooksUi.empty-line;
-                color: Theme.palette-muted;
-                font-family: "Montserrat";
-                font-size: 15px;
-                wrap: word-wrap;
-                horizontal-alignment: center;
-            }
-
-            Flickable {
-                vertical-stretch: 1;
-                viewport-height: NotebooksUi.rows.length * 92px
-                    + (NotebooksUi.archived-label != "" ? 44px : 0px)
-                    + (NotebooksUi.show-archived ? NotebooksUi.archived-rows.length * 72px : 0px);
-                VerticalLayout {
-                    spacing: 8px;
-                    alignment: start;
-                    for nb in NotebooksUi.rows: Rectangle {
-                        height: 84px;
-                        border-radius: 12px;
-                        border-width: 1px;
-                        border-color: nb.active ? Theme.palette-primary : Theme.palette-border;
-                        TouchArea { clicked => { NotebookCb.open(nb.account); } }
-                        HorizontalLayout {
-                            padding: 12px;
-                            spacing: 8px;
-                            VerticalLayout {
-                                horizontal-stretch: 1;
-                                spacing: 4px;
-                                alignment: center;
-                                Text {
-                                    text: nb.name;
-                                    color: Theme.palette-foreground;
-                                    font-family: "Montserrat";
-                                    font-size: 18px;
-                                    font-weight: 700;
-                                    overflow: elide;
-                                }
-                                Text {
-                                    text: nb.meta;
-                                    color: Theme.palette-muted;
-                                    font-family: "SourceCodePro";
-                                    font-size: 13px;
-                                    overflow: elide;
-                                }
-                            }
-                            // Rename
-                            Rectangle {
-                                width: 40px;
-                                TouchArea { clicked => { NotebookCb.rename(nb.account); } }
-                                Text {
-                                    text: "Aa";
-                                    color: Theme.palette-muted;
-                                    font-family: "Montserrat";
-                                    font-size: 15px;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                }
-                            }
-                            // Archive
-                            Rectangle {
-                                width: 40px;
-                                TouchArea { clicked => { NotebookCb.archive(nb.account, true); } }
-                                Text {
-                                    text: "×";
-                                    color: Theme.palette-muted;
-                                    font-family: "Montserrat";
-                                    font-size: 22px;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                }
-                            }
-                        }
-                    }
-                    if NotebooksUi.archived-label != "": Rectangle {
-                        height: 36px;
-                        TouchArea { clicked => { NotebooksUi.show-archived = !NotebooksUi.show-archived; } }
-                        Text {
-                            text: NotebooksUi.archived-label + (NotebooksUi.show-archived ? "  ^" : "  v");
-                            color: Theme.palette-muted;
-                            font-family: "Montserrat";
-                            font-size: 14px;
-                            x: 4px;
-                            y: (parent.height - self.height) / 2;
-                        }
-                    }
-                    if NotebooksUi.show-archived: VerticalLayout {
-                        spacing: 8px;
-                        for nb in NotebooksUi.archived-rows: Rectangle {
-                            height: 64px;
-                            border-radius: 12px;
-                            border-width: 1px;
-                            border-color: Theme.palette-border;
-                            HorizontalLayout {
-                                padding: 12px;
-                                spacing: 8px;
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    alignment: center;
-                                    Text {
-                                        text: nb.name;
-                                        color: Theme.palette-muted;
-                                        font-family: "Montserrat";
-                                        font-size: 15px;
-                                        overflow: elide;
-                                    }
-                                }
-                                SecondaryAction {
-                                    text: "Restore";
-                                    clicked => { NotebookCb.archive(nb.account, false); }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
 
         // ---- notebook name dialog (create + rename) ----
