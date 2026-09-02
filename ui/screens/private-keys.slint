@@ -1,0 +1,204 @@
+// Screen.private-keys — extracted verbatim from app.slint on 2026-09-01
+// (PLAN-graffito-arch.md phase 4a). The instantiation site in app.slint
+// still sets width/height to the window; everything else is the
+// original block body.
+// ------------------------------------- screen 24: PRIVATE keys
+// The dangerous exports: recovery words (whole seed) and a single
+// notebook's raw key (hex/WIF). Camera warning up top.
+
+import { Theme, UISize } from "@ui/theme.slint";
+import { Screen, Callbacks, Ui, Recovery } from "../callbacks.slint";
+import { SecondaryAction, ScreenHeader, PillOption } from "../components.slint";
+
+export component PrivateKeysScreen inherits VerticalLayout {
+    padding-left: 24px;
+    padding-right: 24px;
+    padding-top: 16px + UISize.control-center-status-bar-height;
+    padding-bottom: 24px;
+    spacing: 10px;
+
+    ScreenHeader {
+        title: "Private keys";
+        back => {
+            Callbacks.export-close();
+            Ui.screen = Screen.settings;
+        }
+    }
+
+    Text {
+        text: Recovery.export-title;
+        color: Theme.palette-foreground;
+        font-family: "Montserrat";
+        font-size: 16px;
+        font-weight: 600;
+    }
+    Text {
+        text: "Make sure no cameras or onlookers — anyone who captures these controls the coins and can read every private note.";
+        color: Theme.palette-danger;
+        font-family: "Montserrat";
+        font-size: 12px;
+        font-weight: 600;
+        wrap: word-wrap;
+    }
+
+    HorizontalLayout {
+        spacing: 6px;
+        PillOption {
+            label: "Seed words";
+            selected: Recovery.export-seed-view;
+            horizontal-stretch: 1;
+            tapped => {
+                Recovery.export-seed-view = true;
+                Recovery.show-qr = false;
+            }
+        }
+        PillOption {
+            label: "hex";
+            selected: !Recovery.export-seed-view && Recovery.export-which == 2;
+            horizontal-stretch: 1;
+            tapped => {
+                Recovery.export-seed-view = false;
+                Callbacks.export-select(2);
+            }
+        }
+        PillOption {
+            label: "WIF";
+            selected: !Recovery.export-seed-view && Recovery.export-which == 3;
+            horizontal-stretch: 1;
+            tapped => {
+                Recovery.export-seed-view = false;
+                Callbacks.export-select(3);
+            }
+        }
+    }
+
+    // --- Seed-words view (whole seed) ---
+    if Recovery.export-seed-view: VerticalLayout {
+        spacing: 10px;
+        Text {
+            text: "24 words · backs up the whole seed";
+            color: Theme.palette-muted;
+            font-family: "Montserrat";
+            font-size: 13px;
+        }
+        if !Recovery.show-qr: HorizontalLayout {
+            spacing: 16px;
+            Text {
+                text: Recovery.words-col1;
+                color: Theme.palette-foreground;
+                font-family: "SourceCodePro";
+                font-size: 15px;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: Recovery.words-col2;
+                color: Theme.palette-foreground;
+                font-family: "SourceCodePro";
+                font-size: 15px;
+                horizontal-stretch: 1;
+            }
+        }
+        if Recovery.show-qr: HorizontalLayout {
+            alignment: center;
+            Image {
+                source: Recovery.qr;
+                width: 200px;
+                height: 200px;
+                image-rendering: pixelated;
+            }
+        }
+        SecondaryAction {
+            width: 100%;
+            text: Recovery.show-qr ? "Show words" : "Show as SeedQR";
+            clicked => { Recovery.show-qr = !Recovery.show-qr; }
+        }
+        Text {
+            text: "These 24 words back up the WHOLE seed — every account and notebook. Import them into any taproot wallet, or write them down offline.";
+            color: Theme.palette-muted;
+            font-family: "Montserrat";
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+    }
+
+    // --- Single-key view (one notebook: hex/WIF) ---
+    if !Recovery.export-seed-view: VerticalLayout {
+        spacing: 10px;
+        Text {
+            text: "Notebook (whose private key):";
+            color: Theme.palette-muted;
+            font-family: "Montserrat";
+            font-size: 13px;
+        }
+        for nb in Recovery.export-notebooks: Rectangle {
+            height: 40px;
+            background: nb.index == Recovery.export-nb-index ? Theme.palette-primary : Theme.palette-surface;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: nb.index == Recovery.export-nb-index ? Theme.palette-primary : Theme.palette-border;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 8px;
+                Text {
+                    text: nb.name;
+                    color: nb.index == Recovery.export-nb-index ? #ffffff : Theme.palette-foreground;
+                    font-family: "Montserrat";
+                    font-size: 14px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                Text {
+                    text: nb.addr;
+                    color: nb.index == Recovery.export-nb-index ? #ffffff : Theme.palette-muted;
+                    font-family: "SourceCodePro";
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+            TouchArea { clicked => { Callbacks.export-pick-notebook(nb.index); } }
+        }
+        Text {
+            text: Recovery.export-label;
+            color: Theme.palette-muted;
+            font-family: "Montserrat";
+            font-size: 13px;
+            font-weight: 600;
+        }
+        Rectangle {
+            background: Theme.palette-surface;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.palette-danger;
+            VerticalLayout {
+                padding: 12px;
+                Text {
+                    text: Recovery.export-value;
+                    color: Theme.palette-foreground;
+                    font-family: "SourceCodePro";
+                    font-size: 13px;
+                    wrap: char-wrap;
+                }
+            }
+        }
+        HorizontalLayout {
+            alignment: center;
+            Image {
+                source: Recovery.export-qr;
+                width: 176px;
+                height: 176px;
+                image-rendering: pixelated;
+            }
+        }
+        Text {
+            text: "Just this one address's private key — import into the graffito desktop app or any wallet to spend it. The whole account recovers from the Seed words instead.";
+            color: Theme.palette-muted;
+            font-family: "Montserrat";
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+    }
+
+    Rectangle { vertical-stretch: 1; }
+}
