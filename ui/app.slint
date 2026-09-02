@@ -12,6 +12,7 @@ import { SignedScreen } from "screens/signed.slint";
 import { CoinsScreen } from "screens/coins.slint";
 import { SweepScreen } from "screens/sweep.slint";
 import { SettingsScreen } from "screens/settings.slint";
+import { AccountsScreen } from "screens/accounts.slint";
 
 export { Screen, Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, DeviceQuantumKey, Theme, ButtonVariant, ButtonState, ControlSize, Images }
 
@@ -106,128 +107,9 @@ export component AppWindow inherits Window {
         // Wallet-context switcher only (rotation seed index + BIP-86
         // account). The words reveal lives on its own screen (22), reached
         // from a separate Settings entry.
-        if Ui.screen == Screen.accounts: VerticalLayout {
+        if Ui.screen == Screen.accounts: AccountsScreen {
             width: parent.width;
             height: parent.height;
-            padding-left: 24px;
-            padding-right: 24px;
-            padding-top: 16px + UISize.control-center-status-bar-height;
-            padding-bottom: 24px;
-            spacing: 12px;
-
-            ScreenHeader {
-                title: "Accounts";
-                back => { Ui.screen = Screen.settings; }
-            }
-
-            // Recovery seed — its own row with an explanation.
-            Text {
-                text: "Recovery seed";
-                color: Theme.palette-foreground;
-                font-family: "Montserrat";
-                font-size: 15px;
-                font-weight: 600;
-            }
-            Text {
-                text: "The 24-word phrase that backs up this wallet. Move to a fresh index only if a phrase is ever exposed — old words keep old keys, so sweep funds first.";
-                color: Theme.palette-muted;
-                font-family: "Montserrat";
-                font-size: 13px;
-                wrap: word-wrap;
-            }
-            Rectangle {
-                height: 44px;
-                background: Theme.palette-surface;
-                border-radius: 12px;
-                border-width: 1px;
-                border-color: seed-input.has-focus ? Theme.palette-primary : Theme.palette-border;
-                clip: true;
-                seed-input := TextInput {
-                    x: 14px;
-                    width: parent.width - 28px;
-                    height: 24px;
-                    y: (parent.height - self.height) / 2;
-                    text <=> Recovery.seed-text;
-                    color: Theme.palette-foreground;
-                    font-family: "SourceCodePro";
-                    font-size: 18px;
-                    single-line: true;
-                    edited => { Recovery.saved-msg = ""; Recovery.context-error = ""; }
-                    accepted => { self.clear-focus(); }
-                }
-            }
-
-            // Account — its own row with an explanation.
-            Text {
-                text: "Account";
-                color: Theme.palette-foreground;
-                font-family: "Montserrat";
-                font-size: 15px;
-                font-weight: 600;
-            }
-            Text {
-                text: "A separate wallet under this seed — its own notebooks, coins, and addresses. Keep separate accounts for separate purposes.";
-                color: Theme.palette-muted;
-                font-family: "Montserrat";
-                font-size: 13px;
-                wrap: word-wrap;
-            }
-            Rectangle {
-                height: 44px;
-                background: Theme.palette-surface;
-                border-radius: 12px;
-                border-width: 1px;
-                border-color: account-input.has-focus ? Theme.palette-primary : Theme.palette-border;
-                clip: true;
-                account-input := TextInput {
-                    x: 14px;
-                    width: parent.width - 28px;
-                    height: 24px;
-                    y: (parent.height - self.height) / 2;
-                    text <=> Recovery.account-text;
-                    color: Theme.palette-foreground;
-                    font-family: "SourceCodePro";
-                    font-size: 18px;
-                    single-line: true;
-                    edited => { Recovery.saved-msg = ""; Recovery.context-error = ""; }
-                    accepted => { self.clear-focus(); }
-                }
-            }
-
-            SecondaryAction {
-                width: 100%;
-                text: "Save";
-                clicked => { Callbacks.set-context(); }
-            }
-            // Inline feedback: validation error (red) or the saved
-            // confirmation (accent) — the Switch stays on this screen.
-            if Recovery.context-error != "": Text {
-                text: Recovery.context-error;
-                color: Theme.palette-danger;
-                font-family: "Montserrat";
-                font-size: 13px;
-                wrap: word-wrap;
-            }
-            if Recovery.context-error == "" && Recovery.saved-msg != "": Text {
-                text: Recovery.saved-msg;
-                color: Theme.palette-primary;
-                font-family: "Montserrat";
-                font-size: 13px;
-                wrap: word-wrap;
-            }
-
-            // The recovery-phrase backup lives on its own screen (22),
-            // reached from a SEPARATE Settings entry — a pointer here so
-            // the two tasks are clearly distinct.
-            Text {
-                text: "To back up or rotate a seed, use \"Private keys…\" in Settings — its Seed words show the 24-word phrase for the selected seed index.";
-                color: Theme.palette-muted;
-                font-family: "Montserrat";
-                font-size: 13px;
-                wrap: word-wrap;
-            }
-
-            Rectangle { vertical-stretch: 1; }
         }
 
         // ---------------------------------- screen 22: recovery words
