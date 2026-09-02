@@ -803,16 +803,15 @@ fn delete_device_quantum_key(fs: &Fs) -> Result<(), String> {
 /// writes the new value straight into the cache itself rather than
 /// invalidating it, since each already has the fresh keypair (or its
 /// absence) in hand.
-fn device_quantum_key(
-    fs: &Fs,
-    cache: &Rc<RefCell<Option<Option<pq::MlKemKeypair>>>>,
-) -> Option<pq::MlKemKeypair> {
-    if let Some(cached) = cache.borrow().as_ref() {
-        return cached.clone();
+impl App {
+    fn device_quantum_key(&mut self, fs: &Fs) -> Option<pq::MlKemKeypair> {
+        if let Some(cached) = self.device_pq_key.as_ref() {
+            return cached.clone();
+        }
+        let kp = load_device_quantum_key(fs);
+        self.device_pq_key = Some(kp.clone());
+        kp
     }
-    let kp = load_device_quantum_key(fs);
-    *cache.borrow_mut() = Some(kp.clone());
-    kp
 }
 
 /// A single QR (v40, EcLevel::M byte mode) holds up to 2331 bytes —
@@ -1384,6 +1383,50 @@ struct App {
     /// Default ML-KEM level id (`pq::MlKemAlg::id()`) the Quantum-keys
     /// screen pre-selects. Persisted (`DeviceConfig.mlkem_level`).
     mlkem_level: u8,
+
+    // ---- live session state (never persisted) ------------------------
+    /// The ACTIVE notebook's BIP-86 account key — `None` on the notebook
+    /// list (Screen.notebooks). Set when the user taps a row; cleared when
+    /// the wallet context changes.
+    active: Option<u32>,
+    /// Quantum-keys screen: which notebook's ML-KEM key is shown — `None`
+    /// until the picker is touched, meaning "active-or-first-visible" (the
+    /// screen's original single-notebook default); `Some(index)` once the
+    /// user picks a specific notebook from the picker.
+    quantum_nb: Option<u32>,
+    /// Personal device quantum key (PLAN-graffito-quantum-key.md,
+    /// Screen.device-quantum-key): lazily loaded/cached — outer `None` =
+    /// not looked up yet, `Some(None)` = looked up, no key on disk,
+    /// `Some(Some(kp))` = loaded. NOT read at boot; the first touch is a
+    /// screen open, a compose eligibility check, or an unlock attempt.
+    device_pq_key: Option<Option<pq::MlKemKeypair>>,
+    /// The compose Plan built by Continue and consumed by the confirm
+    /// screen's Sign (`take()`n there) — the universal confirm gate keeps
+    /// nothing committed until Sign.
+    plan: Option<Plan>,
+    /// Same for a sweep/consolidate in progress.
+    sweep_plan: Option<SweepPlan>,
+    /// External PSBT signing (funding-unification): the deserialized-but-
+    /// UNSIGNED Psbt scanned in stage A (`on_sign_psbt`), stashed until the
+    /// universal confirm screen's Sign tap actually signs it in stage B —
+    /// nothing about it is persisted before then.
+    psbt_pending: Option<notes_core::psbt::Psbt>,
+    /// Post-quantum Security section (pq.rs): the exact text the last
+    /// `passphrase::generate()` call produced — a typed passphrase counts
+    /// toward quantum resistance ONLY while it's still byte-identical to
+    /// this (any edit un-certifies it). `None` until Generate is tapped.
+    pq_generated: Option<String>,
+    /// Funding-unification: the per-coin funding pick for the compose in
+    /// progress. Reset to the default rule whenever a fresh compose is
+    /// entered (see `pick_contact`).
+    funding_pick: FundingPick,
+    /// The change-destination pick for the compose in progress (reset with
+    /// `funding_pick`).
+    change_pick: ChangePickState,
+    /// Edge-tracks whether the compose draft is over the broadcast ceiling,
+    /// so the "too large" dialog pops once on crossing — not on every
+    /// keystroke.
+    compose_oversize: bool,
 }
 
 impl App {
@@ -1410,13 +1453,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let fs = cx.fs.clone();
     let ui_weak = ui.as_weak();
 
-    let plan: Rc<RefCell<Option<Plan>>> = Rc::new(RefCell::new(None));
-    let sweep_plan: Rc<RefCell<Option<SweepPlan>>> = Rc::new(RefCell::new(None));
-    // External PSBT signing (funding-unification): the deserialized-but-
-    // UNSIGNED Psbt scanned in stage A (`on_sign_psbt`), stashed until the
-    // universal confirm screen's Sign tap actually signs it in stage B —
-    // nothing about it is persisted before then.
-    let psbt_pending: Rc<RefCell<Option<notes_core::psbt::Psbt>>> = Rc::new(RefCell::new(None));
 
     // The app seed (GetAppSeed, PIN-gated on hardware) — kept so each
     // notebook's identity can be derived on demand (`Identity::from_bip86`
@@ -1449,18 +1485,17 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         bip_account: device_cfg.account,
         lock_policy: device_cfg.lock_time,
         mlkem_level: device_cfg.mlkem_level,
+        active: None,
+        quantum_nb: None,
+        device_pq_key: None,
+        plan: None,
+        sweep_plan: None,
+        psbt_pending: None,
+        pq_generated: None,
+        funding_pick: FundingPick::default(),
+        change_pick: ChangePickState::default(),
+        compose_oversize: false,
     }));
-    // Quantum-keys screen (27): which notebook's ML-KEM key is shown —
-    // `None` until the picker is touched, meaning "active-or-first-visible"
-    // (the screen's original single-notebook default); `Some(index)` once
-    // the user picks a specific notebook from the picker.
-    let quantum_nb: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
-    let active: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
-    // Personal device quantum key (PLAN-graffito-quantum-key.md, screen
-    // 28): lazily-loaded/cached — see `device_quantum_key`. NOT read here
-    // at boot; the first touch is a screen open, a compose eligibility
-    // check, or an unlock attempt.
-    let device_pq_key: Rc<RefCell<Option<Option<pq::MlKemKeypair>>>> = Rc::new(RefCell::new(None));
 
     // Persist the device config from the current cells (single source of
     // truth — inline DeviceConfig constructions drift as fields grow).
@@ -1787,11 +1822,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         }
     };
 
-    // Funding-unification: current per-coin funding pick + change pick for
-    // the compose in progress. Reset to the default rule whenever a fresh
-    // compose is entered (see `pick_contact` below).
-    let funding_pick: Rc<RefCell<FundingPick>> = Rc::new(RefCell::new(FundingPick::default()));
-    let change_pick: Rc<RefCell<ChangePickState>> = Rc::new(RefCell::new(ChangePickState::default()));
 
     // Rebuild the Pay-from screen's rows/summaries, the compose nav row's
     // label, AND Settings' spending card (same underlying section) from
@@ -1801,19 +1831,17 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let state = state.clone();
         let notebooks = notebooks.clone();
         let app = app.clone();
-        let active = active.clone();
         let app_seed = app_seed.clone();
-        let funding_pick = funding_pick.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
             let active_net = app.borrow().net.clone();
             let ix = notebooks.borrow();
-            let ctx = notebook_ctx(&ix, *active.borrow())
+            let ctx = notebook_ctx(&ix, app.borrow().active)
                 .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
             let section = ix.spending(&active_net, ctx.0, ctx.1).cloned();
             drop(ix);
-            let pick = funding_pick.borrow();
+            let pick = app.borrow().funding_pick.clone();
 
             let nb_rows: Vec<FundingCoinRow> = st
                 .utxos
@@ -1985,12 +2013,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // spends any spending-wallet coin.
     let refresh_change = {
         let ui_weak = ui_weak.clone();
-        let funding_pick = funding_pick.clone();
-        let change_pick = change_pick.clone();
+        let app = app.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let participates = !funding_pick.borrow().spending.is_empty();
-            let cp = change_pick.borrow();
+            let participates = !app.borrow().funding_pick.spending.is_empty();
+            let cp = app.borrow().change_pick.clone();
             let auto_label = if participates {
                 "Fresh spending-wallet address — protects the change from address reuse."
             } else {
@@ -2028,13 +2055,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let notebooks = notebooks.clone();
-        let active = active.clone();
+        let app = app.clone();
         let app_seed = app_seed.clone();
         let app = app.clone();
         Rc::new(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let ix = notebooks.borrow();
-            let active_acct = *active.borrow();
+            let active_acct = app.borrow().active;
             let dev_net = app.borrow().net.clone();
             let ctx = (app.borrow().seed_idx, app.borrow().bip_account);
             let build = |m: &notebooks::NotebookMeta| -> NotebookRow {
@@ -2091,7 +2118,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let fs = fs.clone();
         let state = state.clone();
         let identity = identity.clone();
-        let active = active.clone();
+        let app = app.clone();
         let notebooks = notebooks.clone();
         let app_seed = app_seed.clone();
         let app = app.clone();
@@ -2102,10 +2129,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let refresh_funding = refresh_funding.clone();
         Rc::new(move |account: u32| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            if active.borrow().is_some() {
+            if app.borrow().active.is_some() {
                 save_state(&fs, &state.borrow());
             }
-            *active.borrow_mut() = Some(account);
+            app.borrow_mut().active = Some(account);
             *identity.borrow_mut() = notebooks
                 .borrow()
                 .get(account)
@@ -2140,9 +2167,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let update_sweep = update_sweep.clone();
         let notebooks = notebooks.clone();
         let app = app.clone();
-        let active = active.clone();
-        let funding_pick = funding_pick.clone();
-        let change_pick = change_pick.clone();
         let refresh_funding = refresh_funding.clone();
         let refresh_change = refresh_change.clone();
         move |addr_raw: &str| {
@@ -2246,13 +2270,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // default rule (spending only when enabled AND funded).
                 let st = state.borrow();
                 let ix = notebooks.borrow();
-                let ctx = notebook_ctx(&ix, *active.borrow())
+                let ctx = notebook_ctx(&ix, app.borrow().active)
                     .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
                 let section = ix.spending(&app.borrow().net, ctx.0, ctx.1).cloned();
                 drop(ix);
-                *funding_pick.borrow_mut() = default_funding_pick(&st, section.as_ref());
+                app.borrow_mut().funding_pick = default_funding_pick(&st, section.as_ref());
                 drop(st);
-                *change_pick.borrow_mut() = ChangePickState::default();
+                app.borrow_mut().change_pick = ChangePickState::default();
                 refresh_funding();
                 refresh_change();
                 ui.global::<Callbacks>().invoke_compose_changed();
@@ -2428,9 +2452,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let notebooks = notebooks.clone();
         let app = app.clone();
-        let active = active.clone();
         let app_seed = app_seed.clone();
-        let quantum_nb = quantum_nb.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let qk = ui.global::<QuantumKeys>();
@@ -2469,12 +2491,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
             // Selection: an explicit picker choice (if it's still visible),
             // else the active-or-first default described above.
-            let default_meta = (*active.borrow())
+            let default_meta = (app.borrow().active)
                 .and_then(|acc| ix.get(acc))
                 .or_else(|| ix.visible(ctx.0, ctx.1).next())
                 .cloned();
-            let meta = quantum_nb
+            let meta = app
                 .borrow()
+                .quantum_nb
                 .and_then(|i| ix.visible(ctx.0, ctx.1).find(|m| m.index == i).cloned())
                 .or(default_meta);
             drop(ix);
@@ -2521,12 +2544,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     {
         let refresh_quantum_keys = refresh_quantum_keys.clone();
-        let quantum_nb = quantum_nb.clone();
+        let app = app.clone();
         ui.global::<Callbacks>().on_open_quantum_keys(move || {
             // Reopening the screen resets to the active-or-first default
             // rather than remembering the last-picked notebook from a
             // previous visit.
-            *quantum_nb.borrow_mut() = None;
+            app.borrow_mut().quantum_nb = None;
             refresh_quantum_keys();
         });
     }
@@ -2552,9 +2575,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     {
         let refresh_quantum_keys = refresh_quantum_keys.clone();
-        let quantum_nb = quantum_nb.clone();
+        let app = app.clone();
         ui.global::<Callbacks>().on_quantum_key_pick_notebook(move |index| {
-            *quantum_nb.borrow_mut() = Some(index as u32);
+            app.borrow_mut().quantum_nb = Some(index as u32);
             log::info!("cb: pq-key notebook={index}");
             refresh_quantum_keys();
         });
@@ -2586,11 +2609,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let refresh_device_quantum_key = {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let device_pq_key = device_pq_key.clone();
+        let app = app.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let dq = ui.global::<DeviceQuantumKey>();
-            match device_quantum_key(&fs, &device_pq_key) {
+            // Bound to a local first: a `match` scrutinee's temporaries live
+            // through the arms, and this one is a RefMut<App>.
+            let device_kp = app.borrow_mut().device_quantum_key(&fs);
+            match device_kp {
                 Some(kp) => {
                     dq.set_has_key(true);
                     dq.set_fingerprint(kp.fingerprint().into());
@@ -2664,7 +2690,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let device_pq_key = device_pq_key.clone();
+        let app = app.clone();
         let refresh_device_quantum_key = refresh_device_quantum_key.clone();
         ui.global::<Callbacks>().on_device_quantum_key_generate(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -2680,7 +2706,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 .and_then(|kp| save_device_quantum_key(&fs, kp.alg(), kp.seed()).map(|_| kp));
             match result {
                 Ok(kp) => {
-                    *device_pq_key.borrow_mut() = Some(Some(kp));
+                    app.borrow_mut().device_pq_key = Some(Some(kp));
                     dq.set_gen_error("".into());
                     dq.set_gen_extra_text("".into());
                     log::info!("cb: quantum-key generate level={} ok", mlkem_alg_name(alg));
@@ -2697,7 +2723,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let device_pq_key = device_pq_key.clone();
+        let app = app.clone();
         let refresh_device_quantum_key = refresh_device_quantum_key.clone();
         ui.global::<Callbacks>().on_device_quantum_key_import(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -2727,7 +2753,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             match pq::import_private(&armor) {
                 Ok((alg, seed)) => match save_device_quantum_key(&fs, alg, &seed) {
                     Ok(()) => {
-                        *device_pq_key.borrow_mut() =
+                        app.borrow_mut().device_pq_key =
                             Some(Some(pq::MlKemKeypair::from_seed(alg, &seed)));
                         dq.set_import_error("".into());
                         log::info!("cb: quantum-key import ok");
@@ -2759,11 +2785,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let device_pq_key = device_pq_key.clone();
+        let app = app.clone();
         ui.global::<Callbacks>().on_device_quantum_key_reveal_private(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let dq = ui.global::<DeviceQuantumKey>();
-            let Some(kp) = device_quantum_key(&fs, &device_pq_key) else {
+            let device_kp = app.borrow_mut().device_quantum_key(&fs);
+            let Some(kp) = device_kp else {
                 // Shouldn't be reachable (the button only shows when
                 // has-key is true) — fail safe back to the summary view.
                 dq.set_view("".into());
@@ -2803,7 +2830,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let device_pq_key = device_pq_key.clone();
+        let app = app.clone();
         let refresh_device_quantum_key = refresh_device_quantum_key.clone();
         ui.global::<Callbacks>().on_device_quantum_key_replace_confirm(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -2815,7 +2842,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             if let Err(e) = delete_device_quantum_key(&fs) {
                 log::warn!("cb: quantum-key replace err={e}");
             }
-            *device_pq_key.borrow_mut() = Some(None);
+            app.borrow_mut().device_pq_key = Some(None);
             dq.set_show_replace_confirm(false);
             dq.set_view("".into());
             dq.set_private_armor("".into());
@@ -2831,7 +2858,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let device_pq_key = device_pq_key.clone();
+        let app = app.clone();
         let refresh_device_quantum_key = refresh_device_quantum_key.clone();
         ui.global::<Callbacks>().on_device_quantum_key_delete_confirm(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -2839,7 +2866,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             if let Err(e) = delete_device_quantum_key(&fs) {
                 log::warn!("cb: quantum-key delete err={e}");
             }
-            *device_pq_key.borrow_mut() = Some(None);
+            app.borrow_mut().device_pq_key = Some(None);
             dq.set_show_delete_confirm(false);
             dq.set_view("".into());
             dq.set_private_armor("".into());
@@ -2915,11 +2942,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let identity = identity.clone();
-        let sweep_plan = sweep_plan.clone();
+        let app = app.clone();
         let fs = fs.clone();
         let notebooks = notebooks.clone();
         let app_seed = app_seed.clone();
-        let active = active.clone();
         let app = app.clone();
         ui.global::<Callbacks>().on_sweep_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -2927,11 +2953,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let ui_weak = ui_weak.clone();
             let state = state.clone();
             let identity = identity.clone();
-            let sweep_plan = sweep_plan.clone();
+            let app = app.clone();
             let fs = fs.clone();
             let notebooks = notebooks.clone();
             let app_seed = app_seed.clone();
-            let active = active.clone();
             let app = app.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
@@ -2953,7 +2978,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     &st.network,
                     (app.borrow().seed_idx, app.borrow().bip_account),
                 );
-                let dest_account = active.borrow().unwrap_or(0);
+                let dest_account = app.borrow().active.unwrap_or(0);
                 let id_guard = identity.borrow();
                 let result = id_guard
                     .as_ref()
@@ -3071,7 +3096,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             "Sign & export",
                         ) {
                             Ok(()) => {
-                                *sweep_plan.borrow_mut() = Some(SweepPlan {
+                                app.borrow_mut().sweep_plan = Some(SweepPlan {
                                     tx,
                                     kind: if consolidate { "consolidate" } else { "sweep" },
                                     dest: (!consolidate).then(|| dest.clone()),
@@ -3099,11 +3124,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let fs = fs.clone();
         let notebooks = notebooks.clone();
         let app = app.clone();
-        let active = active.clone();
         let refresh_funding = refresh_funding.clone();
         ui.global::<Callbacks>().on_set_spending_enabled(move |on| {
             let mut ix = notebooks.borrow_mut();
-            let ctx = notebook_ctx(&ix, *active.borrow())
+            let ctx = notebook_ctx(&ix, app.borrow().active)
                 .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
             let net_s = app.borrow().net.clone();
             ix.spending_mut(&net_s, ctx.0, ctx.1).enabled = on;
@@ -3124,13 +3148,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
     {
         let ui_weak = ui_weak.clone();
-        let funding_pick = funding_pick.clone();
+        let app = app.clone();
         let refresh_funding = refresh_funding.clone();
         let refresh_change = refresh_change.clone();
         ui.global::<Callbacks>().on_funding_toggle_coin(move |key| {
             let Some(ui) = ui_weak.upgrade() else { return };
             if let Some((spending_src, txid, vout)) = parse_funding_key(key.as_str()) {
-                funding_pick.borrow_mut().toggle(spending_src, txid, vout);
+                app.borrow_mut().funding_pick.toggle(spending_src, txid, vout);
             }
             refresh_funding();
             refresh_change();
@@ -3138,9 +3162,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
     {
-        let funding_pick = funding_pick.clone();
+        let app = app.clone();
         ui.global::<Callbacks>().on_funding_done(move || {
-            let pick = funding_pick.borrow();
+            let pick = app.borrow().funding_pick.clone();
             log::info!(
                 "cb: pay-from {} coins={}",
                 pick.mode_label(),
@@ -3158,11 +3182,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
     {
         let ui_weak = ui_weak.clone();
-        let change_pick = change_pick.clone();
+        let app = app.clone();
         let refresh_change = refresh_change.clone();
         ui.global::<Callbacks>().on_change_pick(move |choice| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            change_pick.borrow_mut().choice = choice.to_string();
+            app.borrow_mut().change_pick.choice = choice.to_string();
             ui.global::<ChangePick>().set_choice(choice.clone());
             ui.global::<ChangePick>().set_custom_error("".into());
             log::info!("cb: change-pick {choice}");
@@ -3172,10 +3196,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
     {
         let ui_weak = ui_weak.clone();
-        let change_pick = change_pick.clone();
+        let app = app.clone();
         ui.global::<Callbacks>().on_change_address_changed(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            change_pick.borrow_mut().custom_address =
+            app.borrow_mut().change_pick.custom_address =
                 ui.global::<ChangePick>().get_custom_address().to_string();
             ui.global::<ChangePick>().set_custom_error("".into());
             ui.global::<Callbacks>().invoke_compose_changed();
@@ -3189,30 +3213,17 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
-    // Edge-tracks whether the compose draft is over the broadcast ceiling, so
-    // the "too large" dialog pops once on crossing — not on every keystroke.
-    let compose_oversize = Rc::new(std::cell::Cell::new(false));
 
-    // Post-quantum Security section (pq.rs): the exact text the last
-    // `passphrase::generate()` call produced — a typed passphrase counts
-    // toward quantum resistance ONLY while it's still byte-identical to
-    // this (any edit un-certifies it). `None` until Generate is tapped.
-    let pq_generated: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
     // Keystroke cost estimator — pure arithmetic, no crypto runs (see
     // notes-core crypt::SEAL_OVERHEAD), so per-keystroke recompute is free.
     {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
-        let compose_oversize = compose_oversize.clone();
-        let funding_pick = funding_pick.clone();
-        let change_pick = change_pick.clone();
+        let app = app.clone();
         let notebooks = notebooks.clone();
         let app = app.clone();
-        let active = active.clone();
-        let pq_generated = pq_generated.clone();
         let fs = fs.clone();
-        let device_pq_key = device_pq_key.clone();
         ui.global::<Callbacks>().on_compose_changed(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let compose = ui.global::<Compose>();
@@ -3243,7 +3254,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             // to before this feature.
             let base_pq_eligible = private && compose.get_to_extra().row_count() == 0;
             let device_kp = if base_pq_eligible && !directed {
-                device_quantum_key(&fs, &device_pq_key)
+                app.borrow_mut().device_quantum_key(&fs)
             } else {
                 None
             };
@@ -3289,7 +3300,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let pq_passphrase_text = compose.get_pq_passphrase_text().to_string();
             let pq_passphrase_verified = pq_passphrase_active
                 && !pq_passphrase_text.is_empty()
-                && pq_generated.borrow().as_deref() == Some(pq_passphrase_text.as_str());
+                && app.borrow().pq_generated.as_deref() == Some(pq_passphrase_text.as_str());
             let pq_passphrase_weak = pq_passphrase_active
                 && !pq_passphrase_verified
                 && !pq_passphrase_text.is_empty()
@@ -3358,11 +3369,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             if text_len == 0 {
                 compose.set_cost_line("Type to see the cost.".into());
                 compose.set_can_continue(false);
-                compose_oversize.set(false); // clearing the draft re-arms the dialog
+                app.borrow_mut().compose_oversize = false; // clearing the draft re-arms the dialog
                 return;
             }
             let ix = notebooks.borrow();
-            let ctx = notebook_ctx(&ix, *active.borrow())
+            let ctx = notebook_ctx(&ix, app.borrow().active)
                 .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
             let net_s = app.borrow().net.clone();
             let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
@@ -3444,7 +3455,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     }
                 }
                 compose.set_can_continue(false);
-                if !compose_oversize.replace(true) {
+                let was_oversize = std::mem::replace(&mut app.borrow_mut().compose_oversize, true);
+            if !was_oversize {
                     match fit {
                         FitCheck::FitsAtStandard => {
                             compose.set_oversize_offer_bump(true);
@@ -3470,9 +3482,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 }
                 return;
             }
-            compose_oversize.set(false);
+            app.borrow_mut().compose_oversize = false;
 
-            let pick = funding_pick.borrow();
+            let pick = app.borrow().funding_pick.clone();
             let sp_participates = !pick.spending.is_empty();
             let mode_auto = !pick.touched && !sp_participates;
 
@@ -3543,7 +3555,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 .take(n_notebook)
                 .chain(std::iter::repeat(InputKind::P2wpkh).take(n_spending))
                 .collect();
-            let cp = change_pick.borrow();
+            let cp = app.borrow().change_pick.clone();
             let change_len = match change_spk_len_preview(
                 &cp.choice,
                 &cp.custom_address,
@@ -3696,13 +3708,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     {
         let ui_weak = ui_weak.clone();
-        let pq_generated = pq_generated.clone();
+        let app = app.clone();
         ui.global::<Callbacks>().on_pq_generate_passphrase(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             match passphrase::generate() {
                 Ok(phrase) => {
                     ui.global::<Compose>().set_pq_passphrase_text(phrase.clone().into());
-                    *pq_generated.borrow_mut() = Some(phrase);
+                    app.borrow_mut().pq_generated = Some(phrase);
                     log::info!("cb: pq-generate bits={:.0}", passphrase::GENERATED_BITS);
                     ui.global::<Callbacks>().invoke_compose_changed();
                 }
@@ -3717,30 +3729,22 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let identity = identity.clone();
-        let plan = plan.clone();
+        let app = app.clone();
         let notebooks = notebooks.clone();
         let app = app.clone();
-        let active = active.clone();
         let app_seed = app_seed.clone();
-        let funding_pick = funding_pick.clone();
-        let change_pick = change_pick.clone();
         let fs = fs.clone();
-        let device_pq_key = device_pq_key.clone();
         ui.global::<Callbacks>().on_compose_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
             let ui_weak = ui_weak.clone();
             let state = state.clone();
             let identity = identity.clone();
-            let plan = plan.clone();
+            let app = app.clone();
             let notebooks = notebooks.clone();
             let app = app.clone();
-            let active = active.clone();
             let app_seed = app_seed.clone();
-            let funding_pick = funding_pick.clone();
-            let change_pick = change_pick.clone();
             let fs = fs.clone();
-            let device_pq_key = device_pq_key.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
@@ -3763,10 +3767,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let pq_passphrase_text = compose.get_pq_passphrase_text().to_string();
                 let st = state.borrow();
                 let id_guard = identity.borrow();
-                let pick = funding_pick.borrow().clone();
-                let change_choice = change_pick.borrow().clone();
+                let pick = app.borrow().funding_pick.clone();
+                let change_choice = app.borrow().change_pick.clone();
                 let ix = notebooks.borrow();
-                let ctx = notebook_ctx(&ix, *active.borrow())
+                let ctx = notebook_ctx(&ix, app.borrow().active)
                     .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
                 let net_s = app.borrow().net.clone();
                 let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
@@ -3861,7 +3865,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     .ok_or("recipient has no quantum key — add one in Contacts")?;
                                 Some(pq::import_public(&armor).map_err(|e| e.to_string())?)
                             } else {
-                                let kp = device_quantum_key(&fs, &device_pq_key).ok_or(
+                                let kp = app.borrow_mut().device_quantum_key(&fs).ok_or(
                                     "no quantum key on this device — create one in Settings",
                                 )?;
                                 Some((kp.alg(), kp.ek().to_vec()))
@@ -4254,7 +4258,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         // (screen 4) — every fact it shows comes from
                         // decoding `note.raw_hex` itself; this only gathers
                         // the LOOKUPS (source labels, self/change spks).
-                        let active_acct = active.borrow().unwrap_or(0);
+                        let active_acct = app.borrow().active.unwrap_or(0);
                         let ix = notebooks.borrow();
                         let active_name = {
                             let short = id_guard
@@ -4392,7 +4396,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                         log::info!("cb: confirm fold amount={fold_amount}");
                                     }
                                 }
-                                *plan.borrow_mut() = Some(Plan {
+                                app.borrow_mut().plan = Some(Plan {
                                     note,
                                     text,
                                     private,
@@ -4428,18 +4432,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
-        let plan = plan.clone();
-        let sweep_plan = sweep_plan.clone();
-        let psbt_pending = psbt_pending.clone();
+        let app = app.clone();
         let identity = identity.clone();
         let fs = fs.clone();
         let refresh_notes = refresh_notes.clone();
         let notebooks = notebooks.clone();
         let app = app.clone();
-        let active = active.clone();
         let refresh_funding = refresh_funding.clone();
-        let funding_pick = funding_pick.clone();
-        let change_pick = change_pick.clone();
         let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_confirm_sign(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -4448,18 +4447,18 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             log::info!("cb: confirm sign kind={kind} txid={txid}");
             match kind.as_str() {
                 "sweep" | "consolidate" => {
-                    let Some(p) = sweep_plan.borrow_mut().take() else { return };
+                    let Some(p) = app.borrow_mut().sweep_plan.take() else { return };
                     ui.global::<Ui>().set_busy(true);
                     let ui_weak = ui_weak.clone();
                     let state = state.clone();
                     let fs = fs.clone();
-                    let active = active.clone();
+                    let app = app.clone();
                     let app = app.clone();
                     let refresh_home = refresh_home.clone();
                     Timer::single_shot(Duration::from_millis(150), move || {
                         let Some(ui) = ui_weak.upgrade() else { return };
                         let mut st = state.borrow_mut();
-                        let active_acct = active.borrow().unwrap_or(p.dest_account);
+                        let active_acct = app.borrow().active.unwrap_or(p.dest_account);
 
                         // Wallet-level ledger: remove each notebook's spent
                         // inputs from its own state file (the active one via
@@ -4550,7 +4549,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     });
                 }
                 "psbt" => {
-                    let Some(psbt) = psbt_pending.borrow_mut().take() else { return };
+                    let Some(psbt) = app.borrow_mut().psbt_pending.take() else { return };
                     let id_guard = identity.borrow();
                     let Some(id) = id_guard.as_ref() else {
                         drop(id_guard);
@@ -4603,7 +4602,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 }
                 _ => {
                     // "compose" — the default arm.
-                    let Some(p) = plan.borrow_mut().take() else { return };
+                    let Some(p) = app.borrow_mut().plan.take() else { return };
                     ui.global::<Ui>().set_busy(true);
                     let ui_weak = ui_weak.clone();
                     let state = state.clone();
@@ -4611,10 +4610,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     let refresh_notes = refresh_notes.clone();
                     let notebooks = notebooks.clone();
                     let app = app.clone();
-                    let active = active.clone();
                     let refresh_funding = refresh_funding.clone();
-                    let funding_pick = funding_pick.clone();
-                    let change_pick = change_pick.clone();
                     Timer::single_shot(Duration::from_millis(150), move || {
                         let Some(ui) = ui_weak.upgrade() else { return };
                         let mut st = state.borrow_mut();
@@ -4673,7 +4669,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         // the notebook ledger's unconfirmed-chaining update above.
                         if !p.spending_spent.is_empty() || p.spending_change_addr.is_some() {
                             let mut ix = notebooks.borrow_mut();
-                            let ctx = notebook_ctx(&ix, *active.borrow())
+                            let ctx = notebook_ctx(&ix, app.borrow().active)
                                 .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
                             let net_s = app.borrow().net.clone();
                             let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
@@ -4796,8 +4792,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         ui.global::<Compose>().set_gift_expanded(false);
                         // Funding/change picks reset too — a stale coin selection or
                         // custom change address must never leak into the next note.
-                        *funding_pick.borrow_mut() = FundingPick::default();
-                        *change_pick.borrow_mut() = ChangePickState::default();
+                        app.borrow_mut().funding_pick = FundingPick::default();
+                        app.borrow_mut().change_pick = ChangePickState::default();
                         ui.global::<ChangePick>().set_choice("auto".into());
                         ui.global::<ChangePick>().set_custom_address("".into());
                         ui.global::<Ui>().set_busy(false);
@@ -4814,16 +4810,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // rows, then return to the kind's origin screen.
     {
         let ui_weak = ui_weak.clone();
-        let plan = plan.clone();
-        let sweep_plan = sweep_plan.clone();
-        let psbt_pending = psbt_pending.clone();
+        let app = app.clone();
         ui.global::<Callbacks>().on_confirm_cancel(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let kind = ui.global::<ConfirmSign>().get_kind().to_string();
             log::info!("cb: confirm cancel kind={kind}");
-            *plan.borrow_mut() = None;
-            *sweep_plan.borrow_mut() = None;
-            *psbt_pending.borrow_mut() = None;
+            app.borrow_mut().plan = None;
+            app.borrow_mut().sweep_plan = None;
+            app.borrow_mut().psbt_pending = None;
             let cs = ui.global::<ConfirmSign>();
             cs.set_inputs(Rc::new(VecModel::from(Vec::<ConfirmRow>::new())).into());
             cs.set_outputs(Rc::new(VecModel::from(Vec::<ConfirmRow>::new())).into());
@@ -4847,7 +4841,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let state = state.clone();
         let identity = identity.clone();
         let fs = fs.clone();
-        let device_pq_key = device_pq_key.clone();
+        let app = app.clone();
         ui.global::<Callbacks>().on_open_note(move |id| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
@@ -4916,7 +4910,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let mut kem_key_present = false;
             let mut kem_key_wrong = false;
             if self_kem_locked {
-                if let Some(kp) = device_quantum_key(&fs, &device_pq_key) {
+                // Bound first: an `if let` scrutinee's RefMut would live
+                // through the whole block.
+                let device_kp = app.borrow_mut().device_quantum_key(&fs);
+                if let Some(kp) = device_kp {
                     kem_key_present = true;
                     if !self_kem_also_pw {
                         if let (Some(locked_body), Some(ident)) =
@@ -5043,9 +5040,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let identity = identity.clone();
         let notebooks = notebooks.clone();
         let app = app.clone();
-        let active = active.clone();
         let app_seed = app_seed.clone();
-        let device_pq_key = device_pq_key.clone();
         ui.global::<Callbacks>().on_unlock_note(move |password| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let id_str = ui.global::<View>().get_id().to_string();
@@ -5067,7 +5062,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // device key is present — KEM-only self bodies are tried
                 // automatically on open and never show the Unlock button.
                 let mlkem_secret = if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
-                    device_quantum_key(&fs, &device_pq_key).map(|kp| kp.secret())
+                    app.borrow_mut().device_quantum_key(&fs).map(|kp| kp.secret())
                 } else {
                     None
                 };
@@ -5078,7 +5073,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
                         let ix = notebooks.borrow();
                         let net_s = app.borrow().net.clone();
-                        let leaf = (*active.borrow())
+                        let leaf = (app.borrow().active)
                             .and_then(|acc| ix.get(acc))
                             .and_then(|meta| derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s));
                         drop(ix);
@@ -5190,7 +5185,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let fs = fs.clone();
         let notebooks = notebooks.clone();
         let app = app.clone();
-        let active = active.clone();
         let app_seed = app_seed.clone();
         Rc::new(move |json: &str, src: &str| -> Result<String, String> {
             let id_guard = identity.borrow();
@@ -5212,7 +5206,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // funded/mixed-source notes (extract_notes_multi_deduped ORs
                 // with the producer's spends_from_self, never narrows).
                 let ix = notebooks.borrow();
-                let ctx = notebook_ctx(&ix, *active.borrow())
+                let ctx = notebook_ctx(&ix, app.borrow().active)
                     .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
                 let net_s = app.borrow().net.clone();
                 let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
@@ -5234,7 +5228,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // no candidates behaves exactly like the pre-pq extraction,
                 // just leaving every pq note `locked`.
                 let mlkem_secrets: Vec<pq::MlKemSecret> =
-                    (*active.borrow()).and_then(|acc| ix.get(acc)).and_then(|meta| {
+                    (app.borrow().active).and_then(|acc| ix.get(acc)).and_then(|meta| {
                         derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s)
                     }).map(|leaf| {
                         derive_mlkem_keypairs(&leaf).into_iter().map(|kp| kp.secret()).collect()
@@ -5705,7 +5699,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let notebooks = notebooks.clone();
         let app = app.clone();
         let app_seed = app_seed.clone();
-        let psbt_pending = psbt_pending.clone();
         ui.global::<Callbacks>().on_sign_psbt(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let id_guard = identity.borrow();
@@ -5853,7 +5846,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             if existing.is_empty() { msg.clone().into() } else { format!("{existing}; {msg}").into() },
                         );
                     }
-                    *psbt_pending.borrow_mut() = Some(psbt);
+                    app.borrow_mut().psbt_pending = Some(psbt);
                 }
                 Err(e) => {
                     log::warn!("cb: confirm summarize err={e}");
@@ -5869,7 +5862,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let identity = identity.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let active = active.clone();
         let notebooks = notebooks.clone();
         let app_seed = app_seed.clone();
         let persist_config = persist_config.clone();
@@ -5882,7 +5874,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             // notebook, cycle the shared network, persist it in config, and
             // reload the active notebook's ledger for the new chain (each
             // notebook keeps a per-network ledger in state-<net>-<account>).
-            if active.borrow().is_some() {
+            if app.borrow().active.is_some() {
                 save_state(&fs, &state.borrow());
             }
             let next = match app.borrow().net.as_str() {
@@ -5895,7 +5887,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             app.borrow_mut().net = next.clone();
             persist_config();
             log::info!("cb: set-network {next}");
-            if let Some(account) = *active.borrow() {
+            let active = app.borrow().active;
+            if let Some(account) = active {
                 let mut fresh = load_state(&fs, &next, account);
                 fresh.chunk_override = app.borrow().device_chunk;
                 *state.borrow_mut() = fresh;
@@ -6102,7 +6095,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let notebooks = notebooks.clone();
-        let active = active.clone();
+        let app = app.clone();
         let app_seed = app_seed.clone();
         let app = app.clone();
         let refresh_notebooks = refresh_notebooks.clone();
@@ -6149,7 +6142,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 log::info!("cb: rename-notebook account={account}");
                 refresh_notebooks();
                 // If it's the open notebook, update its home title.
-                if *active.borrow() == Some(account) {
+                if app.borrow().active == Some(account) {
                     let title = notebooks
                         .borrow()
                         .get(account)
@@ -6194,11 +6187,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let state = state.clone();
-        let active = active.clone();
+        let app = app.clone();
         let refresh_notebooks = refresh_notebooks.clone();
         ui.global::<NotebookCb>().on_back_to_list(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            if active.borrow().is_some() {
+            if app.borrow().active.is_some() {
                 save_state(&fs, &state.borrow());
             }
             refresh_notebooks();
@@ -6497,7 +6490,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let state = state.clone();
-        let active = active.clone();
+        let app = app.clone();
         let app = app.clone();
         let persist_config = persist_config.clone();
         let refresh_notebooks = refresh_notebooks.clone();
@@ -6520,9 +6513,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let seed_changed = app.borrow().seed_idx != new_seed;
             let acct_changed = app.borrow().bip_account != new_acct;
             if seed_changed || acct_changed {
-                if active.borrow().is_some() {
+                if app.borrow().active.is_some() {
                     save_state(&fs, &state.borrow());
-                    *active.borrow_mut() = None;
+                    app.borrow_mut().active = None;
                 }
                 app.borrow_mut().seed_idx = new_seed;
                 app.borrow_mut().bip_account = new_acct;
