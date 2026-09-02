@@ -10,6 +10,7 @@ import { ConfirmSignScreen } from "screens/confirm-sign.slint";
 import { SyncScreen } from "screens/sync.slint";
 import { SignedScreen } from "screens/signed.slint";
 import { CoinsScreen } from "screens/coins.slint";
+import { SweepScreen } from "screens/sweep.slint";
 
 export { Screen, Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, DeviceQuantumKey, Theme, ButtonVariant, ButtonState, ControlSize, Images }
 
@@ -89,142 +90,9 @@ export component AppWindow inherits Window {
         // Shared flow: destination line (picker- or self-set), fee tiers with
         // the collapse-on-Custom rate field, read-only inputs summary, live
         // cost line. A sweep spends ALL coins by design — no coin picking.
-        if Ui.screen == Screen.sweep: VerticalLayout {
+        if Ui.screen == Screen.sweep: SweepScreen {
             width: parent.width;
             height: parent.height;
-            padding-left: 24px;
-            padding-right: 24px;
-            padding-top: 8px + UISize.control-center-status-bar-height;
-            padding-bottom: 24px;
-            spacing: 10px;
-
-            ScreenHeader {
-                vertical-stretch: 0;
-                title: Sweep.kind == "consolidate" ? "Consolidate" : "Sweep";
-                // Sweep: back to the destination picker (still in sweep
-                // mode); consolidate: back to the coins list.
-                back => {
-                    if Sweep.kind == "consolidate" {
-                        Callbacks.refresh-coins();
-                        Ui.screen = Screen.coins;
-                    } else {
-                        Callbacks.refresh-contacts();
-                        Ui.screen = Screen.contacts;
-                    }
-                }
-            }
-
-            Text {
-                vertical-stretch: 0;
-                text: Sweep.dest-label;
-                color: Theme.palette-muted;
-                font-family: "SourceCodePro";
-                font-size: 14px;
-                overflow: elide;
-            }
-
-            HorizontalLayout {
-                vertical-stretch: 0;
-                spacing: 6px;
-                PillOption {
-                    label: "Economy";
-                    selected: Sweep.tier == 0;
-                    horizontal-stretch: 1;
-                    tapped => { Sweep.tier = 0; Callbacks.sweep-changed(); }
-                }
-                PillOption {
-                    label: "Normal";
-                    selected: Sweep.tier == 1;
-                    horizontal-stretch: 1;
-                    tapped => { Sweep.tier = 1; Callbacks.sweep-changed(); }
-                }
-                PillOption {
-                    label: "Fast";
-                    selected: Sweep.tier == 2;
-                    horizontal-stretch: 1;
-                    tapped => { Sweep.tier = 2; Callbacks.sweep-changed(); }
-                }
-                PillOption {
-                    label: "Custom";
-                    selected: Sweep.tier == 3;
-                    horizontal-stretch: 1;
-                    tapped => { Sweep.tier = 3; Callbacks.sweep-changed(); }
-                }
-            }
-
-            if Sweep.tier == 3: HorizontalLayout {
-                vertical-stretch: 0;
-                spacing: 8px;
-                Rectangle {
-                    height: 44px;
-                    horizontal-stretch: 1;
-                    background: Theme.palette-surface;
-                    border-radius: 12px;
-                    border-width: 1px;
-                    border-color: sweep-rate-input.has-focus ? Theme.palette-primary : Theme.palette-border;
-                    clip: true;
-                    sweep-rate-input := TextInput {
-                        x: 14px;
-                        width: parent.width - 28px;
-                        height: 24px;
-                        y: (parent.height - self.height) / 2;
-                        text <=> Sweep.rate-text;
-                        color: Theme.palette-foreground;
-                        font-family: "SourceCodePro";
-                        font-size: 18px;
-                        single-line: true;
-                        edited => { Callbacks.sweep-changed(); }
-                        accepted => { self.clear-focus(); }
-                    }
-                }
-                Text {
-                    text: "sat/vB";
-                    color: Theme.palette-muted;
-                    font-family: "Montserrat";
-                    font-size: 16px;
-                    vertical-alignment: center;
-                }
-            }
-
-            // Read-only inputs summary — a sweep always spends every coin.
-            Rectangle {
-                vertical-stretch: 0;
-                border-radius: 12px;
-                background: Theme.palette-surface;
-                border-width: 1px;
-                border-color: Theme.palette-border;
-                height: 42px;
-                Text {
-                    x: 14px;
-                    width: parent.width - 28px;
-                    height: parent.height;
-                    text: Sweep.inputs-line;
-                    color: Theme.palette-muted;
-                    font-family: "SourceCodePro";
-                    font-size: 14px;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
-            }
-
-            Text {
-                vertical-stretch: 0;
-                text: Sweep.cost-line;
-                color: Theme.palette-muted;
-                font-family: "SourceCodePro";
-                font-size: 14px;
-                wrap: word-wrap;
-            }
-
-            PrimaryAction {
-                vertical-stretch: 0;
-                width: 100%;
-                text: "Continue";
-                disabled: !Sweep.can-continue;
-                clicked => { Callbacks.sweep-continue(); }
-            }
-
-            Rectangle { vertical-stretch: 1; }
         }
 
         // -------------------------------------------- screen 6: settings
