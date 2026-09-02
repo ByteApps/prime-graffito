@@ -1,8 +1,8 @@
 import { Theme, UISize, ButtonVariant, ButtonState, ControlSize, Images } from "@ui/theme.slint";
-import { Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, ConfirmRow, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow, Funding, FundingCoinRow, ChangePick, QuantumKeys, DeviceQuantumKey } from "callbacks.slint";
+import { Screen, Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, ConfirmRow, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow, Funding, FundingCoinRow, ChangePick, QuantumKeys, DeviceQuantumKey } from "callbacks.slint";
 import { Button } from "@ui/button.slint";
 
-export { Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, DeviceQuantumKey, Theme, ButtonVariant, ButtonState, ControlSize, Images }
+export { Screen, Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, DeviceQuantumKey, Theme, ButtonVariant, ButtonState, ControlSize, Images }
 
 component PrimaryAction inherits Button {
     background: Theme.palette-primary;
@@ -483,7 +483,7 @@ export component AppWindow inherits Window {
         // ------------------------------------------------ screen 0: home
         // A NOTEBOOK's home (its address, notes, compose). The header back
         // returns to the notebook list (screen 20 — the main screen).
-        if Ui.screen == 0: VerticalLayout {
+        if Ui.screen == Screen.home: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -549,7 +549,7 @@ export component AppWindow inherits Window {
                 clicked => {
                     Contacts.pick-mode = "compose";
                     Callbacks.refresh-contacts();
-                    Ui.screen = 7;
+                    Ui.screen = Screen.contacts;
                 }
             }
             SecondaryAction {
@@ -557,20 +557,20 @@ export component AppWindow inherits Window {
                 text: "Notes";
                 clicked => {
                     Callbacks.refresh-notes();
-                    Ui.screen = 1;
+                    Ui.screen = Screen.notes;
                 }
             }
             SecondaryAction {
                 width: 100%;
                 text: "Sync";
-                clicked => { Ui.screen = 5; }
+                clicked => { Ui.screen = Screen.sync; }
             }
             // No Settings here — it is wallet-level (network, chunk, wallet
             // coins/sweep), reachable from the notebook list.
         }
 
         // ------------------------------------------- screen 1: notes list
-        if Ui.screen == 1: VerticalLayout {
+        if Ui.screen == Screen.notes: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -581,7 +581,7 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 title: "Notes";
-                back => { Callbacks.refresh-home(); Ui.screen = 0; }
+                back => { Callbacks.refresh-home(); Ui.screen = Screen.home; }
             }
 
             if Notes.rows.length == 0 && Notes.hidden-label == "": Text {
@@ -678,7 +678,7 @@ export component AppWindow inherits Window {
         }
 
         // -------------------------------------------- screen 2: note view
-        if Ui.screen == 2: VerticalLayout {
+        if Ui.screen == Screen.note: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -689,7 +689,7 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 title: "Note";
-                back => { Callbacks.refresh-notes(); Ui.screen = 1; }
+                back => { Callbacks.refresh-notes(); Ui.screen = Screen.notes; }
             }
 
             HorizontalLayout {
@@ -849,7 +849,7 @@ export component AppWindow inherits Window {
         // ---------------------------------------------- screen 3: compose
         // Everything interactive stays in the top ~400px so the on-screen
         // keyboard never covers a control (sibling-app gotcha).
-        if Ui.screen == 3: VerticalLayout {
+        if Ui.screen == Screen.compose: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -863,7 +863,7 @@ export component AppWindow inherits Window {
                 title: "Compose";
                 // Back to the picker so the recipient can be changed
                 // without losing the draft (Compose.text persists).
-                back => { Callbacks.refresh-contacts(); Ui.screen = 7; }
+                back => { Callbacks.refresh-contacts(); Ui.screen = Screen.contacts; }
             }
 
             // Who this note goes to — set by the contacts picker; compose
@@ -918,7 +918,7 @@ export component AppWindow inherits Window {
             Rectangle {
                 vertical-stretch: 0;
                 height: 34px;
-                TouchArea { clicked => { Callbacks.funding-open(); Ui.screen = 25; } }
+                TouchArea { clicked => { Callbacks.funding-open(); Ui.screen = Screen.pay-from; } }
                 HorizontalLayout {
                     Text {
                         text: "Pay from · " + Compose.pay-from-label;
@@ -943,7 +943,7 @@ export component AppWindow inherits Window {
             Rectangle {
                 vertical-stretch: 0;
                 height: 30px;
-                TouchArea { clicked => { Callbacks.change-open(); Ui.screen = 26; } }
+                TouchArea { clicked => { Callbacks.change-open(); Ui.screen = Screen.change; } }
                 HorizontalLayout {
                     Text {
                         text: "Change · " + Compose.change-label;
@@ -1274,7 +1274,7 @@ export component AppWindow inherits Window {
         // so it's the last line of defense before anything hits the wire.
         // The Flickable stretches so the Sign button stays pinned at the
         // screen's true bottom regardless of how many rows there are.
-        if Ui.screen == 4: VerticalLayout {
+        if Ui.screen == Screen.confirm-sign: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -1452,7 +1452,7 @@ export component AppWindow inherits Window {
         }
 
         // ------------------------------------------------- screen 5: sync
-        if Ui.screen == 5: VerticalLayout {
+        if Ui.screen == Screen.sync: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -1463,7 +1463,7 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 title: "Sync";
-                back => { Sync.picking = false; Callbacks.refresh-home(); Ui.screen = 0; }
+                back => { Sync.picking = false; Callbacks.refresh-home(); Ui.screen = Screen.home; }
             }
 
             Text {
@@ -1557,7 +1557,7 @@ export component AppWindow inherits Window {
         }
 
         // -------------------------------------------- screen 8: signed PSBT
-        if Ui.screen == 8: VerticalLayout {
+        if Ui.screen == Screen.signed: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -1604,14 +1604,14 @@ export component AppWindow inherits Window {
             PrimaryAction {
                 width: 100%;
                 text: "Done";
-                clicked => { Callbacks.refresh-home(); Ui.screen = 0; }
+                clicked => { Callbacks.refresh-home(); Ui.screen = Screen.home; }
             }
         }
 
         // ------------------------------------ screen 9: coins (viewer-first)
         // The UTXO ledger as of the last sync bundle. ONE action — the
         // consolidate button on top — opens the shared sweep screen (10).
-        if Ui.screen == 9: VerticalLayout {
+        if Ui.screen == Screen.coins: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -1622,7 +1622,7 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 title: "Wallet coins";
-                back => { Ui.screen = 6; }
+                back => { Ui.screen = Screen.settings; }
             }
 
             Text {
@@ -1689,7 +1689,7 @@ export component AppWindow inherits Window {
         // Shared flow: destination line (picker- or self-set), fee tiers with
         // the collapse-on-Custom rate field, read-only inputs summary, live
         // cost line. A sweep spends ALL coins by design — no coin picking.
-        if Ui.screen == 10: VerticalLayout {
+        if Ui.screen == Screen.sweep: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -1706,10 +1706,10 @@ export component AppWindow inherits Window {
                 back => {
                     if Sweep.kind == "consolidate" {
                         Callbacks.refresh-coins();
-                        Ui.screen = 9;
+                        Ui.screen = Screen.coins;
                     } else {
                         Callbacks.refresh-contacts();
-                        Ui.screen = 7;
+                        Ui.screen = Screen.contacts;
                     }
                 }
             }
@@ -1828,7 +1828,7 @@ export component AppWindow inherits Window {
         }
 
         // -------------------------------------------- screen 6: settings
-        if Ui.screen == 6: VerticalLayout {
+        if Ui.screen == Screen.settings: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -1839,7 +1839,7 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 title: "Settings";
-                back => { Ui.screen = 20; }
+                back => { Ui.screen = Screen.notebooks; }
             }
 
             // Settings has grown (Coins/Sweep, chunk, Accounts, the whole
@@ -1867,7 +1867,7 @@ export component AppWindow inherits Window {
                     text: "Coins";
                     clicked => {
                         Callbacks.refresh-coins();
-                        Ui.screen = 9;
+                        Ui.screen = Screen.coins;
                     }
                 }
                 SecondaryAction {
@@ -1877,7 +1877,7 @@ export component AppWindow inherits Window {
                     clicked => {
                         Contacts.pick-mode = "sweep";
                         Callbacks.refresh-contacts();
-                        Ui.screen = 7;
+                        Ui.screen = Screen.contacts;
                     }
                 }
             }
@@ -2023,7 +2023,7 @@ export component AppWindow inherits Window {
             SecondaryAction {
                 width: 100%;
                 text: "Accounts…";
-                clicked => { Ui.screen = 21; }
+                clicked => { Ui.screen = Screen.accounts; }
             }
 
             // Post-quantum (pq.rs): this notebook's ML-KEM receive
@@ -2032,7 +2032,7 @@ export component AppWindow inherits Window {
             SecondaryAction {
                 width: 100%;
                 text: "Quantum keys…";
-                clicked => { Callbacks.open-quantum-keys(); Ui.screen = 27; }
+                clicked => { Callbacks.open-quantum-keys(); Ui.screen = Screen.quantum-keys; }
             }
 
             // Personal device quantum key (PLAN-graffito-quantum-key.md):
@@ -2043,7 +2043,7 @@ export component AppWindow inherits Window {
             SecondaryAction {
                 width: 100%;
                 text: "Quantum key…";
-                clicked => { Callbacks.open-device-quantum-key(); Ui.screen = 28; }
+                clicked => { Callbacks.open-device-quantum-key(); Ui.screen = Screen.device-quantum-key; }
             }
 
             // Spending wallet (funding-unification): an optional BIP-84
@@ -2222,7 +2222,7 @@ export component AppWindow inherits Window {
                 disabled: !Recovery.seed-available;
                 clicked => {
                     Callbacks.reveal-public();
-                    Ui.screen = 23;
+                    Ui.screen = Screen.public-keys;
                 }
             }
             Text {
@@ -2238,7 +2238,7 @@ export component AppWindow inherits Window {
                 disabled: !Recovery.seed-available;
                 clicked => {
                     Callbacks.reveal-private();
-                    Ui.screen = 24;
+                    Ui.screen = Screen.private-keys;
                 }
             }
             Text {
@@ -2257,7 +2257,7 @@ export component AppWindow inherits Window {
         // Wallet-context switcher only (rotation seed index + BIP-86
         // account). The words reveal lives on its own screen (22), reached
         // from a separate Settings entry.
-        if Ui.screen == 21: VerticalLayout {
+        if Ui.screen == Screen.accounts: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -2268,7 +2268,7 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 title: "Accounts";
-                back => { Ui.screen = 6; }
+                back => { Ui.screen = Screen.settings; }
             }
 
             // Recovery seed — its own row with an explanation.
@@ -2385,7 +2385,7 @@ export component AppWindow inherits Window {
         // Dedicated reveal, reached straight from Settings. Words/SeedQR
         // for the active seed; Back → Settings, clearing them
         // (reveal-close). Fits comfortably on its own, no scrolling.
-        if Ui.screen == 22: VerticalLayout {
+        if Ui.screen == Screen.recovery-words: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -2398,7 +2398,7 @@ export component AppWindow inherits Window {
                 title: "Recovery words";
                 back => {
                     Callbacks.reveal-close();
-                    Ui.screen = 6;
+                    Ui.screen = Screen.settings;
                 }
             }
 
@@ -2457,7 +2457,7 @@ export component AppWindow inherits Window {
         // ------------------------------------- screen 23: PUBLIC keys
         // Watch-only exports for the active account: xpub + tr() descriptor
         // (whole account, all addresses). Safe to share.
-        if Ui.screen == 23: VerticalLayout {
+        if Ui.screen == Screen.public-keys: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -2470,7 +2470,7 @@ export component AppWindow inherits Window {
                 title: "Public keys";
                 back => {
                     Callbacks.export-close();
-                    Ui.screen = 6;
+                    Ui.screen = Screen.settings;
                 }
             }
 
@@ -2544,7 +2544,7 @@ export component AppWindow inherits Window {
         // ------------------------------------- screen 24: PRIVATE keys
         // The dangerous exports: recovery words (whole seed) and a single
         // notebook's raw key (hex/WIF). Camera warning up top.
-        if Ui.screen == 24: VerticalLayout {
+        if Ui.screen == Screen.private-keys: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -2557,7 +2557,7 @@ export component AppWindow inherits Window {
                 title: "Private keys";
                 back => {
                     Callbacks.export-close();
-                    Ui.screen = 6;
+                    Ui.screen = Screen.settings;
                 }
             }
 
@@ -2744,7 +2744,7 @@ export component AppWindow inherits Window {
         // wallet (P2WPKH) — with independent per-coin selection. Selecting
         // coins from both sources at once is allowed (signed in one pass
         // via wpkh::sign_mixed_inputs) and flagged with a linkage warning.
-        if Ui.screen == 25: VerticalLayout {
+        if Ui.screen == Screen.pay-from: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -2756,7 +2756,7 @@ export component AppWindow inherits Window {
             ScreenHeader {
                 vertical-stretch: 0;
                 title: "Pay from";
-                back => { Callbacks.funding-done(); Ui.screen = 3; }
+                back => { Callbacks.funding-done(); Ui.screen = Screen.compose; }
             }
 
             if Funding.warning != "": Text {
@@ -2855,7 +2855,7 @@ export component AppWindow inherits Window {
 
         // -------------------------------------------- screen 26: Change
         // Single-select destination for the compose in progress.
-        if Ui.screen == 26: VerticalLayout {
+        if Ui.screen == Screen.change: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -2867,7 +2867,7 @@ export component AppWindow inherits Window {
             ScreenHeader {
                 vertical-stretch: 0;
                 title: "Change";
-                back => { Callbacks.change-done(); Ui.screen = 3; }
+                back => { Callbacks.change-done(); Ui.screen = Screen.compose; }
             }
 
             ChangeOptionRow {
@@ -2933,7 +2933,7 @@ export component AppWindow inherits Window {
         // recovery words (Settings → "Recovery words…") already
         // reconstruct every derived key, so no separate private-key
         // export lives here.
-        if Ui.screen == 27: VerticalLayout {
+        if Ui.screen == Screen.quantum-keys: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -2944,7 +2944,7 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 title: "Quantum keys";
-                back => { Callbacks.quantum-keys-close(); Ui.screen = 6; }
+                back => { Callbacks.quantum-keys-close(); Ui.screen = Screen.settings; }
             }
 
             Text {
@@ -3106,7 +3106,7 @@ export component AppWindow inherits Window {
         // so the code has maximum contrast, QR at the largest square that
         // fits. Tap anywhere closes (dismiss TouchArea is the LAST child —
         // the qr-zoom rule: anything stacked above it swallows the tap).
-        if Ui.screen == 27 && QuantumKeys.qr-zoom: Rectangle {
+        if Ui.screen == Screen.quantum-keys && QuantumKeys.qr-zoom: Rectangle {
             width: parent.width;
             height: parent.height;
             background: #ffffff;
@@ -3129,7 +3129,7 @@ export component AppWindow inherits Window {
         // personal ML-KEM keypair — generate-or-import while none exists,
         // else fingerprint + share/export/replace/delete. `DeviceQuantumKey
         // .view` picks which panel of the "key present" state shows.
-        if Ui.screen == 28: VerticalLayout {
+        if Ui.screen == Screen.device-quantum-key: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -3140,7 +3140,7 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 title: "My quantum key";
-                back => { Callbacks.device-quantum-key-close(); Ui.screen = 6; }
+                back => { Callbacks.device-quantum-key-close(); Ui.screen = Screen.settings; }
             }
 
             Flickable {
@@ -3461,7 +3461,7 @@ export component AppWindow inherits Window {
         // Fullscreen armor-QR overlay (screen 28's tap-to-zoom) — mirrors
         // screen 27's; picks the public or private QR by which panel is
         // showing.
-        if Ui.screen == 28 && DeviceQuantumKey.qr-zoom: Rectangle {
+        if Ui.screen == Screen.device-quantum-key && DeviceQuantumKey.qr-zoom: Rectangle {
             width: parent.width;
             height: parent.height;
             background: #ffffff;
@@ -3483,7 +3483,7 @@ export component AppWindow inherits Window {
         // The one input slot doubles as manual address entry and, when a
         // row's "name" zone was tapped, the contact-name editor. Errors go
         // in the label above the field so the keyboard can't hide them.
-        if Ui.screen == 7: VerticalLayout {
+        if Ui.screen == Screen.contacts: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -3498,10 +3498,10 @@ export component AppWindow inherits Window {
                 back => {
                     if Contacts.pick-mode == "sweep" {
                         Contacts.pick-mode = "compose";
-                        Ui.screen = 6;
+                        Ui.screen = Screen.settings;
                     } else {
                         Callbacks.refresh-home();
-                        Ui.screen = 0;
+                        Ui.screen = Screen.home;
                     }
                 }
             }
@@ -3637,7 +3637,7 @@ export component AppWindow inherits Window {
         // ------------------------------------ screen 20: notebooks (MAIN)
         // A notebook = an indexed identity; tapping a row opens its home
         // (screen 0). Boot lands here. Fresh install = empty list.
-        if Ui.screen == 20: VerticalLayout {
+        if Ui.screen == Screen.notebooks: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
@@ -3663,7 +3663,7 @@ export component AppWindow inherits Window {
             SecondaryAction {
                 width: 100%;
                 text: "Settings";
-                clicked => { Callbacks.refresh-home(); Callbacks.funding-open(); Ui.screen = 6; }
+                clicked => { Callbacks.refresh-home(); Callbacks.funding-open(); Ui.screen = Screen.settings; }
             }
 
             if Ui.error != "": Text {
