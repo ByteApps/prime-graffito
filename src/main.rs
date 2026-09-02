@@ -2114,6 +2114,1185 @@ impl App {
     }
 }
 
+impl App {
+    /// Persist the device config from the current cells (single source of
+    /// truth — inline DeviceConfig constructions drift as fields grow).
+    /// Coins screen (9): the UTXO ledger as of the last sync bundle, biggest
+    /// first. Viewer-first — consolidate is the screen's single action.
+    /// Sweep screen (10) repricing — every tier tap / rate keystroke. Pure
+    /// arithmetic (estimate_sweep_vsize is byte-exact vs build_sweep_tx).
+    fn update_sweep(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let notebooks = self.notebooks.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let sweep = ui.global::<Sweep>();
+        let st = state.borrow();
+        let tier = sweep.get_tier();
+        if tier != 3 {
+            sweep.set_rate_text(format!("{}", st.fee_rate(tier)).into());
+        }
+        // Wallet-level: inputs are EVERY notebook's coins (flush the
+        // active one first so its file reflects the latest ledger).
+        save_state(&fs, &st);
+        let (n, total) = wallet_balance(
+            &fs,
+            &notebooks.borrow(),
+            &st.network,
+            (self.seed_idx, self.bip_account),
+        );
+        sweep.set_inputs_line(format!("Inputs · {n} coin(s) · {total} sats (all notebooks)").into());
+        if n == 0 {
+            sweep.set_cost_line("Nothing to sweep — no spendable coins.".into());
+            sweep.set_can_continue(false);
+            return;
+        }
+        let rate = match resolve_rate(tier, sweep.get_rate_text().as_str(), &st) {
+            Ok(r) => r,
+            Err(e) => {
+                sweep.set_cost_line(e.into());
+                sweep.set_can_continue(false);
+                return;
+            }
+        };
+        let consolidate = sweep.get_kind() == "consolidate";
+        let dest_spk_len = if consolidate {
+            34 // our own P2TR
+        } else {
+            match Recipient::parse(st.network(), sweep.get_dest().as_str()) {
+                Ok(r) => r.spk.len(),
+                Err(_) => {
+                    sweep.set_cost_line(
+                        format!("Destination is not a valid {} address.", st.network).into(),
+                    );
+                    sweep.set_can_continue(false);
+                    return;
+                }
+            }
+        };
+        let vsize = estimate_sweep_vsize(n, dest_spk_len);
+        let fee = (vsize as f64 * rate).ceil() as u64;
+        if total <= fee || total - fee < notes_core::DUST_LIMIT {
+            sweep.set_cost_line(
+                format!("Balance {total} sats can't cover the ~{fee} sat fee.").into(),
+            );
+            sweep.set_can_continue(false);
+            return;
+        }
+        let recv = total - fee;
+        sweep.set_cost_line(
+            if consolidate {
+                format!(
+                    "Consolidates {n} coins into one · ~{vsize} vB · fee ~{} @ {rate} sat/vB · keeps {recv} sats",
+                    sats_line(fee, st.btc_usd)
+                )
+            } else {
+                format!(
+                    "Sweeps {total} sats · ~{vsize} vB · fee ~{} @ {rate} sat/vB · destination receives {recv} sats",
+                    sats_line(fee, st.btc_usd)
+                )
+            }
+            .into(),
+        );
+        sweep.set_can_continue(true);
+    }
+
+    /// spends any spending-wallet coin.
+    /// A notebook's display name: its local name, else the 1-based default
+    /// Rebuild the notebook list (screen 20) from the index + each
+    /// notebook's state file. Device has no live balance — the row meta is
+    /// address-short · note count.
+    /// Open a notebook: save the current one, swap identity + state to the
+    /// target account, refresh every per-notebook view, and show its home.
+    fn switch_notebook(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, account: u32) {
+        let state = self.state.clone();
+        let identity = self.identity.clone();
+        let notebooks = self.notebooks.clone();
+        let app_seed = self.app_seed.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        if self.active.is_some() {
+            save_state(&fs, &state.borrow());
+        }
+        self.active = Some(account);
+        *identity.borrow_mut() = notebooks
+            .borrow()
+            .get(account)
+            .and_then(|m| derive_identity(app_seed_get(&app_seed), m, &self.net));
+        let mut loaded = load_state(&fs, &self.net, account);
+        loaded.chunk_override = self.device_chunk; // chunk is device-level
+        *state.borrow_mut() = loaded;
+        let short = identity
+            .borrow()
+            .as_ref()
+            .map(|id| short_addr(&id.address(state.borrow().network())))
+            .unwrap_or_default();
+        let title = notebook_name(&notebooks.borrow(), account, &short);
+        ui.global::<NotebooksUi>().set_title(title.into());
+        log::info!("cb: open-notebook account={account}");
+        self.refresh_home(&ui_weak);
+        self.refresh_notes(&ui_weak);
+        self.refresh_coins(&ui_weak, &fs);
+        self.refresh_contacts(&ui_weak);
+        self.refresh_funding(&ui_weak);
+        ui.global::<Ui>().set_screen(Screen::Home);
+    }
+
+    /// Rebuild the notebook list (screen 20) from the index + each
+    /// notebook's state file. Device has no live balance — the row meta is
+    /// address-short · note count.
+    /// Open a notebook: save the current one, swap identity + state to the
+    /// target account, refresh every per-notebook view, and show its home.
+    /// The single pick funnel (self row / recent row / manual entry / scan):
+    /// validates, bumps recency, sets the compose recipient + label, and
+    /// navigates. Invalid manual input stays on the picker with an error.
+    /// Keystroke cost estimator — pure arithmetic, no crypto runs (see
+    /// notes-core crypt::SEAL_OVERHEAD), so per-keystroke recompute is free.
+    fn compose_changed(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let notebooks = self.notebooks.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let compose = ui.global::<Compose>();
+        let st = state.borrow();
+        let to_address = compose.get_to_address().trim().to_string();
+        let directed = !to_address.is_empty();
+        let private = compose.get_private_note();
+        // HOISTED to the handler TOP (2026-08-21): every early return below
+        // (bad rate, empty text, "No funds", recipient-parse) must NOT skip
+        // the pq section's visibility recompute — the "No funds"
+        // and recipient-parse branches return before the cost math, and
+        // the pq section's visibility must never depend on funding —
+        // an unfunded notebook still shows (and toggles) the Security
+        // section, exactly like the Mac app.
+        //
+        // Self-pw notes (PLAN-graffito-self-pw.md, 2026-08-22): the
+        // passphrase layer is also available for a PRIVATE SELF-note
+        // (no recipient) — `pq_eligible` gates the whole Security
+        // section and the passphrase control for either shape.
+        // ML-KEM on a DIRECTED note encapsulates to the contact's
+        // seed-derived receive key; on a SELF-note (PLAN-graffito-
+        // quantum-key.md) it instead encapsulates to THIS device's
+        // personal, non-seed quantum key — a self-note's seed-derived
+        // key would derive from the same leaf as its enc key (security
+        // theater, pq.rs's module doc), so `pq_mlkem_eligible` for a
+        // self-note additionally requires the device key file to
+        // exist. Directed eligibility/computation stays byte-identical
+        // to before this feature.
+        let base_pq_eligible = private && compose.get_to_extra().row_count() == 0;
+        let device_kp = if base_pq_eligible && !directed {
+            self.device_quantum_key(fs)
+        } else {
+            None
+        };
+        let pq_mlkem_eligible =
+            base_pq_eligible && (directed || device_kp.is_some());
+        let pq_eligible = base_pq_eligible;
+        compose.set_pq_eligible(pq_eligible);
+        compose.set_pq_mlkem_eligible(pq_mlkem_eligible);
+        let mlkem_parsed: Option<(pq::MlKemAlg, Vec<u8>)> = if !pq_mlkem_eligible {
+            None
+        } else if directed {
+            st.contacts
+                .iter()
+                .find(|c| c.address == to_address)
+                .and_then(|c| c.mlkem_ek.as_deref())
+                .and_then(|a| pq::import_public(a).ok())
+        } else {
+            device_kp.as_ref().map(|kp| (kp.alg(), kp.ek().to_vec()))
+        };
+        let mlkem_available = mlkem_parsed.is_some();
+        compose.set_pq_mlkem_available(mlkem_available);
+        if (!pq_mlkem_eligible || !mlkem_available) && compose.get_pq_mlkem_active() {
+            compose.set_pq_mlkem_active(false);
+        }
+        compose.set_pq_mlkem_caption(
+            if !pq_mlkem_eligible {
+                String::new()
+            } else if let Some((alg, ek)) = &mlkem_parsed {
+                // Same "LEVEL · fingerprint" line either way — for a
+                // self-note this names the device's own quantum key
+                // (PLAN-graffito-quantum-key.md).
+                format!("{} · {}", mlkem_alg_name(*alg), pq::fingerprint(*alg, ek))
+            } else {
+                "recipient has no quantum key — add one in Contacts".to_string()
+            }
+            .into(),
+        );
+        if !pq_eligible && compose.get_pq_passphrase_active() {
+            compose.set_pq_passphrase_active(false);
+        }
+        let pq_passphrase_active = pq_eligible && compose.get_pq_passphrase_active();
+        let pq_mlkem_active = pq_mlkem_eligible && mlkem_available && compose.get_pq_mlkem_active();
+        let pq_passphrase_text = compose.get_pq_passphrase_text().to_string();
+        let pq_passphrase_verified = pq_passphrase_active
+            && !pq_passphrase_text.is_empty()
+            && self.pq_generated.as_deref() == Some(pq_passphrase_text.as_str());
+        let pq_passphrase_weak = pq_passphrase_active
+            && !pq_passphrase_verified
+            && !pq_passphrase_text.is_empty()
+            && passphrase::typed_is_weak(&pq_passphrase_text);
+        compose.set_pq_passphrase_weak(pq_passphrase_weak);
+        compose.set_pq_passphrase_strength(
+            if !pq_passphrase_active {
+                String::new()
+            } else if pq_passphrase_verified {
+                format!("{:.0}-bit generated phrase", passphrase::GENERATED_BITS)
+            } else if pq_passphrase_weak {
+                "weak — short passphrases are easy to brute-force; use Generate or add more words"
+                    .to_string()
+            } else {
+                "strength can't be verified — use Generate for a certified phrase".to_string()
+            }
+            .into(),
+        );
+        let pq_flags_guess: u8 = (if pq_passphrase_active { notes_core::envelope::FLAG_PW } else { 0 })
+            | (if pq_mlkem_active { notes_core::envelope::FLAG_MLKEM } else { 0 });
+        let pq_alg_guess = mlkem_parsed.as_ref().map(|(alg, _)| *alg);
+        let pq_extra = pq::pq_overhead(pq_flags_guess, pq_alg_guess);
+        compose.set_pq_security_label(
+            if pq_flags_guess == 0 {
+                String::new()
+            } else {
+                pq_security_label(
+                    private,
+                    directed,
+                    pq_passphrase_active,
+                    pq_passphrase_verified,
+                    if pq_mlkem_active { pq_alg_guess } else { None },
+                )
+            }
+            .into(),
+        );
+        // Tier pills drive the rate field; a manual edit set tier=3
+        // first, so we never overwrite the user's custom value.
+        let tier = compose.get_tier();
+        if tier != 3 {
+            compose.set_rate_text(format!("{}", st.fee_rate(tier)).into());
+        }
+        let rate = match resolve_rate(tier, compose.get_rate_text().as_str(), &st) {
+            Ok(r) => r,
+            Err(e) => {
+                compose.set_cost_line(e.into());
+                compose.set_can_continue(false);
+                return;
+            }
+        };
+        // Keyboard Done: the system keyboard's Done key has no distinct
+        // signal — it sends a plain '\n' (gui-app-keyboard maps
+        // KeyAction::Return to Key::Char('\n')). A note is composed as
+        // one paragraph on-device, so ANY newline here means "done
+        // typing": strip it and bump dismiss-nonce, which the editor
+        // watches to drop focus (focus loss hides the keyboard).
+        let raw = compose.get_text();
+        if raw.as_str().contains('\n') {
+            let stripped: String = raw.as_str().replace('\n', "");
+            compose.set_text(stripped.into());
+            compose.set_dismiss_nonce(compose.get_dismiss_nonce() + 1);
+            log::info!("cb: compose keyboard-done");
+        }
+        let text = compose.get_text();
+        let text_len = text.as_str().len();
+        if text_len == 0 {
+            compose.set_cost_line("Type to see the cost.".into());
+            compose.set_can_continue(false);
+            self.compose_oversize = false; // clearing the draft re-arms the dialog
+            return;
+        }
+        let ix = notebooks.borrow();
+        let ctx = notebook_ctx(&ix, self.active)
+            .unwrap_or((self.seed_idx, self.bip_account));
+        let net_s = self.net.clone();
+        let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
+        drop(ix);
+        if st.utxos.is_empty() && section.as_ref().map(|s| s.balance()).unwrap_or(0) == 0 {
+            compose
+                .set_cost_line("No funds — fund the address and import a sync bundle.".into());
+            compose.set_can_continue(false);
+            return;
+        }
+        // Directed = non-empty To field. Validate the recipient like
+        // resolve_rate validates the rate — errors land in the cost
+        // line, never a panic.
+        let recipient_spk_len = if directed {
+            match Recipient::parse(st.network(), &to_address) {
+                Ok(r) => {
+                    if compose.get_private_note() && r.p2tr_x.is_none() {
+                        compose.set_cost_line(
+                            "Private directed notes need a taproot (…1p…) recipient — or switch to Public.".into(),
+                        );
+                        compose.set_can_continue(false);
+                        return;
+                    }
+                    Some(r.spk.len())
+                }
+                Err(_) => {
+                    compose.set_cost_line(
+                        format!("Enter a valid {} recipient address.", st.network).into(),
+                    );
+                    compose.set_can_continue(false);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
+        // Recipient count for THIS draft (primary + every "+ Add
+        // recipient" row); 0 for a self-note. Each recipient gets the
+        // SAME gift amount, so the real sats leaving to recipients is
+        // `gift * n_recipients`, not `gift` alone — the balance checks
+        // and cost-line suffix below both need the total, not the
+        // per-recipient amount.
+        let n_recipients: usize =
+            if directed { 1 + compose.get_to_extra().row_count() } else { 0 };
+        let total_gift: u64 = gift * n_recipients as u64;
+
+        // Post-quantum Security section (pq.rs) — directed private
+        // single-recipient notes only (envelope validity rule: pq
+        // layers are incompatible with FLAG_MULTI). Recomputed every
+        // keystroke so the section reacts immediately to the Private
+        // toggle, an extra recipient being added, or the recipient
+        // changing underneath an already-open draft.
+
+        let effective = st.effective_chunk();
+        // `estimate_note_cost_pq` bakes `pq::pq_overhead` into the same
+        // body_len arithmetic `estimate_note_cost` uses — byte-exact
+        // for the compose cost line whenever a pq layer is active;
+        // `(0, None)` (pq_flags_guess == 0) is never reached here.
+        let est = if pq_flags_guess != 0 {
+            estimate_note_cost_pq(
+                text_len, effective, 1, recipient_spk_len, pq_flags_guess, pq_alg_guess,
+            )
+        } else {
+            estimate_note_cost(text_len, private, effective, 1, recipient_spk_len)
+        };
+        let fit = fit_check(effective, text_len, private, recipient_spk_len, pq_extra);
+
+        // Over the per-tx broadcast ceiling (vsize > 100 kB, or > 255
+        // chunks). Show it in the cost line, gate Continue, and pop the
+        // "too large" dialog once — on the crossing, not every keystroke.
+        if !matches!(fit, FitCheck::Ok) {
+            match &est {
+                Ok((chunks, vsize)) => compose.set_cost_line(
+                    format!("{chunks} chunk(s) · ~{vsize} vB — too large to broadcast").into(),
+                ),
+                Err(_) => {
+                    compose.set_cost_line("Too large to broadcast (> 255 chunks).".into())
+                }
+            }
+            compose.set_can_continue(false);
+            let was_oversize = std::mem::replace(&mut self.compose_oversize, true);
+        if !was_oversize {
+                match fit {
+                    FitCheck::FitsAtStandard => {
+                        compose.set_oversize_offer_bump(true);
+                        compose.set_oversize_message(
+                            "This note doesn't fit at your current chunk size. \
+                             Switch to Standard (a single large chunk) to fit it in one transaction?"
+                                .into(),
+                        );
+                    }
+                    _ => {
+                        compose.set_oversize_offer_bump(false);
+                        compose.set_oversize_message(
+                            "This note is too large to broadcast. A single Bitcoin \
+                             transaction can't exceed ~100 kB (the network relay limit), \
+                             whatever the chunk size. Shorten the note, or split it across \
+                             several notes. Multi-transaction notes are planned for a \
+                             future release."
+                                .into(),
+                        );
+                    }
+                }
+                compose.set_show_oversize(true);
+            }
+            return;
+        }
+        self.compose_oversize = false;
+
+        let pick = self.funding_pick.clone();
+        let sp_participates = !pick.spending.is_empty();
+        let mode_auto = !pick.touched && !sp_participates;
+
+        if mode_auto {
+            // Byte-identical to pre-funding-unification behavior.
+            match est {
+                Ok((chunks, vsize)) => {
+                    let fee = (vsize as f64 * rate).ceil() as u64;
+                    if fee + total_gift > st.balance() {
+                        compose.set_cost_line(
+                            format!(
+                                "Needs ~{} sats — balance is {}.",
+                                fee + total_gift,
+                                st.balance()
+                            )
+                            .into(),
+                        );
+                        compose.set_can_continue(false);
+                    } else {
+                        compose.set_cost_line(
+                            format!(
+                                "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}",
+                                sats_line(fee, st.btc_usd),
+                                if !directed {
+                                    String::new()
+                                } else if n_recipients <= 1 {
+                                    format!(" + {gift} sats to recipient")
+                                } else {
+                                    format!(
+                                        " + {n_recipients} × {gift} = {total_gift} sats to {n_recipients} recipients"
+                                    )
+                                }
+                            )
+                            .into(),
+                        );
+                        compose.set_can_continue(true);
+                    }
+                }
+                Err(e) => {
+                    compose.set_cost_line(format!("{e}").into());
+                    compose.set_can_continue(false);
+                }
+            }
+            return;
+        }
+
+        // Exact-selected-coins preview (notebook subset, spending, or
+        // mixed): real selected input kinds/count and real extra
+        // outputs, unlike `estimate_note_cost`'s single-taproot-input
+        // approximation above (used only for `fit_check`'s ceiling test).
+        let payload_lens = match payload_lens_for(text_len, private, pq_extra, effective) {
+            Ok(v) => v,
+            Err(e) => {
+                compose.set_cost_line(e.into());
+                compose.set_can_continue(false);
+                return;
+            }
+        };
+        let chunks = payload_lens.len();
+        let n_notebook = pick.notebook.len();
+        let n_spending = pick.spending.len();
+        if n_notebook + n_spending == 0 {
+            compose.set_cost_line("Select at least one coin — \"Pay from\" above.".into());
+            compose.set_can_continue(false);
+            return;
+        }
+        let kinds: Vec<InputKind> = std::iter::repeat(InputKind::Taproot)
+            .take(n_notebook)
+            .chain(std::iter::repeat(InputKind::P2wpkh).take(n_spending))
+            .collect();
+        let cp = self.change_pick.clone();
+        let change_len = match change_spk_len_preview(
+            &cp.choice,
+            &cp.custom_address,
+            st.network(),
+            sp_participates,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                compose.set_cost_line(e.into());
+                compose.set_can_continue(false);
+                return;
+            }
+        };
+        drop(cp);
+        let nb_total: u64 = st
+            .utxos
+            .iter()
+            .filter(|u| pick.is_selected(false, &u.txid, u.vout))
+            .map(|u| u.value)
+            .sum();
+        let sp_total: u64 = section
+            .as_ref()
+            .map(|s| {
+                s.utxos
+                    .iter()
+                    .filter(|u| pick.is_selected(true, &u.txid, u.vout))
+                    .map(|u| u.value)
+                    .sum()
+            })
+            .unwrap_or(0);
+        let in_value = nb_total + sp_total;
+        // Anchored condition (mirrors `build_note_tx_mixed_exact_anchored`):
+        // the notebook dust-to-self output is skipped whenever a notebook
+        // coin is among the selected inputs — that input already anchors
+        // the tx to the notebook's address history, so the discoverability
+        // dust would be pure waste. Only a pure-spending-wallet-funded
+        // build (n_notebook == 0) still needs it.
+        let dust_applies = sp_participates && n_notebook == 0;
+        let dust_needed = if dust_applies { notes_core::DUST_LIMIT } else { 0 };
+
+        // Both shapes' extra (non-OP_RETURN) output lengths, computed
+        // unconditionally now (previously the no-change list was only
+        // built inside the folded branch) so the honest-fee-label
+        // fold prediction below can always compare the two, exactly
+        // mirroring what `notes_core::fold::predict_fold` needs.
+        let mut extra_no_change: Vec<usize> = Vec::new();
+        if let Some(l) = recipient_spk_len {
+            extra_no_change.push(l);
+        }
+        if dust_applies {
+            extra_no_change.push(34); // notebook dust spk (P2TR, always 34 bytes)
+        }
+        let mut extra_with_change = extra_no_change.clone();
+        extra_with_change.push(change_len);
+        let vsize_with_change = estimate_vsize_mixed(&kinds, &payload_lens, &extra_with_change);
+        let fee_with_change = (vsize_with_change as f64 * rate).ceil() as u64;
+        let vsize_no_change = estimate_vsize_mixed(&kinds, &payload_lens, &extra_no_change);
+        let fee_no_change = (vsize_no_change as f64 * rate).ceil() as u64;
+        let leftover_with_change =
+            in_value.checked_sub(fee_with_change + total_gift + dust_needed);
+
+        // took_no_change tracks which shape `(vsize, fee, ok)` below
+        // actually reflects — needed because `ok2`'s success range
+        // (`<= DUST_LIMIT`, including exactly 0 — an exact fit, not a
+        // fold) is intentionally broader than
+        // `notes_core::fold::predict_fold`'s "something folded"
+        // signal (which excludes a 0 leftover); keeping this boolean
+        // means the fold suffix below can never fire on an exact-fit
+        // no-change build that isn't actually folding anything.
+        let (vsize, fee, ok, took_no_change) = match leftover_with_change {
+            Some(v) if v >= notes_core::DUST_LIMIT => {
+                (vsize_with_change, fee_with_change, true, false)
+            }
+            _ => {
+                let ok2 = matches!(in_value.checked_sub(fee_no_change + total_gift + dust_needed), Some(v) if v <= notes_core::DUST_LIMIT);
+                (vsize_no_change, fee_no_change, ok2, true)
+            }
+        };
+        // Honest-fee-label (2026-07-19, ported from the graffito desktop app):
+        // when the no-change (dust-fold) shape is what a real build
+        // would take, `fee` above is already the byte-true NOMINAL
+        // fee — but the actual signed tx's fee also carries the
+        // sub-dust leftover on top of it (it can't be its own output,
+        // so the builder folds it into the fee instead).
+        // `predict_fold` mirrors that builder decision exactly for
+        // this fixed selection (pin-tested in notes-core's
+        // `tests/fold.rs` against `build_note_tx_exact`/
+        // `build_note_tx_mixed_exact_anchored`), so the cost line can
+        // show the split honestly instead of a single number that
+        // reads as an inflated fee.
+        let fold = if ok && took_no_change {
+            notes_core::fold::predict_fold(in_value, total_gift + dust_needed, fee_with_change, fee_no_change, true)
+        } else {
+            None
+        };
+        if !ok {
+            compose.set_cost_line(
+                format!(
+                    "Needs ~{} sats — selected coins total {}.",
+                    fee + total_gift + dust_needed,
+                    in_value
+                )
+                .into(),
+            );
+            compose.set_can_continue(false);
+        } else {
+            compose.set_cost_line(
+                format!(
+                    "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}{}{}",
+                    sats_line(fee, st.btc_usd),
+                    if !directed {
+                        String::new()
+                    } else if n_recipients <= 1 {
+                        format!(" + {gift} sats to recipient")
+                    } else {
+                        format!(
+                            " + {n_recipients} × {gift} = {total_gift} sats to {n_recipients} recipients"
+                        )
+                    },
+                    if dust_applies {
+                        format!(" + {} sats dust to notebook", notes_core::DUST_LIMIT)
+                    } else {
+                        String::new()
+                    },
+                    if let Some((_, folded)) = fold {
+                        format!(" + {folded} sats leftover (dust rule)")
+                    } else {
+                        String::new()
+                    }
+                )
+                .into(),
+            );
+            compose.set_can_continue(true);
+        }
+    }
+
+    fn pick_contact(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, addr_raw: &str) {
+        let state = self.state.clone();
+        let notebooks = self.notebooks.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let addr = addr_raw.trim().to_string();
+        let contacts_g = ui.global::<Contacts>();
+        let sweep_mode = contacts_g.get_pick_mode() == "sweep";
+        let compose = ui.global::<Compose>();
+
+        // Appending an EXTRA recipient to an in-progress directed draft
+        // (Callbacks.add-recipient-open set this) — pushes onto
+        // Compose.to-extra instead of replacing the primary, and does
+        // NOT touch funding/change picks or navigate anywhere but back
+        // to compose (this is editing a draft, not starting a fresh
+        // one — unlike the replace path below, which intentionally
+        // resets those for a brand-new compose target).
+        if !sweep_mode && contacts_g.get_picking_extra() {
+            if addr.is_empty() {
+                contacts_g
+                    .set_input_error("Can't add yourself as an extra recipient.".into());
+                log::warn!("cb: pick-contact err=self extra=true");
+                return;
+            }
+            let mut st = state.borrow_mut();
+            if Recipient::parse(st.network(), &addr).is_err() {
+                contacts_g
+                    .set_input_error(format!("Not a valid {} address.", st.network).into());
+                log::warn!("cb: pick-contact err=invalid address extra=true");
+                return;
+            }
+            let primary = compose.get_to_address().to_string();
+            let current_extra: Vec<ToRow> = compose.get_to_extra().iter().collect();
+            if addr == primary || current_extra.iter().any(|r| r.address == addr) {
+                contacts_g.set_input_error("Already a recipient of this note.".into());
+                log::warn!("cb: pick-contact err=duplicate extra=true");
+                return;
+            }
+            if 1 + current_extra.len() + 1 > 255 {
+                contacts_g.set_input_error("Too many recipients (max 255).".into());
+                log::warn!("cb: pick-contact err=too-many extra=true");
+                return;
+            }
+            upsert_contact(&mut st, &addr);
+            save_state(&fs, &st);
+            let label = to_label_for(&st, &addr);
+            drop(st);
+            let mut new_extra = current_extra;
+            new_extra.push(ToRow { address: addr.as_str().into(), label: label.into() });
+            compose.set_to_extra(Rc::new(VecModel::from(new_extra)).into());
+            contacts_g.set_picking_extra(false);
+            contacts_g.set_input_text("".into());
+            contacts_g.set_input_error("".into());
+            contacts_g.set_naming_address("".into());
+            log::info!("cb: pick-contact to={addr} extra=true");
+            ui.global::<Ui>().set_screen(Screen::Compose);
+            return;
+        }
+
+        if addr.is_empty() {
+            // Self: compose only — the sweep picker hides the Self card
+            // (sweep-to-self is the Coins screen's consolidate).
+            if sweep_mode {
+                return;
+            }
+            compose.set_to_address("".into());
+            compose.set_to_label("to: self — my notebook".into());
+            compose.set_to_extra(Rc::new(VecModel::from(Vec::<ToRow>::new())).into());
+            log::info!("cb: pick-contact to=self");
+        } else {
+            let mut st = state.borrow_mut();
+            if Recipient::parse(st.network(), &addr).is_err() {
+                contacts_g
+                    .set_input_error(format!("Not a valid {} address.", st.network).into());
+                log::warn!("cb: pick-contact err=invalid address");
+                return;
+            }
+            upsert_contact(&mut st, &addr);
+            save_state(&fs, &st);
+            if sweep_mode {
+                let sweep = ui.global::<Sweep>();
+                sweep.set_kind("sweep".into());
+                sweep.set_dest(addr.as_str().into());
+                sweep.set_dest_label(to_label_for(&st, &addr).into());
+                sweep.set_tier(1);
+                log::info!("cb: sweep-open kind=sweep to={addr}");
+            } else {
+                compose.set_to_address(addr.as_str().into());
+                compose.set_to_label(to_label_for(&st, &addr).into());
+                compose.set_to_extra(Rc::new(VecModel::from(Vec::<ToRow>::new())).into());
+                log::info!("cb: pick-contact to={addr}");
+            }
+        }
+        contacts_g.set_input_text("".into());
+        contacts_g.set_input_error("".into());
+        contacts_g.set_naming_address("".into());
+        if sweep_mode {
+            self.update_sweep(ui_weak, fs);
+            ui.global::<Ui>().set_screen(Screen::Sweep);
+        } else {
+            // Fresh compose: reset the funding/change picks to their
+            // default rule (spending only when enabled AND funded).
+            let st = state.borrow();
+            let ix = notebooks.borrow();
+            let ctx = notebook_ctx(&ix, self.active)
+                .unwrap_or((self.seed_idx, self.bip_account));
+            let section = ix.spending(&self.net, ctx.0, ctx.1).cloned();
+            drop(ix);
+            self.funding_pick = default_funding_pick(&st, section.as_ref());
+            drop(st);
+            self.change_pick = ChangePickState::default();
+            self.refresh_funding(&ui_weak);
+            self.refresh_change(&ui_weak);
+            // Direct call, not `invoke_compose_changed()`: this method holds
+            // the App borrow, and the callback would borrow it again.
+            self.compose_changed(ui_weak, fs);
+            ui.global::<Ui>().set_screen(Screen::Compose);
+        }
+    }
+
+    /// Shared by file import AND camera scan: parse + merge a bundle,
+    /// logging `cb: import-bundle {src} … ok` (src keeps the file=/loc=
+    /// shape the UI tests grep).
+    fn apply_bundle(&self, fs: &Fs, json: &str, src: &str) -> Result<String, String> {
+        let state = self.state.clone();
+        let identity = self.identity.clone();
+        let notebooks = self.notebooks.clone();
+        let app_seed = self.app_seed.clone();
+        let id_guard = identity.borrow();
+        let id = id_guard.as_ref().ok_or("identity unavailable")?;
+        {
+            let bundle =
+                SyncBundle::from_json(json).map_err(|e| format!("bad bundle: {e}"))?;
+            let mut st = state.borrow_mut();
+            if !bundle.network.is_empty() && bundle.network != st.network {
+                return Err(format!(
+                    "bundle is for {}, app is on {} — switch network first",
+                    bundle.network, st.network
+                ));
+            }
+
+            // Spending-unification: the self-spk SET is the notebook's
+            // own spk plus every address the spending wallet has issued
+            // (`SpendingSection.self_spks`) — extends OWN detection to
+            // funded/mixed-source notes (extract_notes_multi_deduped ORs
+            // with the producer's spends_from_self, never narrows).
+            let ix = notebooks.borrow();
+            let ctx = notebook_ctx(&ix, self.active)
+                .unwrap_or((self.seed_idx, self.bip_account));
+            let net_s = self.net.clone();
+            let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
+            // DISPLAY-OWNER dedup anchor set (device CLAUDE.md): every
+            // VISIBLE (non-archived) notebook's own spk in the active
+            // wallet context, derived ONCE per import — never per tx —
+            // by reusing the same per-notebook identity derivation
+            // `confirm_self_spks` already does for the confirm screen.
+            // Archived notebooks are excluded by `visible()`, so an
+            // archived notebook's input can never suppress a note in an
+            // active one.
+            let notebook_spks = wallet_notebook_spks(&ix, app_seed_get(&app_seed), &net_s, ctx);
+            // Post-quantum auto-unlock candidates: the ACTIVE notebook's
+            // three derived ML-KEM receive secrets (512/768/1024) — the
+            // only notebook whose received notes this scan could ever
+            // be decrypting (the scan itself is already scoped to `id`,
+            // this notebook's Identity). Empty when the leaf secret
+            // isn't derivable (device locked) — `extract_notes_pq` with
+            // no candidates behaves exactly like the pre-pq extraction,
+            // just leaving every pq note `locked`.
+            let mlkem_secrets: Vec<pq::MlKemSecret> =
+                (self.active).and_then(|acc| ix.get(acc)).and_then(|meta| {
+                    derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s)
+                }).map(|leaf| {
+                    derive_mlkem_keypairs(&leaf).into_iter().map(|kp| kp.secret()).collect()
+                }).unwrap_or_default();
+            drop(ix);
+            let notebook_addr = id.address(st.network());
+            let self_spks: Vec<Vec<u8>> = {
+                let mut v = vec![p2tr_script_pubkey(&id.output_x)];
+                if let Some(s) = &section {
+                    v.extend(s.self_spks());
+                }
+                v
+            };
+
+            let recovered = extract_notes_pq(
+                &bundle,
+                id,
+                st.network(),
+                &self_spks,
+                &notebook_spks,
+                &mlkem_secrets,
+            );
+            let mut new_notes = 0usize;
+            let mut received_notes = 0usize;
+            for r in &recovered {
+                let id_hex = r.id.clone();
+                if r.received {
+                    received_notes += 1;
+                }
+                // Merge keyed by (id, from): a received note can never
+                // overwrite an own note sharing its id (its txid).
+                match st
+                    .notes
+                    .iter_mut()
+                    .find(|n| n.id == id_hex && n.from.as_deref() == r.sender.as_deref())
+                {
+                    Some(existing) => {
+                        existing.height = r.height.or(existing.height);
+                        existing.blocktime = r.blocktime.or(existing.blocktime);
+                        if existing.height.is_some() {
+                            existing.status = "confirmed".into();
+                        }
+                    }
+                    None => {
+                        new_notes += 1;
+                        st.notes.push(NoteRec {
+                            id: id_hex.clone(),
+                            text: r.text.clone().unwrap_or_else(|| {
+                                if r.pq_flags != 0 {
+                                    "(locked — unlock to read)".into()
+                                } else if r.received {
+                                    "(directed note — could not decrypt)".into()
+                                } else {
+                                    "(sealed under another key)".into()
+                                }
+                            }),
+                            private: r.private,
+                            txid: id_hex,
+                            raw_hex: String::new(),
+                            fee: 0,
+                            vsize: 0,
+                            chunks: 0,
+                            height: r.height,
+                            blocktime: r.blocktime,
+                            status: if r.height.is_some() {
+                                "confirmed".into()
+                            } else {
+                                "pending".into()
+                            },
+                            directed: r.directed,
+                            to: r.recipient.clone(),
+                            from: r.sender.clone(),
+                            recipients: r.recipients.clone(),
+                            pq_flags: r.pq_flags,
+                            locked: r.locked.clone(),
+                        });
+                    }
+                }
+            }
+
+            // Split the bundle's UTXOs by owner: no `owner_address` (or
+            // one matching the notebook's own address) is a notebook
+            // coin; an address matching a KNOWN spending-wallet `used`
+            // entry routes to the spending ledger (tagged with its
+            // chain/index so signing can re-derive the key). A coin at
+            // an owner address the device hasn't recorded as used yet
+            // is GAP-ADOPTED below (funding-unification device-port
+            // fix, 2026-07-19) rather than dropped.
+            //
+            // Gap-adoption: the device has no chain access to probe
+            // blindly like the graffito desktop app's discover_spending() does,
+            // so instead it derives the bounded candidate set — both
+            // chains, `next_receive`/`next_change` .. +SPENDING_ADOPT_GAP
+            // (= 20, same constant the app's gap scan uses) — and
+            // compares each candidate's address against the coin's own
+            // owner_address. A match is exactly the kind of address the
+            // device would have marked `used` had it ever revealed or
+            // spent it, so it's ADOPTED: `mark_used` (idempotent,
+            // advances the index past it) and the coin is kept instead
+            // of dropped. Cheap and exact — each index's address is
+            // unique, so no false positives are possible.
+            //
+            // Companion gap-discovery, option (b) (2026-07-19): the
+            // device also exports a lookahead WATCH WINDOW (next 20
+            // receive + next 20 change addresses, Settings' spending
+            // card) so the companion can probe addresses it hasn't seen
+            // a coin at yet. The companion reports back every window
+            // address with ANY on-chain history — coin or not — as
+            // `bundle.owner_used`; those resolve through the exact same
+            // gap window below and get adopted even with no live coin.
+            // This is the convergence piece: a restore whose early
+            // addresses are used-but-spent-empty must still advance past
+            // them, or the device would forever re-offer an already-
+            // spent address as "next receive".
+            const SPENDING_ADOPT_GAP: u32 = 20;
+            let net_v = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
+            let mut nb_utxos: Vec<UtxoRec> = Vec::new();
+            let mut sp_utxos: Vec<spending::SpendingUtxo> = Vec::new();
+            let mut newly_used: Vec<spending::SpendingAddress> = Vec::new();
+            let mut next_recv = section.as_ref().map(|s| s.next_receive).unwrap_or(0);
+            let mut next_chg = section.as_ref().map(|s| s.next_change).unwrap_or(0);
+
+            // Shared gap derive-and-compare resolver (companion gap-
+            // discovery option (b), 2026-07-19): given ANY owner-tagged
+            // address — whether it came with a live coin or just a bare
+            // "this address has history" marker — find it among already-
+            // known `used` entries (persisted from a prior import, or
+            // adopted earlier in THIS SAME import via `newly_used`, which
+            // a pre-loop `section` clone can't see) or by deriving the
+            // bounded candidate window ahead of next_receive/next_change.
+            // A match is exactly the kind of address the device would
+            // have marked `used` had it ever revealed or spent it, so
+            // it's adopted: `next_recv`/`next_chg` advance past it and it
+            // is queued in `newly_used` for `mark_used` below. Returns
+            // `(address, true)` only the FIRST time an address resolves
+            // via derivation this import — callers use that to log
+            // exactly once per genuine adoption, never on repeat lookups
+            // (e.g. a second coin at the same already-adopted address).
+            let mut resolve_owner = |a: &str| -> Option<(spending::SpendingAddress, bool)> {
+                let already_known = section
+                    .as_ref()
+                    .and_then(|s| s.used.iter().find(|x| x.address == a).cloned())
+                    .or_else(|| newly_used.iter().find(|x| x.address == a).cloned());
+                if let Some(addr) = already_known {
+                    return Some((addr, false));
+                }
+                // `app_seed_get` hands back a concrete `&Option<[u8; 32]>`,
+                // so `.as_ref()` is unambiguously `Option::as_ref` here.
+                let Some(seed) = app_seed_get(&app_seed).as_ref() else { return None };
+                let mut found_addr: Option<spending::SpendingAddress> = None;
+                'gap: for chain in [0u32, 1u32] {
+                    let base = if chain == 0 { next_recv } else { next_chg };
+                    for index in base..base.saturating_add(SPENDING_ADOPT_GAP) {
+                        if let Ok(key) = notes_core::seeds::derive_spending_key(
+                            seed, ctx.0, net_v, ctx.1, chain, index,
+                        ) {
+                            if key.address == a {
+                                found_addr = Some(spending::SpendingAddress {
+                                    chain,
+                                    index,
+                                    address: key.address.clone(),
+                                    spk_hex: hex::encode(&key.script_pubkey),
+                                });
+                                break 'gap;
+                            }
+                        }
+                    }
+                }
+                if let Some(addr) = &found_addr {
+                    if addr.chain == 0 {
+                        next_recv = next_recv.max(addr.index + 1);
+                    } else {
+                        next_chg = next_chg.max(addr.index + 1);
+                    }
+                    newly_used.push(addr.clone());
+                }
+                found_addr.map(|addr| (addr, true))
+            };
+
+            // 1) Used-only markers FIRST — every watch-window address the
+            // companion found ANY history for, coin or not. This must run
+            // BEFORE the coin loop below so a coin at a later index
+            // benefits from the advanced next_recv/next_chg window in the
+            // SAME import: a restore whose early addresses are used-but-
+            // spent-empty must still converge past them to reach a later
+            // real coin, not get stuck re-deriving from index 0 forever.
+            for a in &bundle.owner_used {
+                if a == &notebook_addr {
+                    continue; // the notebook identity is a separate address space
+                }
+                if let Some((addr, is_new)) = resolve_owner(a) {
+                    if is_new {
+                        log::info!(
+                            "cb: spending-adopt chain={} index={} used-only",
+                            addr.chain, addr.index
+                        );
+                    }
+                }
+                // else: still unknown beyond the gap — nothing to advance.
+            }
+
+            // 2) Coins — log line shape UNCHANGED from before this
+            // companion gap-discovery extension (today's e2e greps it).
+            for u in &bundle.utxos {
+                match &u.owner_address {
+                    None => {
+                        nb_utxos.push(UtxoRec { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                    }
+                    Some(a) if *a == notebook_addr => {
+                        nb_utxos.push(UtxoRec { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                    }
+                    Some(a) => {
+                        if let Some((addr, is_new)) = resolve_owner(a) {
+                            if is_new {
+                                log::info!(
+                                    "cb: spending-adopt chain={} index={}",
+                                    addr.chain, addr.index
+                                );
+                            }
+                            sp_utxos.push(spending::SpendingUtxo {
+                                txid: u.txid.clone(),
+                                vout: u.vout,
+                                value: u.value,
+                                chain: addr.chain,
+                                index: addr.index,
+                            });
+                        }
+                        // else: still unknown beyond the gap — dropped, unchanged.
+                    }
+                }
+            }
+            st.utxos = nb_utxos;
+            if section.is_some() || !newly_used.is_empty() {
+                let mut ix = notebooks.borrow_mut();
+                let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
+                for addr in newly_used {
+                    sec.mark_used(addr);
+                }
+                sec.set_utxos(sp_utxos);
+                save_notebooks(&fs, &ix);
+            }
+            st.tip_height = Some(bundle.tip_height);
+            st.bundle_time = Some(bundle.bundle_time);
+            // Chunk size is a pure device setting — any relay-policy
+            // field in the bundle is deliberately ignored.
+            if bundle.fee_rates.economy > 0.0 {
+                st.fee_economy = bundle.fee_rates.economy;
+            }
+            if bundle.fee_rates.half_hour > 0.0 {
+                st.fee_normal = bundle.fee_rates.half_hour;
+            }
+            if bundle.fee_rates.fastest > 0.0 {
+                st.fee_fast = bundle.fee_rates.fastest;
+            }
+            st.btc_usd = bundle.btc_usd.or(st.btc_usd);
+            save_state(&fs, &st);
+
+            log::info!(
+                "cb: import-bundle {src} notes={} new={new_notes} received={received_notes} utxos={} tip={} ok",
+                recovered.len(),
+                st.utxos.len(),
+                bundle.tip_height
+            );
+            Ok(format!(
+                "Imported ({src}): {} note(s) ({new_notes} new), {} utxo(s), height {}.",
+                recovered.len(),
+                st.utxos.len(),
+                bundle.tip_height
+            ))
+        }
+    }
+
+    /// ---- recovery seeds (screen 21 + wallet context) ----
+    /// Derive the ACTIVE seed's 24 words + SeedQR into the Recovery props.
+    /// Everything is re-derived on demand and lives only in UI properties
+    /// until reveal-close wipes them; nothing is persisted or logged. Shared
+    /// by the reveal button AND the Switch action (which refreshes the words
+    /// to the new seed while they're shown). Keeps the SeedQR in sync.
+    fn reveal_words(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let app_seed = self.app_seed.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let recovery = ui.global::<Recovery>();
+        let index = self.seed_idx;
+        let Some(seed) = app_seed_get(&app_seed).as_ref() else {
+            ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
+            log::warn!("cb: reveal-seed index={index} err=locked");
+            return;
+        };
+        let entropy = notes_core::keys::derive_seed_entropy(seed, index);
+        let words = match notes_core::bip39::entropy_to_mnemonic(&entropy) {
+            Ok(w) => w,
+            Err(e) => {
+                ui.global::<Ui>().set_error(format!("Derivation failed: {e}").into());
+                log::warn!("cb: reveal-seed index={index} err={e}");
+                return;
+            }
+        };
+        let list: Vec<&str> = words.split_whitespace().collect();
+        let col = |range: std::ops::Range<usize>| -> String {
+            range
+                .map(|i| format!("{:2}. {}", i + 1, list[i]))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        recovery.set_words_col1(col(0..12).into());
+        recovery.set_words_col2(col(12..24).into());
+        // Standard SeedQR: the 4-digit wordlist indices, concatenated.
+        let digits: String = notes_core::bip39::entropy_to_indices(&entropy)
+            .unwrap_or_default()
+            .iter()
+            .map(|i| format!("{i:04}"))
+            .collect();
+        recovery.set_qr(qr_image(&digits));
+        recovery.set_show_qr(false);
+        recovery.set_title_line(format!("Seed {index} · 24 words").into());
+        log::info!("cb: reveal-seed index={index} ok");
+    }
+
+    /// ---- export keys (screen 23) ----
+    /// Reveal the active (seed, account) context's importable formats:
+    /// account xpub + tr() descriptor cover the WHOLE account (all
+    /// addresses); hex + WIF are one notebook's leaf, picked from the
+    /// notebook list. No private xprv on the device (the 24 words recover
+    /// the whole seed). Values live in UI props only, wiped on close;
+    /// never logged.
+    fn apply_export(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, which: i32) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let r = ui.global::<Recovery>();
+        let nb = r.get_export_nb_name();
+        let (label, value): (String, _) = match which {
+            0 => {
+                ("Account xpub · all addresses · watch-only".to_string(), r.get_export_xpub())
+            }
+            1 => (
+                "Descriptor (tr) · all addresses · watch-only".to_string(),
+                r.get_export_descriptor(),
+            ),
+            2 => (format!("Notebook \"{nb}\" · hex"), r.get_export_hex()),
+            _ => (format!("Notebook \"{nb}\" · WIF"), r.get_export_wif()),
+        };
+        r.set_export_which(which);
+        r.set_export_label(label.into());
+        r.set_export_value(value.clone());
+        r.set_export_qr(qr_image(value.as_str()));
+    }
+
+    /// ---- export keys (screen 23) ----
+    /// Reveal the active (seed, account) context's importable formats:
+    /// account xpub + tr() descriptor cover the WHOLE account (all
+    /// addresses); hex + WIF are one notebook's leaf, picked from the
+    /// notebook list. No private xprv on the device (the 24 words recover
+    /// the whole seed). Values live in UI props only, wiped on close;
+    /// never logged.
+    /// The active account's notebooks as picker rows (index/name/short addr)
+    /// plus the default selection (first notebook, else a synthetic index 0).
+    fn export_rows(&self, si: u32, acct: u32, net_s: &str, network: Network) -> (Vec<ExportNbRow>, i32, String) {
+        let app_seed = self.app_seed.clone();
+        let notebooks = self.notebooks.clone();
+        let mut rows: Vec<ExportNbRow> = Vec::new();
+        let ixb = notebooks.borrow();
+        for m in ixb.visible(si, acct) {
+            let addr = derive_identity(app_seed_get(&app_seed), m, net_s)
+                .map(|id| id.address(network))
+                .unwrap_or_default();
+            let short = short_addr(&addr);
+            let name = if m.name.trim().is_empty() {
+                notebooks::default_name(m.index)
+            } else {
+                m.name.clone()
+            };
+            rows.push(ExportNbRow {
+                index: m.index as i32,
+                name: name.into(),
+                addr: short.into(),
+            });
+        }
+        let (sel, sel_name) = rows
+            .first()
+            .map(|r0| (r0.index, r0.name.to_string()))
+            .unwrap_or((0, "index 0".to_string()));
+        if rows.is_empty() {
+            rows.push(ExportNbRow { index: 0, name: "index 0".into(), addr: "".into() });
+        }
+        (rows, sel, sel_name)
+    }
+
+    /// NOTHING here may read the app seed: `GetAppSeed` prompts on SDK 1.0.0
+    /// and the prompt cannot be answered until `ui.run()` is pumping, so a read
+    /// on this path hangs the app at launch (see `app_seed_get`). The list is
+    /// therefore painted seed-free first — rows render without their addresses
+    /// — and the timer below primes the seed once the loop is live, then
+    /// repaints the list with them.
+    fn boot_seed(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let app_seed = self.app_seed.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        // First read of the seed in the app's life: this is what raises
+        // the one-time "App-scoped seed" consent prompt, and the running
+        // loop is what lets the user answer it.
+        let available = app_seed_get(&app_seed).is_some();
+        ui.global::<Recovery>().set_seed_available(available);
+        if !available {
+            ui.global::<Ui>().set_error("Device locked or seed unavailable".into());
+        }
+        // Repaint: the rows drawn before the seed existed have no address.
+        self.refresh_notebooks(&ui_weak, &fs);
+    }
+}
+
 fn app_main(cx: AppContext, ui: AppWindow) {
     log_server::init_wait(env!("CARGO_CRATE_NAME")).unwrap();
     log::set_max_level(log::LevelFilter::Info);
@@ -2178,85 +3357,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     // Sweep screen (10) repricing — every tier tap / rate keystroke. Pure
     // arithmetic (estimate_sweep_vsize is byte-exact vs build_sweep_tx).
-    let update_sweep = {
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        let app = app.clone();
-        move || {
-            let state = app.borrow().state.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let sweep = ui.global::<Sweep>();
-            let st = state.borrow();
-            let tier = sweep.get_tier();
-            if tier != 3 {
-                sweep.set_rate_text(format!("{}", st.fee_rate(tier)).into());
-            }
-            // Wallet-level: inputs are EVERY notebook's coins (flush the
-            // active one first so its file reflects the latest ledger).
-            save_state(&fs, &st);
-            let (n, total) = wallet_balance(
-                &fs,
-                &notebooks.borrow(),
-                &st.network,
-                (app.borrow().seed_idx, app.borrow().bip_account),
-            );
-            sweep.set_inputs_line(format!("Inputs · {n} coin(s) · {total} sats (all notebooks)").into());
-            if n == 0 {
-                sweep.set_cost_line("Nothing to sweep — no spendable coins.".into());
-                sweep.set_can_continue(false);
-                return;
-            }
-            let rate = match resolve_rate(tier, sweep.get_rate_text().as_str(), &st) {
-                Ok(r) => r,
-                Err(e) => {
-                    sweep.set_cost_line(e.into());
-                    sweep.set_can_continue(false);
-                    return;
-                }
-            };
-            let consolidate = sweep.get_kind() == "consolidate";
-            let dest_spk_len = if consolidate {
-                34 // our own P2TR
-            } else {
-                match Recipient::parse(st.network(), sweep.get_dest().as_str()) {
-                    Ok(r) => r.spk.len(),
-                    Err(_) => {
-                        sweep.set_cost_line(
-                            format!("Destination is not a valid {} address.", st.network).into(),
-                        );
-                        sweep.set_can_continue(false);
-                        return;
-                    }
-                }
-            };
-            let vsize = estimate_sweep_vsize(n, dest_spk_len);
-            let fee = (vsize as f64 * rate).ceil() as u64;
-            if total <= fee || total - fee < notes_core::DUST_LIMIT {
-                sweep.set_cost_line(
-                    format!("Balance {total} sats can't cover the ~{fee} sat fee.").into(),
-                );
-                sweep.set_can_continue(false);
-                return;
-            }
-            let recv = total - fee;
-            sweep.set_cost_line(
-                if consolidate {
-                    format!(
-                        "Consolidates {n} coins into one · ~{vsize} vB · fee ~{} @ {rate} sat/vB · keeps {recv} sats",
-                        sats_line(fee, st.btc_usd)
-                    )
-                } else {
-                    format!(
-                        "Sweeps {total} sats · ~{vsize} vB · fee ~{} @ {rate} sat/vB · destination receives {recv} sats",
-                        sats_line(fee, st.btc_usd)
-                    )
-                }
-                .into(),
-            );
-            sweep.set_can_continue(true);
-        }
-    };
 
 
     // Rebuild the Pay-from screen's rows/summaries, the compose nav row's
@@ -2275,173 +3375,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     // Open a notebook: save the current one, swap identity + state to the
     // target account, refresh every per-notebook view, and show its home.
-    let switch_notebook = {
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        let app = app.clone();
-        Rc::new(move |account: u32| {
-            let state = app.borrow().state.clone();
-            let identity = app.borrow().identity.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            if app.borrow().active.is_some() {
-                save_state(&fs, &state.borrow());
-            }
-            app.borrow_mut().active = Some(account);
-            *identity.borrow_mut() = notebooks
-                .borrow()
-                .get(account)
-                .and_then(|m| derive_identity(app_seed_get(&app_seed), m, &app.borrow().net));
-            let mut loaded = load_state(&fs, &app.borrow().net, account);
-            loaded.chunk_override = app.borrow().device_chunk; // chunk is device-level
-            *state.borrow_mut() = loaded;
-            let short = identity
-                .borrow()
-                .as_ref()
-                .map(|id| short_addr(&id.address(state.borrow().network())))
-                .unwrap_or_default();
-            let title = notebook_name(&notebooks.borrow(), account, &short);
-            ui.global::<NotebooksUi>().set_title(title.into());
-            log::info!("cb: open-notebook account={account}");
-            app.borrow().refresh_home(&ui_weak);
-            app.borrow().refresh_notes(&ui_weak);
-            app.borrow().refresh_coins(&ui_weak, &fs);
-            app.borrow().refresh_contacts(&ui_weak);
-            app.borrow().refresh_funding(&ui_weak);
-            ui.global::<Ui>().set_screen(Screen::Home);
-        })
-    };
 
     // The single pick funnel (self row / recent row / manual entry / scan):
     // validates, bumps recency, sets the compose recipient + label, and
     // navigates. Invalid manual input stays on the picker with an error.
-    let pick_contact = {
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        let update_sweep = update_sweep.clone();
-        let app = app.clone();
-        move |addr_raw: &str| {
-            let state = app.borrow().state.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let addr = addr_raw.trim().to_string();
-            let contacts_g = ui.global::<Contacts>();
-            let sweep_mode = contacts_g.get_pick_mode() == "sweep";
-            let compose = ui.global::<Compose>();
-
-            // Appending an EXTRA recipient to an in-progress directed draft
-            // (Callbacks.add-recipient-open set this) — pushes onto
-            // Compose.to-extra instead of replacing the primary, and does
-            // NOT touch funding/change picks or navigate anywhere but back
-            // to compose (this is editing a draft, not starting a fresh
-            // one — unlike the replace path below, which intentionally
-            // resets those for a brand-new compose target).
-            if !sweep_mode && contacts_g.get_picking_extra() {
-                if addr.is_empty() {
-                    contacts_g
-                        .set_input_error("Can't add yourself as an extra recipient.".into());
-                    log::warn!("cb: pick-contact err=self extra=true");
-                    return;
-                }
-                let mut st = state.borrow_mut();
-                if Recipient::parse(st.network(), &addr).is_err() {
-                    contacts_g
-                        .set_input_error(format!("Not a valid {} address.", st.network).into());
-                    log::warn!("cb: pick-contact err=invalid address extra=true");
-                    return;
-                }
-                let primary = compose.get_to_address().to_string();
-                let current_extra: Vec<ToRow> = compose.get_to_extra().iter().collect();
-                if addr == primary || current_extra.iter().any(|r| r.address == addr) {
-                    contacts_g.set_input_error("Already a recipient of this note.".into());
-                    log::warn!("cb: pick-contact err=duplicate extra=true");
-                    return;
-                }
-                if 1 + current_extra.len() + 1 > 255 {
-                    contacts_g.set_input_error("Too many recipients (max 255).".into());
-                    log::warn!("cb: pick-contact err=too-many extra=true");
-                    return;
-                }
-                upsert_contact(&mut st, &addr);
-                save_state(&fs, &st);
-                let label = to_label_for(&st, &addr);
-                drop(st);
-                let mut new_extra = current_extra;
-                new_extra.push(ToRow { address: addr.as_str().into(), label: label.into() });
-                compose.set_to_extra(Rc::new(VecModel::from(new_extra)).into());
-                contacts_g.set_picking_extra(false);
-                contacts_g.set_input_text("".into());
-                contacts_g.set_input_error("".into());
-                contacts_g.set_naming_address("".into());
-                log::info!("cb: pick-contact to={addr} extra=true");
-                ui.global::<Ui>().set_screen(Screen::Compose);
-                return;
-            }
-
-            if addr.is_empty() {
-                // Self: compose only — the sweep picker hides the Self card
-                // (sweep-to-self is the Coins screen's consolidate).
-                if sweep_mode {
-                    return;
-                }
-                compose.set_to_address("".into());
-                compose.set_to_label("to: self — my notebook".into());
-                compose.set_to_extra(Rc::new(VecModel::from(Vec::<ToRow>::new())).into());
-                log::info!("cb: pick-contact to=self");
-            } else {
-                let mut st = state.borrow_mut();
-                if Recipient::parse(st.network(), &addr).is_err() {
-                    contacts_g
-                        .set_input_error(format!("Not a valid {} address.", st.network).into());
-                    log::warn!("cb: pick-contact err=invalid address");
-                    return;
-                }
-                upsert_contact(&mut st, &addr);
-                save_state(&fs, &st);
-                if sweep_mode {
-                    let sweep = ui.global::<Sweep>();
-                    sweep.set_kind("sweep".into());
-                    sweep.set_dest(addr.as_str().into());
-                    sweep.set_dest_label(to_label_for(&st, &addr).into());
-                    sweep.set_tier(1);
-                    log::info!("cb: sweep-open kind=sweep to={addr}");
-                } else {
-                    compose.set_to_address(addr.as_str().into());
-                    compose.set_to_label(to_label_for(&st, &addr).into());
-                    compose.set_to_extra(Rc::new(VecModel::from(Vec::<ToRow>::new())).into());
-                    log::info!("cb: pick-contact to={addr}");
-                }
-            }
-            contacts_g.set_input_text("".into());
-            contacts_g.set_input_error("".into());
-            contacts_g.set_naming_address("".into());
-            if sweep_mode {
-                update_sweep();
-                ui.global::<Ui>().set_screen(Screen::Sweep);
-            } else {
-                // Fresh compose: reset the funding/change picks to their
-                // default rule (spending only when enabled AND funded).
-                let st = state.borrow();
-                let ix = notebooks.borrow();
-                let ctx = notebook_ctx(&ix, app.borrow().active)
-                    .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
-                let section = ix.spending(&app.borrow().net, ctx.0, ctx.1).cloned();
-                drop(ix);
-                app.borrow_mut().funding_pick = default_funding_pick(&st, section.as_ref());
-                drop(st);
-                app.borrow_mut().change_pick = ChangePickState::default();
-                app.borrow().refresh_funding(&ui_weak);
-                app.borrow().refresh_change(&ui_weak);
-                ui.global::<Callbacks>().invoke_compose_changed();
-                ui.global::<Ui>().set_screen(Screen::Compose);
-            }
-        }
-    };
 
     {
-        let pick_contact = pick_contact.clone();
-        ui.global::<Callbacks>().on_pick_contact(move |addr| pick_contact(addr.as_str()));
+        let app = app.clone();
+        let fs = fs.clone();
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_pick_contact(move |addr| app.borrow_mut().pick_contact(&ui_weak, &fs, addr.as_str()));
     }
 
     // Compose's "+ Add recipient" row — opens the contacts picker in
@@ -2474,7 +3417,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let pick_contact = pick_contact.clone();
+        let fs = fs.clone();
         ui.global::<Callbacks>().on_scan_contact(move || {
             let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -2518,7 +3461,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             match resolved {
                 Some(a) => {
                     log::info!("cb: scan-contact ok addr={a}");
-                    pick_contact(&a);
+                    app.borrow_mut().pick_contact(&ui_weak, &fs, &a);
                 }
                 None => {
                     log::warn!("cb: scan-contact err=not an address");
@@ -2949,7 +3892,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // Coins → the shared sweep screen with kind=consolidate, dest=self.
     {
         let ui_weak = ui_weak.clone();
-        let update_sweep = update_sweep.clone();
+        let app = app.clone();
+        let fs = fs.clone();
         ui.global::<Callbacks>().on_consolidate_open(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let sweep = ui.global::<Sweep>();
@@ -2958,14 +3902,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             sweep.set_dest_label("to: self — one consolidated coin".into());
             sweep.set_tier(1);
             log::info!("cb: sweep-open kind=consolidate to=self");
-            update_sweep();
+            app.borrow().update_sweep(&ui_weak, &fs);
             ui.global::<Ui>().set_screen(Screen::Sweep);
         });
     }
 
     {
-        let update_sweep = update_sweep.clone();
-        ui.global::<Callbacks>().on_sweep_changed(move || update_sweep());
+        let app = app.clone();
+        let fs = fs.clone();
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_sweep_changed(move || app.borrow().update_sweep(&ui_weak, &fs));
     }
 
     // Build + sign the sweep (ALL coins, key-path), then the confirm dialog.
@@ -3245,475 +4191,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let app = app.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_compose_changed(move || {
-            let state = app.borrow().state.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let compose = ui.global::<Compose>();
-            let st = state.borrow();
-            let to_address = compose.get_to_address().trim().to_string();
-            let directed = !to_address.is_empty();
-            let private = compose.get_private_note();
-            // HOISTED to the handler TOP (2026-08-21): every early return below
-            // (bad rate, empty text, "No funds", recipient-parse) must NOT skip
-            // the pq section's visibility recompute — the "No funds"
-            // and recipient-parse branches return before the cost math, and
-            // the pq section's visibility must never depend on funding —
-            // an unfunded notebook still shows (and toggles) the Security
-            // section, exactly like the Mac app.
-            //
-            // Self-pw notes (PLAN-graffito-self-pw.md, 2026-08-22): the
-            // passphrase layer is also available for a PRIVATE SELF-note
-            // (no recipient) — `pq_eligible` gates the whole Security
-            // section and the passphrase control for either shape.
-            // ML-KEM on a DIRECTED note encapsulates to the contact's
-            // seed-derived receive key; on a SELF-note (PLAN-graffito-
-            // quantum-key.md) it instead encapsulates to THIS device's
-            // personal, non-seed quantum key — a self-note's seed-derived
-            // key would derive from the same leaf as its enc key (security
-            // theater, pq.rs's module doc), so `pq_mlkem_eligible` for a
-            // self-note additionally requires the device key file to
-            // exist. Directed eligibility/computation stays byte-identical
-            // to before this feature.
-            let base_pq_eligible = private && compose.get_to_extra().row_count() == 0;
-            let device_kp = if base_pq_eligible && !directed {
-                app.borrow_mut().device_quantum_key(&fs)
-            } else {
-                None
-            };
-            let pq_mlkem_eligible =
-                base_pq_eligible && (directed || device_kp.is_some());
-            let pq_eligible = base_pq_eligible;
-            compose.set_pq_eligible(pq_eligible);
-            compose.set_pq_mlkem_eligible(pq_mlkem_eligible);
-            let mlkem_parsed: Option<(pq::MlKemAlg, Vec<u8>)> = if !pq_mlkem_eligible {
-                None
-            } else if directed {
-                st.contacts
-                    .iter()
-                    .find(|c| c.address == to_address)
-                    .and_then(|c| c.mlkem_ek.as_deref())
-                    .and_then(|a| pq::import_public(a).ok())
-            } else {
-                device_kp.as_ref().map(|kp| (kp.alg(), kp.ek().to_vec()))
-            };
-            let mlkem_available = mlkem_parsed.is_some();
-            compose.set_pq_mlkem_available(mlkem_available);
-            if (!pq_mlkem_eligible || !mlkem_available) && compose.get_pq_mlkem_active() {
-                compose.set_pq_mlkem_active(false);
-            }
-            compose.set_pq_mlkem_caption(
-                if !pq_mlkem_eligible {
-                    String::new()
-                } else if let Some((alg, ek)) = &mlkem_parsed {
-                    // Same "LEVEL · fingerprint" line either way — for a
-                    // self-note this names the device's own quantum key
-                    // (PLAN-graffito-quantum-key.md).
-                    format!("{} · {}", mlkem_alg_name(*alg), pq::fingerprint(*alg, ek))
-                } else {
-                    "recipient has no quantum key — add one in Contacts".to_string()
-                }
-                .into(),
-            );
-            if !pq_eligible && compose.get_pq_passphrase_active() {
-                compose.set_pq_passphrase_active(false);
-            }
-            let pq_passphrase_active = pq_eligible && compose.get_pq_passphrase_active();
-            let pq_mlkem_active = pq_mlkem_eligible && mlkem_available && compose.get_pq_mlkem_active();
-            let pq_passphrase_text = compose.get_pq_passphrase_text().to_string();
-            let pq_passphrase_verified = pq_passphrase_active
-                && !pq_passphrase_text.is_empty()
-                && app.borrow().pq_generated.as_deref() == Some(pq_passphrase_text.as_str());
-            let pq_passphrase_weak = pq_passphrase_active
-                && !pq_passphrase_verified
-                && !pq_passphrase_text.is_empty()
-                && passphrase::typed_is_weak(&pq_passphrase_text);
-            compose.set_pq_passphrase_weak(pq_passphrase_weak);
-            compose.set_pq_passphrase_strength(
-                if !pq_passphrase_active {
-                    String::new()
-                } else if pq_passphrase_verified {
-                    format!("{:.0}-bit generated phrase", passphrase::GENERATED_BITS)
-                } else if pq_passphrase_weak {
-                    "weak — short passphrases are easy to brute-force; use Generate or add more words"
-                        .to_string()
-                } else {
-                    "strength can't be verified — use Generate for a certified phrase".to_string()
-                }
-                .into(),
-            );
-            let pq_flags_guess: u8 = (if pq_passphrase_active { notes_core::envelope::FLAG_PW } else { 0 })
-                | (if pq_mlkem_active { notes_core::envelope::FLAG_MLKEM } else { 0 });
-            let pq_alg_guess = mlkem_parsed.as_ref().map(|(alg, _)| *alg);
-            let pq_extra = pq::pq_overhead(pq_flags_guess, pq_alg_guess);
-            compose.set_pq_security_label(
-                if pq_flags_guess == 0 {
-                    String::new()
-                } else {
-                    pq_security_label(
-                        private,
-                        directed,
-                        pq_passphrase_active,
-                        pq_passphrase_verified,
-                        if pq_mlkem_active { pq_alg_guess } else { None },
-                    )
-                }
-                .into(),
-            );
-            // Tier pills drive the rate field; a manual edit set tier=3
-            // first, so we never overwrite the user's custom value.
-            let tier = compose.get_tier();
-            if tier != 3 {
-                compose.set_rate_text(format!("{}", st.fee_rate(tier)).into());
-            }
-            let rate = match resolve_rate(tier, compose.get_rate_text().as_str(), &st) {
-                Ok(r) => r,
-                Err(e) => {
-                    compose.set_cost_line(e.into());
-                    compose.set_can_continue(false);
-                    return;
-                }
-            };
-            // Keyboard Done: the system keyboard's Done key has no distinct
-            // signal — it sends a plain '\n' (gui-app-keyboard maps
-            // KeyAction::Return to Key::Char('\n')). A note is composed as
-            // one paragraph on-device, so ANY newline here means "done
-            // typing": strip it and bump dismiss-nonce, which the editor
-            // watches to drop focus (focus loss hides the keyboard).
-            let raw = compose.get_text();
-            if raw.as_str().contains('\n') {
-                let stripped: String = raw.as_str().replace('\n', "");
-                compose.set_text(stripped.into());
-                compose.set_dismiss_nonce(compose.get_dismiss_nonce() + 1);
-                log::info!("cb: compose keyboard-done");
-            }
-            let text = compose.get_text();
-            let text_len = text.as_str().len();
-            if text_len == 0 {
-                compose.set_cost_line("Type to see the cost.".into());
-                compose.set_can_continue(false);
-                app.borrow_mut().compose_oversize = false; // clearing the draft re-arms the dialog
-                return;
-            }
-            let ix = notebooks.borrow();
-            let ctx = notebook_ctx(&ix, app.borrow().active)
-                .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
-            let net_s = app.borrow().net.clone();
-            let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
-            drop(ix);
-            if st.utxos.is_empty() && section.as_ref().map(|s| s.balance()).unwrap_or(0) == 0 {
-                compose
-                    .set_cost_line("No funds — fund the address and import a sync bundle.".into());
-                compose.set_can_continue(false);
-                return;
-            }
-            // Directed = non-empty To field. Validate the recipient like
-            // resolve_rate validates the rate — errors land in the cost
-            // line, never a panic.
-            let recipient_spk_len = if directed {
-                match Recipient::parse(st.network(), &to_address) {
-                    Ok(r) => {
-                        if compose.get_private_note() && r.p2tr_x.is_none() {
-                            compose.set_cost_line(
-                                "Private directed notes need a taproot (…1p…) recipient — or switch to Public.".into(),
-                            );
-                            compose.set_can_continue(false);
-                            return;
-                        }
-                        Some(r.spk.len())
-                    }
-                    Err(_) => {
-                        compose.set_cost_line(
-                            format!("Enter a valid {} recipient address.", st.network).into(),
-                        );
-                        compose.set_can_continue(false);
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-            let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
-            // Recipient count for THIS draft (primary + every "+ Add
-            // recipient" row); 0 for a self-note. Each recipient gets the
-            // SAME gift amount, so the real sats leaving to recipients is
-            // `gift * n_recipients`, not `gift` alone — the balance checks
-            // and cost-line suffix below both need the total, not the
-            // per-recipient amount.
-            let n_recipients: usize =
-                if directed { 1 + compose.get_to_extra().row_count() } else { 0 };
-            let total_gift: u64 = gift * n_recipients as u64;
-
-            // Post-quantum Security section (pq.rs) — directed private
-            // single-recipient notes only (envelope validity rule: pq
-            // layers are incompatible with FLAG_MULTI). Recomputed every
-            // keystroke so the section reacts immediately to the Private
-            // toggle, an extra recipient being added, or the recipient
-            // changing underneath an already-open draft.
-
-            let effective = st.effective_chunk();
-            // `estimate_note_cost_pq` bakes `pq::pq_overhead` into the same
-            // body_len arithmetic `estimate_note_cost` uses — byte-exact
-            // for the compose cost line whenever a pq layer is active;
-            // `(0, None)` (pq_flags_guess == 0) is never reached here.
-            let est = if pq_flags_guess != 0 {
-                estimate_note_cost_pq(
-                    text_len, effective, 1, recipient_spk_len, pq_flags_guess, pq_alg_guess,
-                )
-            } else {
-                estimate_note_cost(text_len, private, effective, 1, recipient_spk_len)
-            };
-            let fit = fit_check(effective, text_len, private, recipient_spk_len, pq_extra);
-
-            // Over the per-tx broadcast ceiling (vsize > 100 kB, or > 255
-            // chunks). Show it in the cost line, gate Continue, and pop the
-            // "too large" dialog once — on the crossing, not every keystroke.
-            if !matches!(fit, FitCheck::Ok) {
-                match &est {
-                    Ok((chunks, vsize)) => compose.set_cost_line(
-                        format!("{chunks} chunk(s) · ~{vsize} vB — too large to broadcast").into(),
-                    ),
-                    Err(_) => {
-                        compose.set_cost_line("Too large to broadcast (> 255 chunks).".into())
-                    }
-                }
-                compose.set_can_continue(false);
-                let was_oversize = std::mem::replace(&mut app.borrow_mut().compose_oversize, true);
-            if !was_oversize {
-                    match fit {
-                        FitCheck::FitsAtStandard => {
-                            compose.set_oversize_offer_bump(true);
-                            compose.set_oversize_message(
-                                "This note doesn't fit at your current chunk size. \
-                                 Switch to Standard (a single large chunk) to fit it in one transaction?"
-                                    .into(),
-                            );
-                        }
-                        _ => {
-                            compose.set_oversize_offer_bump(false);
-                            compose.set_oversize_message(
-                                "This note is too large to broadcast. A single Bitcoin \
-                                 transaction can't exceed ~100 kB (the network relay limit), \
-                                 whatever the chunk size. Shorten the note, or split it across \
-                                 several notes. Multi-transaction notes are planned for a \
-                                 future release."
-                                    .into(),
-                            );
-                        }
-                    }
-                    compose.set_show_oversize(true);
-                }
-                return;
-            }
-            app.borrow_mut().compose_oversize = false;
-
-            let pick = app.borrow().funding_pick.clone();
-            let sp_participates = !pick.spending.is_empty();
-            let mode_auto = !pick.touched && !sp_participates;
-
-            if mode_auto {
-                // Byte-identical to pre-funding-unification behavior.
-                match est {
-                    Ok((chunks, vsize)) => {
-                        let fee = (vsize as f64 * rate).ceil() as u64;
-                        if fee + total_gift > st.balance() {
-                            compose.set_cost_line(
-                                format!(
-                                    "Needs ~{} sats — balance is {}.",
-                                    fee + total_gift,
-                                    st.balance()
-                                )
-                                .into(),
-                            );
-                            compose.set_can_continue(false);
-                        } else {
-                            compose.set_cost_line(
-                                format!(
-                                    "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}",
-                                    sats_line(fee, st.btc_usd),
-                                    if !directed {
-                                        String::new()
-                                    } else if n_recipients <= 1 {
-                                        format!(" + {gift} sats to recipient")
-                                    } else {
-                                        format!(
-                                            " + {n_recipients} × {gift} = {total_gift} sats to {n_recipients} recipients"
-                                        )
-                                    }
-                                )
-                                .into(),
-                            );
-                            compose.set_can_continue(true);
-                        }
-                    }
-                    Err(e) => {
-                        compose.set_cost_line(format!("{e}").into());
-                        compose.set_can_continue(false);
-                    }
-                }
-                return;
-            }
-
-            // Exact-selected-coins preview (notebook subset, spending, or
-            // mixed): real selected input kinds/count and real extra
-            // outputs, unlike `estimate_note_cost`'s single-taproot-input
-            // approximation above (used only for `fit_check`'s ceiling test).
-            let payload_lens = match payload_lens_for(text_len, private, pq_extra, effective) {
-                Ok(v) => v,
-                Err(e) => {
-                    compose.set_cost_line(e.into());
-                    compose.set_can_continue(false);
-                    return;
-                }
-            };
-            let chunks = payload_lens.len();
-            let n_notebook = pick.notebook.len();
-            let n_spending = pick.spending.len();
-            if n_notebook + n_spending == 0 {
-                compose.set_cost_line("Select at least one coin — \"Pay from\" above.".into());
-                compose.set_can_continue(false);
-                return;
-            }
-            let kinds: Vec<InputKind> = std::iter::repeat(InputKind::Taproot)
-                .take(n_notebook)
-                .chain(std::iter::repeat(InputKind::P2wpkh).take(n_spending))
-                .collect();
-            let cp = app.borrow().change_pick.clone();
-            let change_len = match change_spk_len_preview(
-                &cp.choice,
-                &cp.custom_address,
-                st.network(),
-                sp_participates,
-            ) {
-                Ok(l) => l,
-                Err(e) => {
-                    compose.set_cost_line(e.into());
-                    compose.set_can_continue(false);
-                    return;
-                }
-            };
-            drop(cp);
-            let nb_total: u64 = st
-                .utxos
-                .iter()
-                .filter(|u| pick.is_selected(false, &u.txid, u.vout))
-                .map(|u| u.value)
-                .sum();
-            let sp_total: u64 = section
-                .as_ref()
-                .map(|s| {
-                    s.utxos
-                        .iter()
-                        .filter(|u| pick.is_selected(true, &u.txid, u.vout))
-                        .map(|u| u.value)
-                        .sum()
-                })
-                .unwrap_or(0);
-            let in_value = nb_total + sp_total;
-            // Anchored condition (mirrors `build_note_tx_mixed_exact_anchored`):
-            // the notebook dust-to-self output is skipped whenever a notebook
-            // coin is among the selected inputs — that input already anchors
-            // the tx to the notebook's address history, so the discoverability
-            // dust would be pure waste. Only a pure-spending-wallet-funded
-            // build (n_notebook == 0) still needs it.
-            let dust_applies = sp_participates && n_notebook == 0;
-            let dust_needed = if dust_applies { notes_core::DUST_LIMIT } else { 0 };
-
-            // Both shapes' extra (non-OP_RETURN) output lengths, computed
-            // unconditionally now (previously the no-change list was only
-            // built inside the folded branch) so the honest-fee-label
-            // fold prediction below can always compare the two, exactly
-            // mirroring what `notes_core::fold::predict_fold` needs.
-            let mut extra_no_change: Vec<usize> = Vec::new();
-            if let Some(l) = recipient_spk_len {
-                extra_no_change.push(l);
-            }
-            if dust_applies {
-                extra_no_change.push(34); // notebook dust spk (P2TR, always 34 bytes)
-            }
-            let mut extra_with_change = extra_no_change.clone();
-            extra_with_change.push(change_len);
-            let vsize_with_change = estimate_vsize_mixed(&kinds, &payload_lens, &extra_with_change);
-            let fee_with_change = (vsize_with_change as f64 * rate).ceil() as u64;
-            let vsize_no_change = estimate_vsize_mixed(&kinds, &payload_lens, &extra_no_change);
-            let fee_no_change = (vsize_no_change as f64 * rate).ceil() as u64;
-            let leftover_with_change =
-                in_value.checked_sub(fee_with_change + total_gift + dust_needed);
-
-            // took_no_change tracks which shape `(vsize, fee, ok)` below
-            // actually reflects — needed because `ok2`'s success range
-            // (`<= DUST_LIMIT`, including exactly 0 — an exact fit, not a
-            // fold) is intentionally broader than
-            // `notes_core::fold::predict_fold`'s "something folded"
-            // signal (which excludes a 0 leftover); keeping this boolean
-            // means the fold suffix below can never fire on an exact-fit
-            // no-change build that isn't actually folding anything.
-            let (vsize, fee, ok, took_no_change) = match leftover_with_change {
-                Some(v) if v >= notes_core::DUST_LIMIT => {
-                    (vsize_with_change, fee_with_change, true, false)
-                }
-                _ => {
-                    let ok2 = matches!(in_value.checked_sub(fee_no_change + total_gift + dust_needed), Some(v) if v <= notes_core::DUST_LIMIT);
-                    (vsize_no_change, fee_no_change, ok2, true)
-                }
-            };
-            // Honest-fee-label (2026-07-19, ported from the graffito desktop app):
-            // when the no-change (dust-fold) shape is what a real build
-            // would take, `fee` above is already the byte-true NOMINAL
-            // fee — but the actual signed tx's fee also carries the
-            // sub-dust leftover on top of it (it can't be its own output,
-            // so the builder folds it into the fee instead).
-            // `predict_fold` mirrors that builder decision exactly for
-            // this fixed selection (pin-tested in notes-core's
-            // `tests/fold.rs` against `build_note_tx_exact`/
-            // `build_note_tx_mixed_exact_anchored`), so the cost line can
-            // show the split honestly instead of a single number that
-            // reads as an inflated fee.
-            let fold = if ok && took_no_change {
-                notes_core::fold::predict_fold(in_value, total_gift + dust_needed, fee_with_change, fee_no_change, true)
-            } else {
-                None
-            };
-            if !ok {
-                compose.set_cost_line(
-                    format!(
-                        "Needs ~{} sats — selected coins total {}.",
-                        fee + total_gift + dust_needed,
-                        in_value
-                    )
-                    .into(),
-                );
-                compose.set_can_continue(false);
-            } else {
-                compose.set_cost_line(
-                    format!(
-                        "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}{}{}",
-                        sats_line(fee, st.btc_usd),
-                        if !directed {
-                            String::new()
-                        } else if n_recipients <= 1 {
-                            format!(" + {gift} sats to recipient")
-                        } else {
-                            format!(
-                                " + {n_recipients} × {gift} = {total_gift} sats to {n_recipients} recipients"
-                            )
-                        },
-                        if dust_applies {
-                            format!(" + {} sats dust to notebook", notes_core::DUST_LIMIT)
-                        } else {
-                            String::new()
-                        },
-                        if let Some((_, folded)) = fold {
-                            format!(" + {folded} sats leftover (dust rule)")
-                        } else {
-                            String::new()
-                        }
-                    )
-                    .into(),
-                );
-                compose.set_can_continue(true);
-            }
-        });
+        ui.global::<Callbacks>().on_compose_changed(move || app.borrow_mut().compose_changed(&ui_weak, &fs));
     }
 
     // Post-quantum Security section: a typed edit un-certifies the
@@ -5147,14 +5625,15 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // extra-recipient list from a previous draft can't leak in.
     {
         let ui_weak = ui_weak.clone();
-        let pick_contact = pick_contact.clone();
+        let app = app.clone();
+        let fs = fs.clone();
         ui.global::<Callbacks>().on_reply_to_note(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let addr = ui.global::<View>().get_reply_address().to_string();
             if addr.is_empty() {
                 return;
             }
-            pick_contact(&addr);
+            app.borrow_mut().pick_contact(&ui_weak, &fs, &addr);
         });
     }
 
@@ -5166,14 +5645,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let pick_contact = pick_contact.clone();
+        let fs = fs.clone();
         ui.global::<Callbacks>().on_reply_all_to_note(move || {
             let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let set: Vec<String> =
                 ui.global::<View>().get_reply_set().iter().map(|s| s.to_string()).collect();
             let Some((first, rest)) = set.split_first() else { return };
-            pick_contact(first);
+            app.borrow_mut().pick_contact(&ui_weak, &fs, first);
             let st = state.borrow();
             let extra: Vec<ToRow> = rest
                 .iter()
@@ -5187,334 +5666,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // Shared by file import AND camera scan: parse + merge a bundle,
     // logging `cb: import-bundle {src} … ok` (src keeps the file=/loc=
     // shape the UI tests grep).
-    let apply_bundle: Rc<dyn Fn(&str, &str) -> Result<String, String>> = {
-        let fs = fs.clone();
-        let app = app.clone();
-        Rc::new(move |json: &str, src: &str| -> Result<String, String> {
-            let state = app.borrow().state.clone();
-            let identity = app.borrow().identity.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
-            let id_guard = identity.borrow();
-            let id = id_guard.as_ref().ok_or("identity unavailable")?;
-            {
-                let bundle =
-                    SyncBundle::from_json(json).map_err(|e| format!("bad bundle: {e}"))?;
-                let mut st = state.borrow_mut();
-                if !bundle.network.is_empty() && bundle.network != st.network {
-                    return Err(format!(
-                        "bundle is for {}, app is on {} — switch network first",
-                        bundle.network, st.network
-                    ));
-                }
-
-                // Spending-unification: the self-spk SET is the notebook's
-                // own spk plus every address the spending wallet has issued
-                // (`SpendingSection.self_spks`) — extends OWN detection to
-                // funded/mixed-source notes (extract_notes_multi_deduped ORs
-                // with the producer's spends_from_self, never narrows).
-                let ix = notebooks.borrow();
-                let ctx = notebook_ctx(&ix, app.borrow().active)
-                    .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
-                let net_s = app.borrow().net.clone();
-                let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
-                // DISPLAY-OWNER dedup anchor set (device CLAUDE.md): every
-                // VISIBLE (non-archived) notebook's own spk in the active
-                // wallet context, derived ONCE per import — never per tx —
-                // by reusing the same per-notebook identity derivation
-                // `confirm_self_spks` already does for the confirm screen.
-                // Archived notebooks are excluded by `visible()`, so an
-                // archived notebook's input can never suppress a note in an
-                // active one.
-                let notebook_spks = wallet_notebook_spks(&ix, app_seed_get(&app_seed), &net_s, ctx);
-                // Post-quantum auto-unlock candidates: the ACTIVE notebook's
-                // three derived ML-KEM receive secrets (512/768/1024) — the
-                // only notebook whose received notes this scan could ever
-                // be decrypting (the scan itself is already scoped to `id`,
-                // this notebook's Identity). Empty when the leaf secret
-                // isn't derivable (device locked) — `extract_notes_pq` with
-                // no candidates behaves exactly like the pre-pq extraction,
-                // just leaving every pq note `locked`.
-                let mlkem_secrets: Vec<pq::MlKemSecret> =
-                    (app.borrow().active).and_then(|acc| ix.get(acc)).and_then(|meta| {
-                        derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s)
-                    }).map(|leaf| {
-                        derive_mlkem_keypairs(&leaf).into_iter().map(|kp| kp.secret()).collect()
-                    }).unwrap_or_default();
-                drop(ix);
-                let notebook_addr = id.address(st.network());
-                let self_spks: Vec<Vec<u8>> = {
-                    let mut v = vec![p2tr_script_pubkey(&id.output_x)];
-                    if let Some(s) = &section {
-                        v.extend(s.self_spks());
-                    }
-                    v
-                };
-
-                let recovered = extract_notes_pq(
-                    &bundle,
-                    id,
-                    st.network(),
-                    &self_spks,
-                    &notebook_spks,
-                    &mlkem_secrets,
-                );
-                let mut new_notes = 0usize;
-                let mut received_notes = 0usize;
-                for r in &recovered {
-                    let id_hex = r.id.clone();
-                    if r.received {
-                        received_notes += 1;
-                    }
-                    // Merge keyed by (id, from): a received note can never
-                    // overwrite an own note sharing its id (its txid).
-                    match st
-                        .notes
-                        .iter_mut()
-                        .find(|n| n.id == id_hex && n.from.as_deref() == r.sender.as_deref())
-                    {
-                        Some(existing) => {
-                            existing.height = r.height.or(existing.height);
-                            existing.blocktime = r.blocktime.or(existing.blocktime);
-                            if existing.height.is_some() {
-                                existing.status = "confirmed".into();
-                            }
-                        }
-                        None => {
-                            new_notes += 1;
-                            st.notes.push(NoteRec {
-                                id: id_hex.clone(),
-                                text: r.text.clone().unwrap_or_else(|| {
-                                    if r.pq_flags != 0 {
-                                        "(locked — unlock to read)".into()
-                                    } else if r.received {
-                                        "(directed note — could not decrypt)".into()
-                                    } else {
-                                        "(sealed under another key)".into()
-                                    }
-                                }),
-                                private: r.private,
-                                txid: id_hex,
-                                raw_hex: String::new(),
-                                fee: 0,
-                                vsize: 0,
-                                chunks: 0,
-                                height: r.height,
-                                blocktime: r.blocktime,
-                                status: if r.height.is_some() {
-                                    "confirmed".into()
-                                } else {
-                                    "pending".into()
-                                },
-                                directed: r.directed,
-                                to: r.recipient.clone(),
-                                from: r.sender.clone(),
-                                recipients: r.recipients.clone(),
-                                pq_flags: r.pq_flags,
-                                locked: r.locked.clone(),
-                            });
-                        }
-                    }
-                }
-
-                // Split the bundle's UTXOs by owner: no `owner_address` (or
-                // one matching the notebook's own address) is a notebook
-                // coin; an address matching a KNOWN spending-wallet `used`
-                // entry routes to the spending ledger (tagged with its
-                // chain/index so signing can re-derive the key). A coin at
-                // an owner address the device hasn't recorded as used yet
-                // is GAP-ADOPTED below (funding-unification device-port
-                // fix, 2026-07-19) rather than dropped.
-                //
-                // Gap-adoption: the device has no chain access to probe
-                // blindly like the graffito desktop app's discover_spending() does,
-                // so instead it derives the bounded candidate set — both
-                // chains, `next_receive`/`next_change` .. +SPENDING_ADOPT_GAP
-                // (= 20, same constant the app's gap scan uses) — and
-                // compares each candidate's address against the coin's own
-                // owner_address. A match is exactly the kind of address the
-                // device would have marked `used` had it ever revealed or
-                // spent it, so it's ADOPTED: `mark_used` (idempotent,
-                // advances the index past it) and the coin is kept instead
-                // of dropped. Cheap and exact — each index's address is
-                // unique, so no false positives are possible.
-                //
-                // Companion gap-discovery, option (b) (2026-07-19): the
-                // device also exports a lookahead WATCH WINDOW (next 20
-                // receive + next 20 change addresses, Settings' spending
-                // card) so the companion can probe addresses it hasn't seen
-                // a coin at yet. The companion reports back every window
-                // address with ANY on-chain history — coin or not — as
-                // `bundle.owner_used`; those resolve through the exact same
-                // gap window below and get adopted even with no live coin.
-                // This is the convergence piece: a restore whose early
-                // addresses are used-but-spent-empty must still advance past
-                // them, or the device would forever re-offer an already-
-                // spent address as "next receive".
-                const SPENDING_ADOPT_GAP: u32 = 20;
-                let net_v = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
-                let mut nb_utxos: Vec<UtxoRec> = Vec::new();
-                let mut sp_utxos: Vec<spending::SpendingUtxo> = Vec::new();
-                let mut newly_used: Vec<spending::SpendingAddress> = Vec::new();
-                let mut next_recv = section.as_ref().map(|s| s.next_receive).unwrap_or(0);
-                let mut next_chg = section.as_ref().map(|s| s.next_change).unwrap_or(0);
-
-                // Shared gap derive-and-compare resolver (companion gap-
-                // discovery option (b), 2026-07-19): given ANY owner-tagged
-                // address — whether it came with a live coin or just a bare
-                // "this address has history" marker — find it among already-
-                // known `used` entries (persisted from a prior import, or
-                // adopted earlier in THIS SAME import via `newly_used`, which
-                // a pre-loop `section` clone can't see) or by deriving the
-                // bounded candidate window ahead of next_receive/next_change.
-                // A match is exactly the kind of address the device would
-                // have marked `used` had it ever revealed or spent it, so
-                // it's adopted: `next_recv`/`next_chg` advance past it and it
-                // is queued in `newly_used` for `mark_used` below. Returns
-                // `(address, true)` only the FIRST time an address resolves
-                // via derivation this import — callers use that to log
-                // exactly once per genuine adoption, never on repeat lookups
-                // (e.g. a second coin at the same already-adopted address).
-                let mut resolve_owner = |a: &str| -> Option<(spending::SpendingAddress, bool)> {
-                    let already_known = section
-                        .as_ref()
-                        .and_then(|s| s.used.iter().find(|x| x.address == a).cloned())
-                        .or_else(|| newly_used.iter().find(|x| x.address == a).cloned());
-                    if let Some(addr) = already_known {
-                        return Some((addr, false));
-                    }
-                    // `app_seed_get` hands back a concrete `&Option<[u8; 32]>`,
-                    // so `.as_ref()` is unambiguously `Option::as_ref` here.
-                    let Some(seed) = app_seed_get(&app_seed).as_ref() else { return None };
-                    let mut found_addr: Option<spending::SpendingAddress> = None;
-                    'gap: for chain in [0u32, 1u32] {
-                        let base = if chain == 0 { next_recv } else { next_chg };
-                        for index in base..base.saturating_add(SPENDING_ADOPT_GAP) {
-                            if let Ok(key) = notes_core::seeds::derive_spending_key(
-                                seed, ctx.0, net_v, ctx.1, chain, index,
-                            ) {
-                                if key.address == a {
-                                    found_addr = Some(spending::SpendingAddress {
-                                        chain,
-                                        index,
-                                        address: key.address.clone(),
-                                        spk_hex: hex::encode(&key.script_pubkey),
-                                    });
-                                    break 'gap;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(addr) = &found_addr {
-                        if addr.chain == 0 {
-                            next_recv = next_recv.max(addr.index + 1);
-                        } else {
-                            next_chg = next_chg.max(addr.index + 1);
-                        }
-                        newly_used.push(addr.clone());
-                    }
-                    found_addr.map(|addr| (addr, true))
-                };
-
-                // 1) Used-only markers FIRST — every watch-window address the
-                // companion found ANY history for, coin or not. This must run
-                // BEFORE the coin loop below so a coin at a later index
-                // benefits from the advanced next_recv/next_chg window in the
-                // SAME import: a restore whose early addresses are used-but-
-                // spent-empty must still converge past them to reach a later
-                // real coin, not get stuck re-deriving from index 0 forever.
-                for a in &bundle.owner_used {
-                    if a == &notebook_addr {
-                        continue; // the notebook identity is a separate address space
-                    }
-                    if let Some((addr, is_new)) = resolve_owner(a) {
-                        if is_new {
-                            log::info!(
-                                "cb: spending-adopt chain={} index={} used-only",
-                                addr.chain, addr.index
-                            );
-                        }
-                    }
-                    // else: still unknown beyond the gap — nothing to advance.
-                }
-
-                // 2) Coins — log line shape UNCHANGED from before this
-                // companion gap-discovery extension (today's e2e greps it).
-                for u in &bundle.utxos {
-                    match &u.owner_address {
-                        None => {
-                            nb_utxos.push(UtxoRec { txid: u.txid.clone(), vout: u.vout, value: u.value })
-                        }
-                        Some(a) if *a == notebook_addr => {
-                            nb_utxos.push(UtxoRec { txid: u.txid.clone(), vout: u.vout, value: u.value })
-                        }
-                        Some(a) => {
-                            if let Some((addr, is_new)) = resolve_owner(a) {
-                                if is_new {
-                                    log::info!(
-                                        "cb: spending-adopt chain={} index={}",
-                                        addr.chain, addr.index
-                                    );
-                                }
-                                sp_utxos.push(spending::SpendingUtxo {
-                                    txid: u.txid.clone(),
-                                    vout: u.vout,
-                                    value: u.value,
-                                    chain: addr.chain,
-                                    index: addr.index,
-                                });
-                            }
-                            // else: still unknown beyond the gap — dropped, unchanged.
-                        }
-                    }
-                }
-                st.utxos = nb_utxos;
-                if section.is_some() || !newly_used.is_empty() {
-                    let mut ix = notebooks.borrow_mut();
-                    let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
-                    for addr in newly_used {
-                        sec.mark_used(addr);
-                    }
-                    sec.set_utxos(sp_utxos);
-                    save_notebooks(&fs, &ix);
-                }
-                st.tip_height = Some(bundle.tip_height);
-                st.bundle_time = Some(bundle.bundle_time);
-                // Chunk size is a pure device setting — any relay-policy
-                // field in the bundle is deliberately ignored.
-                if bundle.fee_rates.economy > 0.0 {
-                    st.fee_economy = bundle.fee_rates.economy;
-                }
-                if bundle.fee_rates.half_hour > 0.0 {
-                    st.fee_normal = bundle.fee_rates.half_hour;
-                }
-                if bundle.fee_rates.fastest > 0.0 {
-                    st.fee_fast = bundle.fee_rates.fastest;
-                }
-                st.btc_usd = bundle.btc_usd.or(st.btc_usd);
-                save_state(&fs, &st);
-
-                log::info!(
-                    "cb: import-bundle {src} notes={} new={new_notes} received={received_notes} utxos={} tip={} ok",
-                    recovered.len(),
-                    st.utxos.len(),
-                    bundle.tip_height
-                );
-                Ok(format!(
-                    "Imported ({src}): {} note(s) ({new_notes} new), {} utxo(s), height {}.",
-                    recovered.len(),
-                    st.utxos.len(),
-                    bundle.tip_height
-                ))
-            }
-        })
-    };
 
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let apply_bundle = apply_bundle.clone();
         ui.global::<Callbacks>().on_import_bundle(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let result = (|| -> Result<String, String> {
@@ -5524,7 +5680,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 if loc == Location::Airlock {
                     unmount_airlock(&fs);
                 }
-                apply_bundle(&json, &format!("file={name} loc={loc_label}"))
+                app.borrow().apply_bundle(&fs, &json, &format!("file={name} loc={loc_label}"))
             })();
             match result {
                 Ok(msg) => {
@@ -5576,7 +5732,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let apply_bundle = apply_bundle.clone();
         ui.global::<Callbacks>().on_pick_bundle(move |name, loc_idx| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let loc = if loc_idx == 1 { Location::Airlock } else { Location::User };
@@ -5589,7 +5744,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     unmount_airlock(&fs);
                 }
                 let loc_label = if loc == Location::Airlock { "airlock" } else { "internal" };
-                apply_bundle(&json?, &format!("file={name} loc={loc_label}"))
+                app.borrow().apply_bundle(&fs, &json?, &format!("file={name} loc={loc_label}"))
             })();
             let sync = ui.global::<Sync>();
             sync.set_picking(false);
@@ -5610,7 +5765,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let apply_bundle = apply_bundle.clone();
+        let fs = fs.clone();
         ui.global::<Callbacks>().on_scan_bundle(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let opts = ScanQrOptions {
@@ -5640,7 +5795,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             log::info!("cb: scan-bundle kind={kind} bytes={}", data.len());
             let result = decode_scanned(&data)
                 .map_err(|e| e.to_string())
-                .and_then(|json| apply_bundle(&json, &format!("src=scan-{kind}")));
+                .and_then(|json| app.borrow().apply_bundle(&fs, &json, &format!("src=scan-{kind}")));
             match result {
                 Ok(msg) => {
                     ui.global::<Sync>().set_result(msg.into());
@@ -6057,8 +6212,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     // ---- notebook callbacks (screen 20 list) ----
     {
-        let switch_notebook = switch_notebook.clone();
-        ui.global::<NotebookCb>().on_open(move |account| switch_notebook(account.max(0) as u32));
+        let app = app.clone();
+        let fs = fs.clone();
+        let ui_weak = ui_weak.clone();
+        ui.global::<NotebookCb>().on_open(move |account| app.borrow_mut().switch_notebook(&ui_weak, &fs, account.max(0) as u32));
     }
     {
         // Create: open the name dialog in create mode (-2). Nothing is
@@ -6102,7 +6259,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let switch_notebook = switch_notebook.clone();
         ui.global::<NotebookCb>().on_name_save(move || {
             let notebooks = app.borrow().notebooks.clone();
             let app_seed = app.borrow().app_seed.clone();
@@ -6136,7 +6292,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     "cb: create-notebook account={account} scheme=bip86 seed={seed} bip-account={bacct} index={index}"
                 );
                 app.borrow().refresh_notebooks(&ui_weak, &fs);
-                switch_notebook(account);
+                app.borrow_mut().switch_notebook(&ui_weak, &fs, account);
             } else {
                 let account = sel as u32;
                 {
@@ -6209,52 +6365,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // until reveal-close wipes them; nothing is persisted or logged. Shared
     // by the reveal button AND the Switch action (which refreshes the words
     // to the new seed while they're shown). Keeps the SeedQR in sync.
-    let reveal_words: Rc<dyn Fn()> = {
-        let ui_weak = ui_weak.clone();
-        let app = app.clone();
-        Rc::new(move || {
-            let app_seed = app.borrow().app_seed.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let recovery = ui.global::<Recovery>();
-            let index = app.borrow().seed_idx;
-            let Some(seed) = app_seed_get(&app_seed).as_ref() else {
-                ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
-                log::warn!("cb: reveal-seed index={index} err=locked");
-                return;
-            };
-            let entropy = notes_core::keys::derive_seed_entropy(seed, index);
-            let words = match notes_core::bip39::entropy_to_mnemonic(&entropy) {
-                Ok(w) => w,
-                Err(e) => {
-                    ui.global::<Ui>().set_error(format!("Derivation failed: {e}").into());
-                    log::warn!("cb: reveal-seed index={index} err={e}");
-                    return;
-                }
-            };
-            let list: Vec<&str> = words.split_whitespace().collect();
-            let col = |range: std::ops::Range<usize>| -> String {
-                range
-                    .map(|i| format!("{:2}. {}", i + 1, list[i]))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            recovery.set_words_col1(col(0..12).into());
-            recovery.set_words_col2(col(12..24).into());
-            // Standard SeedQR: the 4-digit wordlist indices, concatenated.
-            let digits: String = notes_core::bip39::entropy_to_indices(&entropy)
-                .unwrap_or_default()
-                .iter()
-                .map(|i| format!("{i:04}"))
-                .collect();
-            recovery.set_qr(qr_image(&digits));
-            recovery.set_show_qr(false);
-            recovery.set_title_line(format!("Seed {index} · 24 words").into());
-            log::info!("cb: reveal-seed index={index} ok");
-        })
-    };
     {
-        let reveal_words = reveal_words.clone();
-        ui.global::<Callbacks>().on_reveal_seed(move || reveal_words());
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_reveal_seed(move || app.borrow().reveal_words(&ui_weak));
     }
     {
         let ui_weak = ui_weak.clone();
@@ -6276,69 +6390,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // notebook list. No private xprv on the device (the 24 words recover
     // the whole seed). Values live in UI props only, wiped on close;
     // never logged.
-    let apply_export: Rc<dyn Fn(i32)> = {
-        let ui_weak = ui_weak.clone();
-        Rc::new(move |which: i32| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let r = ui.global::<Recovery>();
-            let nb = r.get_export_nb_name();
-            let (label, value): (String, _) = match which {
-                0 => {
-                    ("Account xpub · all addresses · watch-only".to_string(), r.get_export_xpub())
-                }
-                1 => (
-                    "Descriptor (tr) · all addresses · watch-only".to_string(),
-                    r.get_export_descriptor(),
-                ),
-                2 => (format!("Notebook \"{nb}\" · hex"), r.get_export_hex()),
-                _ => (format!("Notebook \"{nb}\" · WIF"), r.get_export_wif()),
-            };
-            r.set_export_which(which);
-            r.set_export_label(label.into());
-            r.set_export_value(value.clone());
-            r.set_export_qr(qr_image(value.as_str()));
-        })
-    };
     // The active account's notebooks as picker rows (index/name/short addr)
     // plus the default selection (first notebook, else a synthetic index 0).
-    let export_rows: Rc<dyn Fn(u32, u32, &str, Network) -> (Vec<ExportNbRow>, i32, String)> = {
-        let app = app.clone();
-        Rc::new(move |si: u32, acct: u32, net_s: &str, network: Network| {
-            let app_seed = app.borrow().app_seed.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let mut rows: Vec<ExportNbRow> = Vec::new();
-            let ixb = notebooks.borrow();
-            for m in ixb.visible(si, acct) {
-                let addr = derive_identity(app_seed_get(&app_seed), m, net_s)
-                    .map(|id| id.address(network))
-                    .unwrap_or_default();
-                let short = short_addr(&addr);
-                let name = if m.name.trim().is_empty() {
-                    notebooks::default_name(m.index)
-                } else {
-                    m.name.clone()
-                };
-                rows.push(ExportNbRow {
-                    index: m.index as i32,
-                    name: name.into(),
-                    addr: short.into(),
-                });
-            }
-            let (sel, sel_name) = rows
-                .first()
-                .map(|r0| (r0.index, r0.name.to_string()))
-                .unwrap_or((0, "index 0".to_string()));
-            if rows.is_empty() {
-                rows.push(ExportNbRow { index: 0, name: "index 0".into(), addr: "".into() });
-            }
-            (rows, sel, sel_name)
-        })
-    };
     {
         let ui_weak = ui_weak.clone();
         let app = app.clone();
-        let apply_export = apply_export.clone();
-        let export_rows = export_rows.clone();
         ui.global::<Callbacks>().on_reveal_public(move || {
             let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -6365,16 +6421,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             }
             r.set_export_seed_view(false);
             r.set_export_title(export_title(seed, si, acct).into());
-            apply_export(0);
+            app.borrow().apply_export(&ui_weak, 0);
             log::info!("cb: reveal-public seed={si} account={acct} ok");
         });
     }
     {
         let ui_weak = ui_weak.clone();
         let app = app.clone();
-        let apply_export = apply_export.clone();
-        let export_rows = export_rows.clone();
-        let reveal_words = reveal_words.clone();
         ui.global::<Callbacks>().on_reveal_private(move || {
             let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -6388,7 +6441,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             };
             let net_s = app.borrow().net.clone();
             let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
-            let (rows, sel, sel_name) = export_rows(si, acct, &net_s, network);
+            let (rows, sel, sel_name) = app.borrow().export_rows(si, acct, &net_s, network);
             let derived = (|| -> Result<(), notes_core::Error> {
                 let (hex, wif) = export_leaf_formats(seed, si, network, acct, sel as u32)?;
                 r.set_export_hex(hex.into());
@@ -6404,22 +6457,22 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             r.set_export_nb_index(sel);
             r.set_export_nb_name(sel_name.into());
             // The 24 words (whole seed) into words-col1/2 + SeedQR.
-            reveal_words();
+            app.borrow().reveal_words(&ui_weak);
             r.set_export_title(export_title(seed, si, acct).into());
             r.set_export_seed_view(true); // default to the seed-words view
-            apply_export(2); // pre-load the hex value/QR for a quick pill switch
+            app.borrow().apply_export(&ui_weak, 2); // pre-load the hex value/QR for a quick pill switch
             log::info!("cb: reveal-private seed={si} account={acct} ok");
         });
     }
     {
-        let apply_export = apply_export.clone();
-        ui.global::<Callbacks>().on_export_select(move |which| apply_export(which));
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_export_select(move |which| app.borrow().apply_export(&ui_weak, which));
     }
     {
         // Pick which notebook's private key hex/WIF export (hex/WIF only).
         let ui_weak = ui_weak.clone();
         let app = app.clone();
-        let apply_export = apply_export.clone();
         ui.global::<Callbacks>().on_export_pick_notebook(move |index| {
             let app_seed = app.borrow().app_seed.clone();
             let notebooks = app.borrow().notebooks.clone();
@@ -6453,7 +6506,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             }
             let which = r.get_export_which();
             if which >= 2 {
-                apply_export(which);
+                app.borrow().apply_export(&ui_weak, which);
             }
         });
     }
@@ -6494,7 +6547,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let reveal_words = reveal_words.clone();
         ui.global::<Callbacks>().on_set_context(move || {
             let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -6531,7 +6583,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // context, and refresh the revealed words to the new seed.
                 app.borrow().refresh_notebooks(&ui_weak, &fs);
                 if !recovery.get_words_col1().is_empty() {
-                    reveal_words();
+                    app.borrow().reveal_words(&ui_weak);
                 }
             }
             recovery.set_saved_msg(
@@ -6554,28 +6606,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     ui.global::<Recovery>().set_account_text(format!("{}", app.borrow().bip_account).into());
     ui.global::<Ui>().set_screen(Screen::Notebooks);
 
-    let boot_seed = {
-        let fs = fs.clone();
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        move || {
-            let app_seed = app.borrow().app_seed.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            // First read of the seed in the app's life: this is what raises
-            // the one-time "App-scoped seed" consent prompt, and the running
-            // loop is what lets the user answer it.
-            let available = app_seed_get(&app_seed).is_some();
-            ui.global::<Recovery>().set_seed_available(available);
-            if !available {
-                ui.global::<Ui>().set_error("Device locked or seed unavailable".into());
-            }
-            // Repaint: the rows drawn before the seed existed have no address.
-            app.borrow().refresh_notebooks(&ui_weak, &fs);
-        }
-    };
     // A frame's grace so the list is on screen behind the consent prompt,
     // rather than the prompt appearing over a blank window.
-    Timer::single_shot(Duration::from_millis(150), boot_seed);
+    Timer::single_shot(Duration::from_millis(150), {
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        move || app.borrow().boot_seed(&ui_weak, &fs)
+    });
 
     ui.run().expect("UI running");
 }
