@@ -2,6 +2,7 @@ import { Theme, UISize, ButtonVariant, ButtonState, ControlSize, Images } from "
 import { Screen, Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, ConfirmRow, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow, Funding, FundingCoinRow, ChangePick, QuantumKeys, DeviceQuantumKey } from "callbacks.slint";
 import { Button } from "@ui/button.slint";
 import { PrimaryAction, SecondaryAction, ScreenHeader, PillOption, EditorField, NoteEntry, FundingCoinEntry, ChangeOptionRow, ContactEntry, ToRowEntry, ConfirmRowEntry } from "components.slint";
+import { HomeScreen } from "screens/home.slint";
 
 export { Screen, Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, DeviceQuantumKey, Theme, ButtonVariant, ButtonState, ControlSize, Images }
 
@@ -20,90 +21,9 @@ export component AppWindow inherits Window {
         // ------------------------------------------------ screen 0: home
         // A NOTEBOOK's home (its address, notes, compose). The header back
         // returns to the notebook list (screen 20 — the main screen).
-        if Ui.screen == Screen.home: VerticalLayout {
+        if Ui.screen == Screen.home: HomeScreen {
             width: parent.width;
             height: parent.height;
-            padding-left: 24px;
-            padding-right: 24px;
-            padding-top: 16px + UISize.control-center-status-bar-height;
-            padding-bottom: 24px;
-            spacing: 14px;
-
-            ScreenHeader {
-                title: NotebooksUi.title;
-                back => { Callbacks.refresh-home(); NotebookCb.back-to-list(); }
-            }
-
-            if Home.address == "": Text {
-                text: Ui.error == "" ? "Deriving identity…" : Ui.error;
-                color: Theme.palette-muted;
-                font-family: "Montserrat";
-                font-size: 17px;
-                wrap: word-wrap;
-                horizontal-alignment: center;
-            }
-
-            if Home.address != "": VerticalLayout {
-                spacing: 10px;
-                Image {
-                    source: Home.qr;
-                    width: 190px;
-                    height: 190px;
-                    image-rendering: pixelated;
-                    x: (parent.width - self.width) / 2;
-                }
-                Text {
-                    text: Home.address;
-                    color: Theme.palette-muted;
-                    font-family: "SourceCodePro";
-                    font-size: 13px;
-                    wrap: char-wrap;
-                    horizontal-alignment: center;
-                }
-                Text {
-                    text: Home.balance-line;
-                    color: Theme.palette-foreground;
-                    font-family: "Montserrat";
-                    font-size: 20px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                }
-                Text {
-                    text: Home.sync-line + " · " + Home.network;
-                    color: Theme.palette-muted;
-                    font-family: "SourceCodePro";
-                    font-size: 14px;
-                    horizontal-alignment: center;
-                }
-            }
-
-            Rectangle { vertical-stretch: 1; }
-
-            PrimaryAction {
-                width: 100%;
-                text: "Compose note";
-                disabled: Home.address == "";
-                clicked => {
-                    Contacts.pick-mode = "compose";
-                    Callbacks.refresh-contacts();
-                    Ui.screen = Screen.contacts;
-                }
-            }
-            SecondaryAction {
-                width: 100%;
-                text: "Notes";
-                clicked => {
-                    Callbacks.refresh-notes();
-                    Ui.screen = Screen.notes;
-                }
-            }
-            SecondaryAction {
-                width: 100%;
-                text: "Sync";
-                clicked => { Ui.screen = Screen.sync; }
-            }
-            // No Settings here — it is wallet-level (network, chunk, wallet
-            // coins/sweep), reachable from the notebook list.
         }
 
         // ------------------------------------------- screen 1: notes list
