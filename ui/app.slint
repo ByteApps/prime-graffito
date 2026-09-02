@@ -3,6 +3,7 @@ import { Screen, Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Conf
 import { Button } from "@ui/button.slint";
 import { PrimaryAction, SecondaryAction, ScreenHeader, PillOption, EditorField, NoteEntry, FundingCoinEntry, ChangeOptionRow, ContactEntry, ToRowEntry, ConfirmRowEntry } from "components.slint";
 import { HomeScreen } from "screens/home.slint";
+import { NotesScreen } from "screens/notes.slint";
 
 export { Screen, Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, DeviceQuantumKey, Theme, ButtonVariant, ButtonState, ControlSize, Images }
 
@@ -27,111 +28,9 @@ export component AppWindow inherits Window {
         }
 
         // ------------------------------------------- screen 1: notes list
-        if Ui.screen == Screen.notes: VerticalLayout {
+        if Ui.screen == Screen.notes: NotesScreen {
             width: parent.width;
             height: parent.height;
-            padding-left: 24px;
-            padding-right: 24px;
-            padding-top: 16px + UISize.control-center-status-bar-height;
-            padding-bottom: 24px;
-            spacing: 12px;
-
-            ScreenHeader {
-                title: "Notes";
-                back => { Callbacks.refresh-home(); Ui.screen = Screen.home; }
-            }
-
-            if Notes.rows.length == 0 && Notes.hidden-label == "": Text {
-                text: "No notes yet.\nCompose one, or import a sync bundle.";
-                color: Theme.palette-muted;
-                font-family: "Montserrat";
-                font-size: 17px;
-                horizontal-alignment: center;
-            }
-
-            // Sender filter: tap the row to expand a per-sender checklist;
-            // the warn pill flags a persisted exclusion so hidden notes are
-            // never a silent mystery.
-            if Notes.senders.length > 1: Rectangle {
-                height: 32px;
-                TouchArea { clicked => { Notes.filter-expanded = !Notes.filter-expanded; } }
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text {
-                        text: Notes.hidden-label == "" ? "All senders" : Notes.hidden-label;
-                        color: Notes.hidden-label == "" ? Theme.palette-muted : Theme.palette-primary;
-                        font-family: "Montserrat";
-                        font-size: 14px;
-                        vertical-alignment: center;
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text {
-                        text: "Senders " + (Notes.filter-expanded ? " ^" : " v");
-                        color: Theme.palette-muted;
-                        font-family: "Montserrat";
-                        font-size: 14px;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-            if Notes.filter-expanded: Flickable {
-                height: min(Notes.senders.length * 44px, 176px);
-                viewport-height: Notes.senders.length * 44px;
-                VerticalLayout {
-                    spacing: 4px;
-                    for s in Notes.senders: Rectangle {
-                        height: 40px;
-                        border-radius: 10px;
-                        border-width: 1px;
-                        border-color: Theme.palette-border;
-                        TouchArea { clicked => { Callbacks.toggle-sender(s.key, !s.excluded); } }
-                        HorizontalLayout {
-                            padding-left: 10px;
-                            padding-right: 12px;
-                            spacing: 8px;
-                            Rectangle {
-                                width: 22px;
-                                Text {
-                                    text: s.excluded ? "[  ]" : "[x]";
-                                    color: s.excluded ? Theme.palette-muted : Theme.palette-primary;
-                                    font-family: "Montserrat";
-                                    font-size: 15px;
-                                    font-weight: 700;
-                                    x: 0; y: (parent.height - self.height) / 2;
-                                }
-                            }
-                            Text {
-                                text: s.label;
-                                color: s.excluded ? Theme.palette-muted : Theme.palette-foreground;
-                                font-family: "Montserrat";
-                                font-size: 14px;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                                overflow: elide;
-                            }
-                            Text {
-                                text: s.sub;
-                                color: Theme.palette-muted;
-                                font-family: "Montserrat";
-                                font-size: 12px;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-                }
-            }
-
-            Flickable {
-                vertical-stretch: 1;
-                viewport-height: Notes.rows.length * 84px;
-                VerticalLayout {
-                    spacing: 8px;
-                    for entry in Notes.rows: NoteEntry {
-                        entry: entry;
-                        tapped => { Callbacks.open-note(entry.id); }
-                    }
-                }
-            }
         }
 
         // -------------------------------------------- screen 2: note view
