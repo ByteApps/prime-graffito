@@ -1458,6 +1458,18 @@ struct App {
     compose_oversize: bool,
 }
 
+// "Notebook <index+1>" (never empty — rows and the home title read
+// this). Every notebook is created named, so the default only covers
+// entries written before that rule; `addr_short` is the last resort
+// for an account with no index entry at all.
+fn notebook_name(ix: &notebooks::NotebookIndex, account: u32, addr_short: &str) -> String {
+    match ix.get(account) {
+        Some(m) if !m.name.trim().is_empty() => m.name.clone(),
+        Some(m) => notebooks::default_name(m.index),
+        None => addr_short.to_string(),
+    }
+}
+
 impl App {
     /// The persisted projection of the wallet-level fields — the ONE
     /// place `config.json`'s shape is assembled from live state.
@@ -1470,6 +1482,635 @@ impl App {
             lock_time: self.lock_policy,
             mlkem_level: self.mlkem_level,
         }
+    }
+}
+
+impl App {
+    /// Persist the device config from the current cells (single source of
+    /// truth — inline DeviceConfig constructions drift as fields grow).
+    fn refresh_home(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let state = self.state.clone();
+        let identity = self.identity.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let st = state.borrow();
+        let home = ui.global::<Home>();
+        home.set_network(self.net.clone().into()); // device-level network
+        if let Some(id) = identity.borrow().as_ref() {
+            let addr = id.address(st.network());
+            home.set_qr(qr_image(&addr.to_uppercase()));
+            home.set_address(addr.into());
+        }
+        home.set_balance_line(sats_line(st.balance(), st.btc_usd).into());
+        let sync_line = match st.tip_height {
+            Some(h) => format!("synced to height {h}"),
+            None => "never synced".to_string(),
+        };
+        home.set_sync_line(sync_line.into());
+        let sync = ui.global::<Sync>();
+        sync.set_status(
+            format!(
+                "network: {}\nbalance: {} sats · {} utxos\nchain height: {}\nfees (sat/vB): {}/{}/{} · chunk: {} bytes",
+                st.network,
+                st.balance(),
+                st.utxos.len(),
+                st.tip_height.map(|h| h.to_string()).unwrap_or("—".into()),
+                st.fee_economy,
+                st.fee_normal,
+                st.fee_fast,
+                st.effective_chunk()
+            )
+            .into(),
+        );
+        let settings = ui.global::<Settings>();
+        let dchunk = self.device_chunk;
+        settings.set_chunk_mode(match dchunk {
+            None => 0,
+            Some(80) => 1,
+            Some(_) => 2,
+        });
+        let eff = dchunk.map(|c| c.clamp(MIN_CHUNK, DEFAULT_CHUNK)).unwrap_or(DEFAULT_CHUNK);
+        settings.set_chunk_text(format!("{eff}").into());
+        let policy = self.lock_policy;
+        settings.set_locktime_mode(match policy {
+            LockTimePolicy::Tip => 0,
+            LockTimePolicy::Zero => 1,
+            LockTimePolicy::Custom { .. } => 2,
+        });
+        // Mirror the height the policy would actually use, so the
+        // Custom field opens pre-filled with the current value.
+        settings.set_locktime_text(format!("{}", resolve_locktime(policy, st.tip_height)).into());
+        settings.set_locktime_effective(locktime_caption(policy, st.tip_height).into());
+        log::info!(
+            "cb: home balance={} utxos={} tip={}",
+            st.balance(),
+            st.utxos.len(),
+            st.tip_height.map(|h| h.to_string()).unwrap_or("none".into())
+        );
+    }
+
+    /// Persist the device config from the current cells (single source of
+    /// truth — inline DeviceConfig constructions drift as fields grow).
+    fn refresh_notes(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let state = self.state.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let st = state.borrow();
+        // Sender filter: build the checklist + filter the list. A note
+        // is hidden iff its sender key is in the persisted exclusion set.
+        let senders: Vec<SenderRow> = st
+            .senders()
+            .into_iter()
+            .map(|(key, count)| {
+                let label = if key == "self" {
+                    "Self".to_string()
+                } else {
+                    st.contacts
+                        .iter()
+                        .find(|c| c.address == key && !c.name.is_empty())
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| short_addr(&key))
+                };
+                SenderRow {
+                    excluded: st.is_excluded(&key),
+                    key: key.into(),
+                    label: label.into(),
+                    sub: format!("{count} note(s)").into(),
+                }
+            })
+            .collect();
+        let hidden = senders.iter().filter(|s| s.excluded).count();
+        let notes_g = ui.global::<Notes>();
+        notes_g.set_senders(Rc::new(VecModel::from(senders)).into());
+        notes_g.set_hidden_label(
+            if hidden == 0 { "".to_string() } else { format!("{hidden} sender(s) hidden") }.into(),
+        );
+        let mut recs: Vec<&NoteRec> =
+            st.notes.iter().filter(|n| !st.is_excluded(&State::sender_key(n))).collect();
+        // Pending first, then newest confirmed first.
+        recs.sort_by_key(|n| match n.height {
+            None => (0u8, 0i64),
+            Some(h) => (1u8, -(h as i64)),
+        });
+        let rows: Vec<NoteRow> = recs
+            .iter()
+            .map(|n| NoteRow {
+                id: n.id.clone().into(),
+                preview: preview_of(&n.text).into(),
+                meta: {
+                    let base = match n.height {
+                        Some(h) => format!("block {h} · {} chunk(s)", n.chunks.max(1)),
+                        None => format!("pending · fee {} sats", n.fee),
+                    };
+                    match (&n.from, &n.to) {
+                        (Some(from), _) => format!("{base} · from {}", short_addr(from)),
+                        (None, Some(to)) => format!("{base} · to {}", short_addr(to)),
+                        _ => base,
+                    }
+                }
+                .into(),
+                badge: if n.private { "PRIVATE" } else { "PUBLIC" }.into(),
+                // Post-quantum (pq.rs): pq mirrors the contacts picker's
+                // "PQ" badge (a passphrase and/or ML-KEM layer was
+                // used); locked mirrors the note-view screen's lock
+                // state (a received pq note this device couldn't
+                // auto-decrypt at scan time — still visually distinct
+                // from an unlocked pq note in the list).
+                pq: n.pq_flags != 0,
+                locked: n.locked.is_some(),
+            })
+            .collect();
+        log::info!("cb: refresh-notes n={} hidden={hidden}", rows.len());
+        notes_g.set_rows(Rc::new(VecModel::from(rows)).into());
+    }
+
+    /// Persist the device config from the current cells (single source of
+    /// truth — inline DeviceConfig constructions drift as fields grow).
+    fn refresh_contacts(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let state = self.state.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let st = state.borrow();
+        // State order IS recency (front = latest use) — no re-sort.
+        let rows: Vec<ContactRow> = st
+            .contacts
+            .iter()
+            .map(|c| ContactRow {
+                address: c.address.clone().into(),
+                name: c.name.clone().into(),
+                label: if c.name.is_empty() { short_addr(&c.address) } else { c.name.clone() }
+                    .into(),
+                meta: short_addr(&c.address).into(),
+                pq_caption: c
+                    .mlkem_ek
+                    .as_deref()
+                    .map(contact_pq_caption)
+                    .unwrap_or_default()
+                    .into(),
+            })
+            .collect();
+        log::info!("cb: refresh-contacts n={}", rows.len());
+        ui.global::<Contacts>().set_rows(Rc::new(VecModel::from(rows)).into());
+    }
+
+    /// truth — inline DeviceConfig constructions drift as fields grow).
+    /// Coins screen (9): the UTXO ledger as of the last sync bundle, biggest
+    /// first. Viewer-first — consolidate is the screen's single action.
+    fn refresh_coins(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let notebooks = self.notebooks.clone();
+        let app_seed = self.app_seed.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        // Wallet-wide: every ACTIVE notebook's coins, each tagged with
+        // its notebook. Flush the active notebook first so its file is
+        // current, then read all from disk.
+        save_state(&fs, &state.borrow());
+        let ix = notebooks.borrow();
+        let active_net = self.net.clone();
+        let ctx = (self.seed_idx, self.bip_account);
+        let btc_usd = state.borrow().btc_usd;
+        // (value, notebook name, txid, vout) across the wallet.
+        let mut all: Vec<(u64, String, String, u32)> = Vec::new();
+        let mut nb_with_coins = 0usize;
+        for m in ix.visible(ctx.0, ctx.1) {
+            let st2 = load_state(&fs, &active_net, m.account);
+            if st2.utxos.is_empty() {
+                continue;
+            }
+            nb_with_coins += 1;
+            let short = derive_identity(app_seed_get(&app_seed), m, &active_net)
+                .map(|id| short_addr(&id.address(st2.network())))
+                .unwrap_or_default();
+            let name = notebook_name(&ix, m.account, &short);
+            for u in &st2.utxos {
+                all.push((u.value, name.clone(), u.txid.clone(), u.vout));
+            }
+        }
+        all.sort_by_key(|(v, ..)| std::cmp::Reverse(*v));
+        let total: u64 = all.iter().map(|(v, ..)| v).sum();
+        let rows: Vec<CoinRow> = all
+            .iter()
+            .map(|(v, name, txid, vout)| CoinRow {
+                label: format!("{v} sats · {name}").into(),
+                meta: format!("txid {} · output {}", short_addr(txid), vout).into(),
+            })
+            .collect();
+        let coins = ui.global::<Coins>();
+        coins.set_summary(
+            format!(
+                "{} coin(s) · {} across {nb_with_coins} notebook(s)",
+                rows.len(),
+                sats_line(total, btc_usd)
+            )
+            .into(),
+        );
+        coins.set_can_consolidate(rows.len() >= 2);
+        log::info!("cb: refresh-coins n={} total={total} notebooks={nb_with_coins}", rows.len());
+        coins.set_rows(Rc::new(VecModel::from(rows)).into());
+    }
+
+    /// Rebuild the Pay-from screen's rows/summaries, the compose nav row's
+    /// label, AND Settings' spending card (same underlying section) from
+    /// `state` + the active notebook's spending section + `funding_pick`.
+    fn refresh_funding(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let state = self.state.clone();
+        let notebooks = self.notebooks.clone();
+        let app_seed = self.app_seed.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let st = state.borrow();
+        let active_net = self.net.clone();
+        let ix = notebooks.borrow();
+        let ctx = notebook_ctx(&ix, self.active)
+            .unwrap_or((self.seed_idx, self.bip_account));
+        let section = ix.spending(&active_net, ctx.0, ctx.1).cloned();
+        drop(ix);
+        let pick = self.funding_pick.clone();
+
+        let nb_rows: Vec<FundingCoinRow> = st
+            .utxos
+            .iter()
+            .map(|u| FundingCoinRow {
+                key: funding_key(false, &u.txid, u.vout).into(),
+                label: format!("{} sats", u.value).into(),
+                meta: format!("txid {} · output {}", short_addr(&u.txid), u.vout).into(),
+                selected: pick.is_selected(false, &u.txid, u.vout),
+            })
+            .collect();
+        let nb_total: u64 = st.utxos.iter().map(|u| u.value).sum();
+        let nb_selected_total: u64 = st
+            .utxos
+            .iter()
+            .filter(|u| pick.is_selected(false, &u.txid, u.vout))
+            .map(|u| u.value)
+            .sum();
+
+        let sp_rows: Vec<FundingCoinRow> = section
+            .as_ref()
+            .map(|s| {
+                s.utxos
+                    .iter()
+                    .map(|u| FundingCoinRow {
+                        key: funding_key(true, &u.txid, u.vout).into(),
+                        label: format!("{} sats", u.value).into(),
+                        meta: format!(
+                            "txid {} · output {} · idx {}",
+                            short_addr(&u.txid),
+                            u.vout,
+                            u.index
+                        )
+                        .into(),
+                        selected: pick.is_selected(true, &u.txid, u.vout),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let sp_total = section.as_ref().map(|s| s.balance()).unwrap_or(0);
+        let sp_enabled = section.as_ref().map(|s| s.enabled).unwrap_or(false);
+        let sp_selected_total: u64 = section
+            .as_ref()
+            .map(|s| {
+                s.utxos
+                    .iter()
+                    .filter(|u| pick.is_selected(true, &u.txid, u.vout))
+                    .map(|u| u.value)
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        let funding = ui.global::<Funding>();
+        funding.set_notebook_coins(Rc::new(VecModel::from(nb_rows)).into());
+        funding.set_spending_coins(Rc::new(VecModel::from(sp_rows)).into());
+        funding.set_notebook_summary(
+            format!("{} coin(s) · {} sats", st.utxos.len(), nb_total).into(),
+        );
+        funding.set_spending_summary(
+            if !sp_enabled {
+                "Off".to_string()
+            } else if sp_total == 0 {
+                "No coins".to_string()
+            } else {
+                format!(
+                    "{} coin(s) · {} sats",
+                    section.as_ref().map(|s| s.utxos.len()).unwrap_or(0),
+                    sp_total
+                )
+            }
+            .into(),
+        );
+        funding.set_spending_enabled(sp_enabled);
+        let mode = pick.mode_label();
+        let selected_total = nb_selected_total + sp_selected_total;
+        let selected_n = pick.notebook.len() + pick.spending.len();
+        funding.set_warning(
+            if mode == "mixed" {
+                "This note spends from both the notebook and the spending wallet — their addresses become publicly linked on-chain.".to_string()
+            } else {
+                String::new()
+            }
+            .into(),
+        );
+
+        let compose = ui.global::<Compose>();
+        compose.set_pay_from_label(
+            match mode {
+                "mixed" => "Mixed",
+                "spending" => "Spending wallet",
+                _ => "Notebook",
+            }
+            .into(),
+        );
+        compose
+            .set_pay_from_balance(format!("{selected_total} sats · {selected_n} coin(s)").into());
+
+        // Settings' spending card mirrors the SAME section — harmless to
+        // refresh even when Settings isn't the visible screen.
+        let settings = ui.global::<Settings>();
+        settings.set_spending_enabled(sp_enabled);
+        if let Some(s) = &section {
+            settings.set_spending_balance_line(
+                format!("{} coin(s) · {} sats", s.utxos.len(), s.balance()).into(),
+            );
+            if let Some(seed) = app_seed_get(&app_seed).as_ref() {
+                let net_v = Network::from_str_opt(&active_net).unwrap_or(Network::Mainnet);
+                if let Ok(key) = notes_core::seeds::derive_spending_key(
+                    seed, ctx.0, net_v, ctx.1, 0, s.next_receive,
+                ) {
+                    settings.set_spending_address(key.address.clone().into());
+                    settings.set_spending_qr(qr_image(&key.address.to_uppercase()));
+                }
+                // Companion watch window (funding-unification gap-
+                // discovery, option (b), 2026-07-19): the next
+                // SPENDING_WINDOW receive AND change addresses — a
+                // lookahead the companion can probe for coins/history the
+                // device hasn't revealed or spent yet, so a restore (or a
+                // funding-wallet-style external deposit straight to a
+                // not-yet-shown address) still gets found on the next
+                // sync. Plain address lines, receive block then change
+                // block, so the whole text pastes straight into the
+                // companion's "Spending wallet addresses" field — no
+                // chain/index prefix (unlike `spending-addresses-text`
+                // above, which is for human display of what's ALREADY
+                // used). Same derivation as everywhere else on this
+                // screen — no new crypto.
+                const SPENDING_WINDOW: u32 = 20;
+                let window_lines: Vec<String> = [0u32, 1u32]
+                    .into_iter()
+                    .flat_map(|chain| {
+                        let base = if chain == 1 { s.next_change } else { s.next_receive };
+                        (base..base.saturating_add(SPENDING_WINDOW)).filter_map(move |index| {
+                            notes_core::seeds::derive_spending_key(
+                                seed, ctx.0, net_v, ctx.1, chain, index,
+                            )
+                            .ok()
+                            .map(|k| k.address)
+                        })
+                    })
+                    .collect();
+                let window_text = window_lines.join("\n");
+                settings.set_spending_window_text(window_text.clone().into());
+                settings.set_spending_window_qr(qr_image(&window_text.to_uppercase()));
+            }
+            let addr_lines: Vec<String> = s
+                .used
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{}/{}  {}",
+                        if a.chain == 1 { "change" } else { "receive" },
+                        a.index,
+                        a.address
+                    )
+                })
+                .collect();
+            settings.set_spending_addresses_text(addr_lines.join("\n").into());
+        } else {
+            settings.set_spending_balance_line("0 coin(s) · 0 sats".into());
+            settings.set_spending_addresses_text("".into());
+            settings.set_spending_window_text("".into());
+        }
+    }
+
+    /// Rebuild the Pay-from screen's rows/summaries, the compose nav row's
+    /// label, AND Settings' spending card (same underlying section) from
+    /// `state` + the active notebook's spending section + `funding_pick`.
+    /// Rebuild the compose nav row's Change label + the Change screen's
+    /// "Auto" sub-line from `change_pick` + whether the CURRENT funding pick
+    /// spends any spending-wallet coin.
+    fn refresh_change(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let participates = !self.funding_pick.spending.is_empty();
+        let cp = self.change_pick.clone();
+        let auto_label = if participates {
+            "Fresh spending-wallet address — protects the change from address reuse."
+        } else {
+            "Notebook address — the same address it goes to today."
+        };
+        ui.global::<ChangePick>().set_auto_label(auto_label.into());
+        let label = match cp.choice.as_str() {
+            "custom" if !cp.custom_address.is_empty() => short_addr(&cp.custom_address),
+            "custom" => "custom address".to_string(),
+            "notebook" => "notebook".to_string(),
+            _ if participates => "fresh spending address".to_string(),
+            _ => "back to you".to_string(),
+        };
+        ui.global::<Compose>().set_change_label(label.into());
+    }
+
+    /// for an account with no index entry at all.
+    /// Rebuild the notebook list (screen 20) from the index + each
+    /// notebook's state file. Device has no live balance — the row meta is
+    /// address-short · note count.
+    fn refresh_notebooks(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let notebooks = self.notebooks.clone();
+        let app_seed = self.app_seed.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let ix = notebooks.borrow();
+        let active_acct = self.active;
+        let dev_net = self.net.clone();
+        let ctx = (self.seed_idx, self.bip_account);
+        let build = |m: &notebooks::NotebookMeta| -> NotebookRow {
+            let st = load_state(&fs, &dev_net, m.account);
+            let addr = derive_identity(app_seed_get(&app_seed), m, &dev_net)
+                .map(|id| id.address(Network::from_str_opt(&dev_net).unwrap_or(Network::Mainnet)))
+                .unwrap_or_default();
+            let short = short_addr(&addr);
+            let n = st.notes.len();
+            NotebookRow {
+                account: m.account as i32,
+                name: notebook_name(&ix, m.account, &short).into(),
+                meta: format!(
+                    "{short} · {n} note{}",
+                    if n == 1 { "" } else { "s" }
+                )
+                .into(),
+                active: active_acct == Some(m.account),
+            }
+        };
+        let rows: Vec<NotebookRow> = ix.visible(ctx.0, ctx.1).map(build).collect();
+        let archived: Vec<NotebookRow> =
+            ix.archived_in_context(ctx.0, ctx.1).map(build).collect();
+        let nb = ui.global::<NotebooksUi>();
+        nb.set_empty_line(
+            if rows.is_empty() {
+                if !archived.is_empty() {
+                    "All notebooks are archived.".into()
+                } else {
+                    "No notebooks yet — create one to start writing.".into()
+                }
+            } else {
+                "".into()
+            },
+        );
+        nb.set_archived_label(
+            if archived.is_empty() {
+                "".to_string()
+            } else {
+                format!("Archived ({})", archived.len())
+            }
+            .into(),
+        );
+        log::info!("cb: notebooks list n={} archived={}", rows.len(), archived.len());
+        nb.set_rows(Rc::new(VecModel::from(rows)).into());
+        nb.set_archived_rows(Rc::new(VecModel::from(archived)).into());
+    }
+
+    /// Quantum-keys screen (27): every visible notebook in the active
+    /// (seed, account) wallet context has its OWN ML-KEM receive identity
+    /// (derived from its own BIP-86 leaf secret, like the Export-keys
+    /// screen's hex/WIF), so the screen needs the same notebook picker —
+    /// `export_pick_notebook`'s row design + selection convention, reusing
+    /// the shared `ExportNbRow` struct. Default selection when the picker
+    /// hasn't been touched (`quantum_nb == None`): the ACTIVE notebook when
+    /// one is open, else the wallet context's first visible notebook — the
+    /// screen's original single-notebook behavior, preserved as the
+    /// default. Public-key only: device backup is the 24 recovery words,
+    /// which already reconstruct every notebook's key.
+    fn refresh_quantum_keys(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let notebooks = self.notebooks.clone();
+        let app_seed = self.app_seed.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let qk = ui.global::<QuantumKeys>();
+        let alg = mlkem_alg_from_u8(self.mlkem_level);
+        let level_idx = match alg {
+            pq::MlKemAlg::MlKem512 => 0,
+            pq::MlKemAlg::MlKem768 => 1,
+            pq::MlKemAlg::MlKem1024 => 2,
+        };
+        qk.set_level(level_idx);
+        qk.set_level_caption(mlkem_alg_describe(alg).into());
+
+        let ix = notebooks.borrow();
+        let net_s = self.net.clone();
+        let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
+        let ctx = (self.seed_idx, self.bip_account);
+
+        // Picker rows: every visible notebook in this wallet context,
+        // same shape/derivation as `export_rows`.
+        let mut rows: Vec<ExportNbRow> = Vec::new();
+        for m in ix.visible(ctx.0, ctx.1) {
+            let addr = derive_identity(app_seed_get(&app_seed), m, &net_s)
+                .map(|id| id.address(network))
+                .unwrap_or_default();
+            let name = if m.name.trim().is_empty() {
+                notebooks::default_name(m.index)
+            } else {
+                m.name.clone()
+            };
+            rows.push(ExportNbRow {
+                index: m.index as i32,
+                name: name.into(),
+                addr: short_addr(&addr).into(),
+            });
+        }
+
+        // Selection: an explicit picker choice (if it's still visible),
+        // else the active-or-first default described above.
+        let default_meta = (self.active)
+            .and_then(|acc| ix.get(acc))
+            .or_else(|| ix.visible(ctx.0, ctx.1).next())
+            .cloned();
+        let meta = self
+            .quantum_nb
+            .and_then(|i| ix.visible(ctx.0, ctx.1).find(|m| m.index == i).cloned())
+            .or(default_meta);
+        drop(ix);
+
+        let (nb_idx, nb_name) = meta
+            .as_ref()
+            .map(|m| {
+                let name = if m.name.trim().is_empty() {
+                    notebooks::default_name(m.index)
+                } else {
+                    m.name.clone()
+                };
+                (m.index as i32, name)
+            })
+            .unwrap_or((0, "".to_string()));
+        qk.set_notebooks(Rc::new(VecModel::from(rows)).into());
+        qk.set_nb_index(nb_idx);
+        qk.set_nb_name(nb_name.into());
+
+        let leaf =
+            meta.as_ref().and_then(|m| derive_leaf_secret(app_seed_get(&app_seed), m, &net_s));
+        match leaf {
+            Some(leaf) => {
+                let kp = pq::mlkem_keypair_from_leaf(&leaf, alg);
+                qk.set_qr_zoom(false); // never re-enter the screen zoomed
+                qk.set_fingerprint(kp.fingerprint().into());
+                // The dense armor QR is optically unverifiable at
+                // device resolution (~1.2px/module), so the UI suite
+                // cross-checks THIS line against notes_cli
+                // pq-fingerprint's independent host derivation.
+                // Public info — safe to log.
+                log::info!("cb: pq-key fp={}", kp.fingerprint());
+                let armor = pq::export_public(alg, kp.ek());
+                qk.set_public_qr(qr_image(&armor));
+                qk.set_public_armor(armor.into());
+            }
+            None => {
+                qk.set_fingerprint("No notebook yet — create one first.".into());
+                qk.set_public_armor("".into());
+            }
+        }
+    }
+
+    /// Personal device quantum key (PLAN-graffito-quantum-key.md, screen
+    /// 28) — Settings → "Quantum key…". A single, NON-seed-derived ML-KEM
+    /// keypair, generated on-device (fresh TRNG mixed with optional user
+    /// entropy — `pq::MlKemKeypair::generate_with_extra`) or imported,
+    /// stored plain in AppData (`QUANTUM_KEY_PATH`). Distinct from the
+    /// per-notebook seed-derived keys the "Quantum keys" screen above
+    /// shows: this key is NOT recovered by the 24 words and dies with app
+    /// uninstall — it is what makes the self-note ML-KEM compose pill
+    /// (compose-changed, earlier) meaningful at all (pq.rs's module doc:
+    /// encapsulating to a seed-derived receive key on a self-note is
+    /// security theater, since that key shares the enc key's root).
+    /// ---------------------------------------------------------------------
+    fn refresh_device_quantum_key(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let dq = ui.global::<DeviceQuantumKey>();
+        // Bound to a local first: a `match` scrutinee's temporaries live
+        // through the arms, and this one is a RefMut<App>.
+        let device_kp = self.device_quantum_key(fs);
+        match device_kp {
+            Some(kp) => {
+                dq.set_has_key(true);
+                dq.set_fingerprint(kp.fingerprint().into());
+                dq.set_level_name(mlkem_alg_name(kp.alg()).into());
+                let armor = pq::export_public(kp.alg(), kp.ek());
+                dq.set_public_qr(qr_image(&armor));
+                dq.set_public_armor(armor.into());
+            }
+            None => {
+                dq.set_has_key(false);
+                dq.set_fingerprint("".into());
+                dq.set_level_name("".into());
+                dq.set_public_armor("".into());
+                dq.set_public_qr(Image::default());
+            }
+        }
+    }
+
+    /// Persist the wallet-level fields to config.json.
+    fn persist_config(&self, fs: &Fs) {
+        save_config(fs, &self.device_config());
     }
 }
 
@@ -1530,244 +2171,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     // Persist the device config from the current cells (single source of
     // truth — inline DeviceConfig constructions drift as fields grow).
-    let persist_config = {
-        let fs = fs.clone();
-        let app = app.clone();
-        Rc::new(move || {
-            save_config(&fs, &app.borrow().device_config());
-        })
-    };
 
-
-    let refresh_home = {
-        let ui_weak = ui_weak.clone();
-        let app = app.clone();
-        move || {
-            let state = app.borrow().state.clone();
-            let identity = app.borrow().identity.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let st = state.borrow();
-            let home = ui.global::<Home>();
-            home.set_network(app.borrow().net.clone().into()); // device-level network
-            if let Some(id) = identity.borrow().as_ref() {
-                let addr = id.address(st.network());
-                home.set_qr(qr_image(&addr.to_uppercase()));
-                home.set_address(addr.into());
-            }
-            home.set_balance_line(sats_line(st.balance(), st.btc_usd).into());
-            let sync_line = match st.tip_height {
-                Some(h) => format!("synced to height {h}"),
-                None => "never synced".to_string(),
-            };
-            home.set_sync_line(sync_line.into());
-            let sync = ui.global::<Sync>();
-            sync.set_status(
-                format!(
-                    "network: {}\nbalance: {} sats · {} utxos\nchain height: {}\nfees (sat/vB): {}/{}/{} · chunk: {} bytes",
-                    st.network,
-                    st.balance(),
-                    st.utxos.len(),
-                    st.tip_height.map(|h| h.to_string()).unwrap_or("—".into()),
-                    st.fee_economy,
-                    st.fee_normal,
-                    st.fee_fast,
-                    st.effective_chunk()
-                )
-                .into(),
-            );
-            let settings = ui.global::<Settings>();
-            let dchunk = app.borrow().device_chunk;
-            settings.set_chunk_mode(match dchunk {
-                None => 0,
-                Some(80) => 1,
-                Some(_) => 2,
-            });
-            let eff = dchunk.map(|c| c.clamp(MIN_CHUNK, DEFAULT_CHUNK)).unwrap_or(DEFAULT_CHUNK);
-            settings.set_chunk_text(format!("{eff}").into());
-            let policy = app.borrow().lock_policy;
-            settings.set_locktime_mode(match policy {
-                LockTimePolicy::Tip => 0,
-                LockTimePolicy::Zero => 1,
-                LockTimePolicy::Custom { .. } => 2,
-            });
-            // Mirror the height the policy would actually use, so the
-            // Custom field opens pre-filled with the current value.
-            settings.set_locktime_text(format!("{}", resolve_locktime(policy, st.tip_height)).into());
-            settings.set_locktime_effective(locktime_caption(policy, st.tip_height).into());
-            log::info!(
-                "cb: home balance={} utxos={} tip={}",
-                st.balance(),
-                st.utxos.len(),
-                st.tip_height.map(|h| h.to_string()).unwrap_or("none".into())
-            );
-        }
-    };
-
-    let refresh_notes = {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        move || {
-            let state = app.borrow().state.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let st = state.borrow();
-            // Sender filter: build the checklist + filter the list. A note
-            // is hidden iff its sender key is in the persisted exclusion set.
-            let senders: Vec<SenderRow> = st
-                .senders()
-                .into_iter()
-                .map(|(key, count)| {
-                    let label = if key == "self" {
-                        "Self".to_string()
-                    } else {
-                        st.contacts
-                            .iter()
-                            .find(|c| c.address == key && !c.name.is_empty())
-                            .map(|c| c.name.clone())
-                            .unwrap_or_else(|| short_addr(&key))
-                    };
-                    SenderRow {
-                        excluded: st.is_excluded(&key),
-                        key: key.into(),
-                        label: label.into(),
-                        sub: format!("{count} note(s)").into(),
-                    }
-                })
-                .collect();
-            let hidden = senders.iter().filter(|s| s.excluded).count();
-            let notes_g = ui.global::<Notes>();
-            notes_g.set_senders(Rc::new(VecModel::from(senders)).into());
-            notes_g.set_hidden_label(
-                if hidden == 0 { "".to_string() } else { format!("{hidden} sender(s) hidden") }.into(),
-            );
-            let mut recs: Vec<&NoteRec> =
-                st.notes.iter().filter(|n| !st.is_excluded(&State::sender_key(n))).collect();
-            // Pending first, then newest confirmed first.
-            recs.sort_by_key(|n| match n.height {
-                None => (0u8, 0i64),
-                Some(h) => (1u8, -(h as i64)),
-            });
-            let rows: Vec<NoteRow> = recs
-                .iter()
-                .map(|n| NoteRow {
-                    id: n.id.clone().into(),
-                    preview: preview_of(&n.text).into(),
-                    meta: {
-                        let base = match n.height {
-                            Some(h) => format!("block {h} · {} chunk(s)", n.chunks.max(1)),
-                            None => format!("pending · fee {} sats", n.fee),
-                        };
-                        match (&n.from, &n.to) {
-                            (Some(from), _) => format!("{base} · from {}", short_addr(from)),
-                            (None, Some(to)) => format!("{base} · to {}", short_addr(to)),
-                            _ => base,
-                        }
-                    }
-                    .into(),
-                    badge: if n.private { "PRIVATE" } else { "PUBLIC" }.into(),
-                    // Post-quantum (pq.rs): pq mirrors the contacts picker's
-                    // "PQ" badge (a passphrase and/or ML-KEM layer was
-                    // used); locked mirrors the note-view screen's lock
-                    // state (a received pq note this device couldn't
-                    // auto-decrypt at scan time — still visually distinct
-                    // from an unlocked pq note in the list).
-                    pq: n.pq_flags != 0,
-                    locked: n.locked.is_some(),
-                })
-                .collect();
-            log::info!("cb: refresh-notes n={} hidden={hidden}", rows.len());
-            notes_g.set_rows(Rc::new(VecModel::from(rows)).into());
-        }
-    };
-
-    let refresh_contacts = {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        move || {
-            let state = app.borrow().state.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let st = state.borrow();
-            // State order IS recency (front = latest use) — no re-sort.
-            let rows: Vec<ContactRow> = st
-                .contacts
-                .iter()
-                .map(|c| ContactRow {
-                    address: c.address.clone().into(),
-                    name: c.name.clone().into(),
-                    label: if c.name.is_empty() { short_addr(&c.address) } else { c.name.clone() }
-                        .into(),
-                    meta: short_addr(&c.address).into(),
-                    pq_caption: c
-                        .mlkem_ek
-                        .as_deref()
-                        .map(contact_pq_caption)
-                        .unwrap_or_default()
-                        .into(),
-                })
-                .collect();
-            log::info!("cb: refresh-contacts n={}", rows.len());
-            ui.global::<Contacts>().set_rows(Rc::new(VecModel::from(rows)).into());
-        }
-    };
 
     // Coins screen (9): the UTXO ledger as of the last sync bundle, biggest
     // first. Viewer-first — consolidate is the screen's single action.
-    let refresh_coins = {
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        let app = app.clone();
-        move || {
-            let state = app.borrow().state.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            // Wallet-wide: every ACTIVE notebook's coins, each tagged with
-            // its notebook. Flush the active notebook first so its file is
-            // current, then read all from disk.
-            save_state(&fs, &state.borrow());
-            let ix = notebooks.borrow();
-            let active_net = app.borrow().net.clone();
-            let ctx = (app.borrow().seed_idx, app.borrow().bip_account);
-            let btc_usd = state.borrow().btc_usd;
-            // (value, notebook name, txid, vout) across the wallet.
-            let mut all: Vec<(u64, String, String, u32)> = Vec::new();
-            let mut nb_with_coins = 0usize;
-            for m in ix.visible(ctx.0, ctx.1) {
-                let st2 = load_state(&fs, &active_net, m.account);
-                if st2.utxos.is_empty() {
-                    continue;
-                }
-                nb_with_coins += 1;
-                let short = derive_identity(app_seed_get(&app_seed), m, &active_net)
-                    .map(|id| short_addr(&id.address(st2.network())))
-                    .unwrap_or_default();
-                let name = notebook_name(&ix, m.account, &short);
-                for u in &st2.utxos {
-                    all.push((u.value, name.clone(), u.txid.clone(), u.vout));
-                }
-            }
-            all.sort_by_key(|(v, ..)| std::cmp::Reverse(*v));
-            let total: u64 = all.iter().map(|(v, ..)| v).sum();
-            let rows: Vec<CoinRow> = all
-                .iter()
-                .map(|(v, name, txid, vout)| CoinRow {
-                    label: format!("{v} sats · {name}").into(),
-                    meta: format!("txid {} · output {}", short_addr(txid), vout).into(),
-                })
-                .collect();
-            let coins = ui.global::<Coins>();
-            coins.set_summary(
-                format!(
-                    "{} coin(s) · {} across {nb_with_coins} notebook(s)",
-                    rows.len(),
-                    sats_line(total, btc_usd)
-                )
-                .into(),
-            );
-            coins.set_can_consolidate(rows.len() >= 2);
-            log::info!("cb: refresh-coins n={} total={total} notebooks={nb_with_coins}", rows.len());
-            coins.set_rows(Rc::new(VecModel::from(rows)).into());
-        }
-    };
 
     // Sweep screen (10) repricing — every tier tap / rate keystroke. Pure
     // arithmetic (estimate_sweep_vsize is byte-exact vs build_sweep_tx).
@@ -1855,290 +2262,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // Rebuild the Pay-from screen's rows/summaries, the compose nav row's
     // label, AND Settings' spending card (same underlying section) from
     // `state` + the active notebook's spending section + `funding_pick`.
-    let refresh_funding = {
-        let ui_weak = ui_weak.clone();
-        let app = app.clone();
-        move || {
-            let state = app.borrow().state.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let st = state.borrow();
-            let active_net = app.borrow().net.clone();
-            let ix = notebooks.borrow();
-            let ctx = notebook_ctx(&ix, app.borrow().active)
-                .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
-            let section = ix.spending(&active_net, ctx.0, ctx.1).cloned();
-            drop(ix);
-            let pick = app.borrow().funding_pick.clone();
-
-            let nb_rows: Vec<FundingCoinRow> = st
-                .utxos
-                .iter()
-                .map(|u| FundingCoinRow {
-                    key: funding_key(false, &u.txid, u.vout).into(),
-                    label: format!("{} sats", u.value).into(),
-                    meta: format!("txid {} · output {}", short_addr(&u.txid), u.vout).into(),
-                    selected: pick.is_selected(false, &u.txid, u.vout),
-                })
-                .collect();
-            let nb_total: u64 = st.utxos.iter().map(|u| u.value).sum();
-            let nb_selected_total: u64 = st
-                .utxos
-                .iter()
-                .filter(|u| pick.is_selected(false, &u.txid, u.vout))
-                .map(|u| u.value)
-                .sum();
-
-            let sp_rows: Vec<FundingCoinRow> = section
-                .as_ref()
-                .map(|s| {
-                    s.utxos
-                        .iter()
-                        .map(|u| FundingCoinRow {
-                            key: funding_key(true, &u.txid, u.vout).into(),
-                            label: format!("{} sats", u.value).into(),
-                            meta: format!(
-                                "txid {} · output {} · idx {}",
-                                short_addr(&u.txid),
-                                u.vout,
-                                u.index
-                            )
-                            .into(),
-                            selected: pick.is_selected(true, &u.txid, u.vout),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let sp_total = section.as_ref().map(|s| s.balance()).unwrap_or(0);
-            let sp_enabled = section.as_ref().map(|s| s.enabled).unwrap_or(false);
-            let sp_selected_total: u64 = section
-                .as_ref()
-                .map(|s| {
-                    s.utxos
-                        .iter()
-                        .filter(|u| pick.is_selected(true, &u.txid, u.vout))
-                        .map(|u| u.value)
-                        .sum()
-                })
-                .unwrap_or(0);
-
-            let funding = ui.global::<Funding>();
-            funding.set_notebook_coins(Rc::new(VecModel::from(nb_rows)).into());
-            funding.set_spending_coins(Rc::new(VecModel::from(sp_rows)).into());
-            funding.set_notebook_summary(
-                format!("{} coin(s) · {} sats", st.utxos.len(), nb_total).into(),
-            );
-            funding.set_spending_summary(
-                if !sp_enabled {
-                    "Off".to_string()
-                } else if sp_total == 0 {
-                    "No coins".to_string()
-                } else {
-                    format!(
-                        "{} coin(s) · {} sats",
-                        section.as_ref().map(|s| s.utxos.len()).unwrap_or(0),
-                        sp_total
-                    )
-                }
-                .into(),
-            );
-            funding.set_spending_enabled(sp_enabled);
-            let mode = pick.mode_label();
-            let selected_total = nb_selected_total + sp_selected_total;
-            let selected_n = pick.notebook.len() + pick.spending.len();
-            funding.set_warning(
-                if mode == "mixed" {
-                    "This note spends from both the notebook and the spending wallet — their addresses become publicly linked on-chain.".to_string()
-                } else {
-                    String::new()
-                }
-                .into(),
-            );
-
-            let compose = ui.global::<Compose>();
-            compose.set_pay_from_label(
-                match mode {
-                    "mixed" => "Mixed",
-                    "spending" => "Spending wallet",
-                    _ => "Notebook",
-                }
-                .into(),
-            );
-            compose
-                .set_pay_from_balance(format!("{selected_total} sats · {selected_n} coin(s)").into());
-
-            // Settings' spending card mirrors the SAME section — harmless to
-            // refresh even when Settings isn't the visible screen.
-            let settings = ui.global::<Settings>();
-            settings.set_spending_enabled(sp_enabled);
-            if let Some(s) = &section {
-                settings.set_spending_balance_line(
-                    format!("{} coin(s) · {} sats", s.utxos.len(), s.balance()).into(),
-                );
-                if let Some(seed) = app_seed_get(&app_seed).as_ref() {
-                    let net_v = Network::from_str_opt(&active_net).unwrap_or(Network::Mainnet);
-                    if let Ok(key) = notes_core::seeds::derive_spending_key(
-                        seed, ctx.0, net_v, ctx.1, 0, s.next_receive,
-                    ) {
-                        settings.set_spending_address(key.address.clone().into());
-                        settings.set_spending_qr(qr_image(&key.address.to_uppercase()));
-                    }
-                    // Companion watch window (funding-unification gap-
-                    // discovery, option (b), 2026-07-19): the next
-                    // SPENDING_WINDOW receive AND change addresses — a
-                    // lookahead the companion can probe for coins/history the
-                    // device hasn't revealed or spent yet, so a restore (or a
-                    // funding-wallet-style external deposit straight to a
-                    // not-yet-shown address) still gets found on the next
-                    // sync. Plain address lines, receive block then change
-                    // block, so the whole text pastes straight into the
-                    // companion's "Spending wallet addresses" field — no
-                    // chain/index prefix (unlike `spending-addresses-text`
-                    // above, which is for human display of what's ALREADY
-                    // used). Same derivation as everywhere else on this
-                    // screen — no new crypto.
-                    const SPENDING_WINDOW: u32 = 20;
-                    let window_lines: Vec<String> = [0u32, 1u32]
-                        .into_iter()
-                        .flat_map(|chain| {
-                            let base = if chain == 1 { s.next_change } else { s.next_receive };
-                            (base..base.saturating_add(SPENDING_WINDOW)).filter_map(move |index| {
-                                notes_core::seeds::derive_spending_key(
-                                    seed, ctx.0, net_v, ctx.1, chain, index,
-                                )
-                                .ok()
-                                .map(|k| k.address)
-                            })
-                        })
-                        .collect();
-                    let window_text = window_lines.join("\n");
-                    settings.set_spending_window_text(window_text.clone().into());
-                    settings.set_spending_window_qr(qr_image(&window_text.to_uppercase()));
-                }
-                let addr_lines: Vec<String> = s
-                    .used
-                    .iter()
-                    .map(|a| {
-                        format!(
-                            "{}/{}  {}",
-                            if a.chain == 1 { "change" } else { "receive" },
-                            a.index,
-                            a.address
-                        )
-                    })
-                    .collect();
-                settings.set_spending_addresses_text(addr_lines.join("\n").into());
-            } else {
-                settings.set_spending_balance_line("0 coin(s) · 0 sats".into());
-                settings.set_spending_addresses_text("".into());
-                settings.set_spending_window_text("".into());
-            }
-        }
-    };
 
     // Rebuild the compose nav row's Change label + the Change screen's
     // "Auto" sub-line from `change_pick` + whether the CURRENT funding pick
     // spends any spending-wallet coin.
-    let refresh_change = {
-        let ui_weak = ui_weak.clone();
-        let app = app.clone();
-        move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let participates = !app.borrow().funding_pick.spending.is_empty();
-            let cp = app.borrow().change_pick.clone();
-            let auto_label = if participates {
-                "Fresh spending-wallet address — protects the change from address reuse."
-            } else {
-                "Notebook address — the same address it goes to today."
-            };
-            ui.global::<ChangePick>().set_auto_label(auto_label.into());
-            let label = match cp.choice.as_str() {
-                "custom" if !cp.custom_address.is_empty() => short_addr(&cp.custom_address),
-                "custom" => "custom address".to_string(),
-                "notebook" => "notebook".to_string(),
-                _ if participates => "fresh spending address".to_string(),
-                _ => "back to you".to_string(),
-            };
-            ui.global::<Compose>().set_change_label(label.into());
-        }
-    };
 
     // A notebook's display name: its local name, else the 1-based default
-    // "Notebook <index+1>" (never empty — rows and the home title read
-    // this). Every notebook is created named, so the default only covers
-    // entries written before that rule; `addr_short` is the last resort
-    // for an account with no index entry at all.
-    fn notebook_name(ix: &notebooks::NotebookIndex, account: u32, addr_short: &str) -> String {
-        match ix.get(account) {
-            Some(m) if !m.name.trim().is_empty() => m.name.clone(),
-            Some(m) => notebooks::default_name(m.index),
-            None => addr_short.to_string(),
-        }
-    }
 
     // Rebuild the notebook list (screen 20) from the index + each
     // notebook's state file. Device has no live balance — the row meta is
     // address-short · note count.
-    let refresh_notebooks = {
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        let app = app.clone();
-        let app = app.clone();
-        Rc::new(move || {
-            let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let ix = notebooks.borrow();
-            let active_acct = app.borrow().active;
-            let dev_net = app.borrow().net.clone();
-            let ctx = (app.borrow().seed_idx, app.borrow().bip_account);
-            let build = |m: &notebooks::NotebookMeta| -> NotebookRow {
-                let st = load_state(&fs, &dev_net, m.account);
-                let addr = derive_identity(app_seed_get(&app_seed), m, &dev_net)
-                    .map(|id| id.address(Network::from_str_opt(&dev_net).unwrap_or(Network::Mainnet)))
-                    .unwrap_or_default();
-                let short = short_addr(&addr);
-                let n = st.notes.len();
-                NotebookRow {
-                    account: m.account as i32,
-                    name: notebook_name(&ix, m.account, &short).into(),
-                    meta: format!(
-                        "{short} · {n} note{}",
-                        if n == 1 { "" } else { "s" }
-                    )
-                    .into(),
-                    active: active_acct == Some(m.account),
-                }
-            };
-            let rows: Vec<NotebookRow> = ix.visible(ctx.0, ctx.1).map(build).collect();
-            let archived: Vec<NotebookRow> =
-                ix.archived_in_context(ctx.0, ctx.1).map(build).collect();
-            let nb = ui.global::<NotebooksUi>();
-            nb.set_empty_line(
-                if rows.is_empty() {
-                    if !archived.is_empty() {
-                        "All notebooks are archived.".into()
-                    } else {
-                        "No notebooks yet — create one to start writing.".into()
-                    }
-                } else {
-                    "".into()
-                },
-            );
-            nb.set_archived_label(
-                if archived.is_empty() {
-                    "".to_string()
-                } else {
-                    format!("Archived ({})", archived.len())
-                }
-                .into(),
-            );
-            log::info!("cb: notebooks list n={} archived={}", rows.len(), archived.len());
-            nb.set_rows(Rc::new(VecModel::from(rows)).into());
-            nb.set_archived_rows(Rc::new(VecModel::from(archived)).into());
-        })
-    };
 
     // Open a notebook: save the current one, swap identity + state to the
     // target account, refresh every per-notebook view, and show its home.
@@ -2146,12 +2279,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let app = app.clone();
-        let refresh_home = refresh_home.clone();
-        let refresh_notes = refresh_notes.clone();
-        let refresh_coins = refresh_coins.clone();
-        let refresh_contacts = refresh_contacts.clone();
-        let refresh_funding = refresh_funding.clone();
         Rc::new(move |account: u32| {
             let state = app.borrow().state.clone();
             let identity = app.borrow().identity.clone();
@@ -2177,11 +2304,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let title = notebook_name(&notebooks.borrow(), account, &short);
             ui.global::<NotebooksUi>().set_title(title.into());
             log::info!("cb: open-notebook account={account}");
-            refresh_home();
-            refresh_notes();
-            refresh_coins();
-            refresh_contacts();
-            refresh_funding();
+            app.borrow().refresh_home(&ui_weak);
+            app.borrow().refresh_notes(&ui_weak);
+            app.borrow().refresh_coins(&ui_weak, &fs);
+            app.borrow().refresh_contacts(&ui_weak);
+            app.borrow().refresh_funding(&ui_weak);
             ui.global::<Ui>().set_screen(Screen::Home);
         })
     };
@@ -2194,8 +2321,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let fs = fs.clone();
         let update_sweep = update_sweep.clone();
         let app = app.clone();
-        let refresh_funding = refresh_funding.clone();
-        let refresh_change = refresh_change.clone();
         move |addr_raw: &str| {
             let state = app.borrow().state.clone();
             let notebooks = app.borrow().notebooks.clone();
@@ -2306,8 +2431,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 app.borrow_mut().funding_pick = default_funding_pick(&st, section.as_ref());
                 drop(st);
                 app.borrow_mut().change_pick = ChangePickState::default();
-                refresh_funding();
-                refresh_change();
+                app.borrow().refresh_funding(&ui_weak);
+                app.borrow().refresh_change(&ui_weak);
                 ui.global::<Callbacks>().invoke_compose_changed();
                 ui.global::<Ui>().set_screen(Screen::Compose);
             }
@@ -2414,7 +2539,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let refresh_contacts = refresh_contacts.clone();
         ui.global::<Callbacks>().on_scan_contact_pq(move || {
             let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -2458,7 +2582,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     contacts_g
                         .set_naming_pq_caption(format!("{} · {fp}", mlkem_alg_name(alg)).into());
                     contacts_g.set_naming_pq_error("".into());
-                    refresh_contacts();
+                    app.borrow().refresh_contacts(&ui_weak);
                 }
                 Err(e) => {
                     log::warn!("cb: contact-pq-key err={e}");
@@ -2479,117 +2603,23 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // screen's original single-notebook behavior, preserved as the
     // default. Public-key only: device backup is the 24 recovery words,
     // which already reconstruct every notebook's key.
-    let refresh_quantum_keys = {
-        let ui_weak = ui_weak.clone();
-        let app = app.clone();
-        move || {
-            let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let qk = ui.global::<QuantumKeys>();
-            let alg = mlkem_alg_from_u8(app.borrow().mlkem_level);
-            let level_idx = match alg {
-                pq::MlKemAlg::MlKem512 => 0,
-                pq::MlKemAlg::MlKem768 => 1,
-                pq::MlKemAlg::MlKem1024 => 2,
-            };
-            qk.set_level(level_idx);
-            qk.set_level_caption(mlkem_alg_describe(alg).into());
-
-            let ix = notebooks.borrow();
-            let net_s = app.borrow().net.clone();
-            let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
-            let ctx = (app.borrow().seed_idx, app.borrow().bip_account);
-
-            // Picker rows: every visible notebook in this wallet context,
-            // same shape/derivation as `export_rows`.
-            let mut rows: Vec<ExportNbRow> = Vec::new();
-            for m in ix.visible(ctx.0, ctx.1) {
-                let addr = derive_identity(app_seed_get(&app_seed), m, &net_s)
-                    .map(|id| id.address(network))
-                    .unwrap_or_default();
-                let name = if m.name.trim().is_empty() {
-                    notebooks::default_name(m.index)
-                } else {
-                    m.name.clone()
-                };
-                rows.push(ExportNbRow {
-                    index: m.index as i32,
-                    name: name.into(),
-                    addr: short_addr(&addr).into(),
-                });
-            }
-
-            // Selection: an explicit picker choice (if it's still visible),
-            // else the active-or-first default described above.
-            let default_meta = (app.borrow().active)
-                .and_then(|acc| ix.get(acc))
-                .or_else(|| ix.visible(ctx.0, ctx.1).next())
-                .cloned();
-            let meta = app
-                .borrow()
-                .quantum_nb
-                .and_then(|i| ix.visible(ctx.0, ctx.1).find(|m| m.index == i).cloned())
-                .or(default_meta);
-            drop(ix);
-
-            let (nb_idx, nb_name) = meta
-                .as_ref()
-                .map(|m| {
-                    let name = if m.name.trim().is_empty() {
-                        notebooks::default_name(m.index)
-                    } else {
-                        m.name.clone()
-                    };
-                    (m.index as i32, name)
-                })
-                .unwrap_or((0, "".to_string()));
-            qk.set_notebooks(Rc::new(VecModel::from(rows)).into());
-            qk.set_nb_index(nb_idx);
-            qk.set_nb_name(nb_name.into());
-
-            let leaf =
-                meta.as_ref().and_then(|m| derive_leaf_secret(app_seed_get(&app_seed), m, &net_s));
-            match leaf {
-                Some(leaf) => {
-                    let kp = pq::mlkem_keypair_from_leaf(&leaf, alg);
-                    qk.set_qr_zoom(false); // never re-enter the screen zoomed
-                    qk.set_fingerprint(kp.fingerprint().into());
-                    // The dense armor QR is optically unverifiable at
-                    // device resolution (~1.2px/module), so the UI suite
-                    // cross-checks THIS line against notes_cli
-                    // pq-fingerprint's independent host derivation.
-                    // Public info — safe to log.
-                    log::info!("cb: pq-key fp={}", kp.fingerprint());
-                    let armor = pq::export_public(alg, kp.ek());
-                    qk.set_public_qr(qr_image(&armor));
-                    qk.set_public_armor(armor.into());
-                }
-                None => {
-                    qk.set_fingerprint("No notebook yet — create one first.".into());
-                    qk.set_public_armor("".into());
-                }
-            }
-        }
-    };
 
     {
-        let refresh_quantum_keys = refresh_quantum_keys.clone();
+        let ui_weak = ui_weak.clone();
         let app = app.clone();
         ui.global::<Callbacks>().on_open_quantum_keys(move || {
             // Reopening the screen resets to the active-or-first default
             // rather than remembering the last-picked notebook from a
             // previous visit.
             app.borrow_mut().quantum_nb = None;
-            refresh_quantum_keys();
+            app.borrow().refresh_quantum_keys(&ui_weak);
         });
     }
 
     {
+        let fs = fs.clone();
         let ui_weak = ui_weak.clone();
         let app = app.clone();
-        let persist_config = persist_config.clone();
-        let refresh_quantum_keys = refresh_quantum_keys.clone();
         ui.global::<Callbacks>().on_quantum_key_level(move |level_idx| {
             let Some(_ui) = ui_weak.upgrade() else { return };
             let alg = match level_idx {
@@ -2598,19 +2628,19 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 _ => pq::MlKemAlg::MlKem768,
             };
             app.borrow_mut().mlkem_level = alg.id();
-            persist_config();
+            app.borrow().persist_config(&fs);
             log::info!("cb: pq-key level={}", mlkem_alg_name(alg));
-            refresh_quantum_keys();
+            app.borrow().refresh_quantum_keys(&ui_weak);
         });
     }
 
     {
-        let refresh_quantum_keys = refresh_quantum_keys.clone();
+        let ui_weak = ui_weak.clone();
         let app = app.clone();
         ui.global::<Callbacks>().on_quantum_key_pick_notebook(move |index| {
             app.borrow_mut().quantum_nb = Some(index as u32);
             log::info!("cb: pq-key notebook={index}");
-            refresh_quantum_keys();
+            app.borrow().refresh_quantum_keys(&ui_weak);
         });
     }
 
@@ -2637,39 +2667,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // encapsulating to a seed-derived receive key on a self-note is
     // security theater, since that key shares the enc key's root).
     // ---------------------------------------------------------------------
-    let refresh_device_quantum_key = {
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        let app = app.clone();
-        move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let dq = ui.global::<DeviceQuantumKey>();
-            // Bound to a local first: a `match` scrutinee's temporaries live
-            // through the arms, and this one is a RefMut<App>.
-            let device_kp = app.borrow_mut().device_quantum_key(&fs);
-            match device_kp {
-                Some(kp) => {
-                    dq.set_has_key(true);
-                    dq.set_fingerprint(kp.fingerprint().into());
-                    dq.set_level_name(mlkem_alg_name(kp.alg()).into());
-                    let armor = pq::export_public(kp.alg(), kp.ek());
-                    dq.set_public_qr(qr_image(&armor));
-                    dq.set_public_armor(armor.into());
-                }
-                None => {
-                    dq.set_has_key(false);
-                    dq.set_fingerprint("".into());
-                    dq.set_level_name("".into());
-                    dq.set_public_armor("".into());
-                    dq.set_public_qr(Image::default());
-                }
-            }
-        }
-    };
 
     {
+        let app = app.clone();
+        let fs = fs.clone();
         let ui_weak = ui_weak.clone();
-        let refresh_device_quantum_key = refresh_device_quantum_key.clone();
         ui.global::<Callbacks>().on_open_device_quantum_key(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let dq = ui.global::<DeviceQuantumKey>();
@@ -2684,7 +2686,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             dq.set_qr_zoom(false);
             dq.set_show_replace_confirm(false);
             dq.set_show_delete_confirm(false);
-            refresh_device_quantum_key();
+            app.borrow_mut().refresh_device_quantum_key(&ui_weak, &fs);
         });
     }
 
@@ -2722,7 +2724,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let refresh_device_quantum_key = refresh_device_quantum_key.clone();
         ui.global::<Callbacks>().on_device_quantum_key_generate(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let dq = ui.global::<DeviceQuantumKey>();
@@ -2741,7 +2742,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     dq.set_gen_error("".into());
                     dq.set_gen_extra_text("".into());
                     log::info!("cb: quantum-key generate level={} ok", mlkem_alg_name(alg));
-                    refresh_device_quantum_key();
+                    app.borrow_mut().refresh_device_quantum_key(&ui_weak, &fs);
                 }
                 Err(e) => {
                     log::warn!("cb: quantum-key generate level={} err={e}", mlkem_alg_name(alg));
@@ -2755,7 +2756,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let refresh_device_quantum_key = refresh_device_quantum_key.clone();
         ui.global::<Callbacks>().on_device_quantum_key_import(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let dq = ui.global::<DeviceQuantumKey>();
@@ -2788,7 +2788,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             Some(Some(pq::MlKemKeypair::from_seed(alg, &seed)));
                         dq.set_import_error("".into());
                         log::info!("cb: quantum-key import ok");
-                        refresh_device_quantum_key();
+                        app.borrow_mut().refresh_device_quantum_key(&ui_weak, &fs);
                     }
                     Err(e) => {
                         log::warn!("cb: quantum-key import err={e}");
@@ -2862,7 +2862,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let refresh_device_quantum_key = refresh_device_quantum_key.clone();
         ui.global::<Callbacks>().on_device_quantum_key_replace_confirm(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let dq = ui.global::<DeviceQuantumKey>();
@@ -2882,7 +2881,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             dq.set_gen_level_caption(mlkem_alg_describe(pq::MlKemAlg::MlKem768).into());
             dq.set_gen_extra_text("".into());
             log::info!("cb: quantum-key replace ok");
-            refresh_device_quantum_key();
+            app.borrow_mut().refresh_device_quantum_key(&ui_weak, &fs);
         });
     }
 
@@ -2890,7 +2889,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let refresh_device_quantum_key = refresh_device_quantum_key.clone();
         ui.global::<Callbacks>().on_device_quantum_key_delete_confirm(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let dq = ui.global::<DeviceQuantumKey>();
@@ -2903,7 +2901,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             dq.set_private_armor("".into());
             dq.set_private_qr(Image::default());
             log::info!("cb: quantum-key delete ok");
-            refresh_device_quantum_key();
+            app.borrow_mut().refresh_device_quantum_key(&ui_weak, &fs);
         });
     }
 
@@ -2917,7 +2915,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let refresh_contacts = refresh_contacts.clone();
         ui.global::<Callbacks>().on_save_contact_name(move || {
             let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -2938,13 +2935,15 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             log::info!("cb: save-contact addr={addr} name-len={}", name.len());
             contacts_g.set_naming_address("".into());
             contacts_g.set_name_text("".into());
-            refresh_contacts();
+            app.borrow().refresh_contacts(&ui_weak);
         });
     }
 
     {
-        let refresh_coins = refresh_coins.clone();
-        ui.global::<Callbacks>().on_refresh_coins(move || refresh_coins());
+        let app = app.clone();
+        let fs = fs.clone();
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_refresh_coins(move || app.borrow().refresh_coins(&ui_weak, &fs));
     }
 
     // Coins → the shared sweep screen with kind=consolidate, dest=self.
@@ -2974,14 +2973,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let app = app.clone();
         let fs = fs.clone();
-        let app = app.clone();
         ui.global::<Callbacks>().on_sweep_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
             let ui_weak = ui_weak.clone();
             let app = app.clone();
             let fs = fs.clone();
-            let app = app.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
                 let state = app.borrow().state.clone();
@@ -3149,9 +3146,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     // Spending wallet: Settings toggle.
     {
+        let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let refresh_funding = refresh_funding.clone();
         ui.global::<Callbacks>().on_set_spending_enabled(move |on| {
             let notebooks = app.borrow().notebooks.clone();
             let mut ix = notebooks.borrow_mut();
@@ -3162,30 +3159,29 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             save_notebooks(&fs, &ix);
             drop(ix);
             log::info!("cb: set-spending enabled={on}");
-            refresh_funding();
+            app.borrow().refresh_funding(&ui_weak);
         });
     }
 
     // Pay-from screen (25): notebook / spending-wallet per-coin selection.
     {
-        let refresh_funding = refresh_funding.clone();
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
         ui.global::<Callbacks>().on_funding_open(move || {
             log::info!("cb: funding-open");
-            refresh_funding();
+            app.borrow().refresh_funding(&ui_weak);
         });
     }
     {
         let ui_weak = ui_weak.clone();
         let app = app.clone();
-        let refresh_funding = refresh_funding.clone();
-        let refresh_change = refresh_change.clone();
         ui.global::<Callbacks>().on_funding_toggle_coin(move |key| {
             let Some(ui) = ui_weak.upgrade() else { return };
             if let Some((spending_src, txid, vout)) = parse_funding_key(key.as_str()) {
                 app.borrow_mut().funding_pick.toggle(spending_src, txid, vout);
             }
-            refresh_funding();
-            refresh_change();
+            app.borrow().refresh_funding(&ui_weak);
+            app.borrow().refresh_change(&ui_weak);
             ui.global::<Callbacks>().invoke_compose_changed();
         });
     }
@@ -3203,22 +3199,22 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     // Change screen (26): compose destination for change.
     {
-        let refresh_change = refresh_change.clone();
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
         ui.global::<Callbacks>().on_change_open(move || {
-            refresh_change();
+            app.borrow().refresh_change(&ui_weak);
         });
     }
     {
         let ui_weak = ui_weak.clone();
         let app = app.clone();
-        let refresh_change = refresh_change.clone();
         ui.global::<Callbacks>().on_change_pick(move |choice| {
             let Some(ui) = ui_weak.upgrade() else { return };
             app.borrow_mut().change_pick.choice = choice.to_string();
             ui.global::<ChangePick>().set_choice(choice.clone());
             ui.global::<ChangePick>().set_custom_error("".into());
             log::info!("cb: change-pick {choice}");
-            refresh_change();
+            app.borrow().refresh_change(&ui_weak);
             ui.global::<Callbacks>().invoke_compose_changed();
         });
     }
@@ -3247,7 +3243,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // notes-core crypt::SEAL_OVERHEAD), so per-keystroke recompute is free.
     {
         let ui_weak = ui_weak.clone();
-        let app = app.clone();
         let app = app.clone();
         let fs = fs.clone();
         ui.global::<Callbacks>().on_compose_changed(move || {
@@ -3756,13 +3751,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let app = app.clone();
-        let app = app.clone();
         let fs = fs.clone();
         ui.global::<Callbacks>().on_compose_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
             let ui_weak = ui_weak.clone();
-            let app = app.clone();
             let app = app.clone();
             let fs = fs.clone();
             // Let the busy overlay paint one frame before the blocking work.
@@ -4457,10 +4450,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let app = app.clone();
         let fs = fs.clone();
-        let refresh_notes = refresh_notes.clone();
-        let app = app.clone();
-        let refresh_funding = refresh_funding.clone();
-        let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_confirm_sign(move || {
             let identity = app.borrow().identity.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -4474,8 +4463,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     let ui_weak = ui_weak.clone();
                     let fs = fs.clone();
                     let app = app.clone();
-                    let app = app.clone();
-                    let refresh_home = refresh_home.clone();
                     Timer::single_shot(Duration::from_millis(150), move || {
                         let state = app.borrow().state.clone();
                         let Some(ui) = ui_weak.upgrade() else { return };
@@ -4566,7 +4553,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         ui.global::<Contacts>().set_pick_mode("compose".into());
 
                         ui.global::<Ui>().set_busy(false);
-                        refresh_home();
+                        app.borrow().refresh_home(&ui_weak);
                         ui.global::<Ui>().set_screen(Screen::Signed);
                     });
                 }
@@ -4628,9 +4615,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     ui.global::<Ui>().set_busy(true);
                     let ui_weak = ui_weak.clone();
                     let fs = fs.clone();
-                    let refresh_notes = refresh_notes.clone();
                     let app = app.clone();
-                    let refresh_funding = refresh_funding.clone();
                     Timer::single_shot(Duration::from_millis(150), move || {
                         let state = app.borrow().state.clone();
                         let notebooks = app.borrow().notebooks.clone();
@@ -4786,7 +4771,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         st.notes.push(rec.clone());
                         save_state(&fs, &st);
                         drop(st);
-                        refresh_funding();
+                        app.borrow().refresh_funding(&ui_weak);
 
                         let view = ui.global::<View>();
                         view.set_id(rec.id.clone().into());
@@ -4819,7 +4804,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         ui.global::<ChangePick>().set_choice("auto".into());
                         ui.global::<ChangePick>().set_custom_address("".into());
                         ui.global::<Ui>().set_busy(false);
-                        refresh_notes();
+                        app.borrow().refresh_notes(&ui_weak);
                         ui.global::<Ui>().set_screen(Screen::Note);
                     });
                 }
@@ -5526,9 +5511,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     };
 
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let refresh_home = refresh_home.clone();
         let apply_bundle = apply_bundle.clone();
         ui.global::<Callbacks>().on_import_bundle(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -5551,7 +5536,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     ui.global::<Sync>().set_result(e.into());
                 }
             }
-            refresh_home();
+            app.borrow().refresh_home(&ui_weak);
         });
     }
 
@@ -5588,9 +5573,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let refresh_home = refresh_home.clone();
         let apply_bundle = apply_bundle.clone();
         ui.global::<Callbacks>().on_pick_bundle(move |name, loc_idx| {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -5618,13 +5603,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     sync.set_result(e.into());
                 }
             }
-            refresh_home();
+            app.borrow().refresh_home(&ui_weak);
         });
     }
 
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let refresh_home = refresh_home.clone();
         let apply_bundle = apply_bundle.clone();
         ui.global::<Callbacks>().on_scan_bundle(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -5666,7 +5651,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     ui.global::<Sync>().set_result(format!("Scan failed: {e}").into());
                 }
             }
-            refresh_home();
+            app.borrow().refresh_home(&ui_weak);
         });
     }
 
@@ -5884,11 +5869,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let persist_config = persist_config.clone();
-        let refresh_home = refresh_home.clone();
-        let refresh_notes = refresh_notes.clone();
-        let refresh_coins = refresh_coins.clone();
-        let refresh_notebooks = refresh_notebooks.clone();
         ui.global::<Callbacks>().on_cycle_network(move || {
             let state = app.borrow().state.clone();
             let identity = app.borrow().identity.clone();
@@ -5909,7 +5889,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             }
             .to_string();
             app.borrow_mut().net = next.clone();
-            persist_config();
+            app.borrow().persist_config(&fs);
             log::info!("cb: set-network {next}");
             let active = app.borrow().active;
             if let Some(account) = active {
@@ -5925,10 +5905,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 }
             }
             let _ = &ui_weak;
-            refresh_home();
-            refresh_notes();
-            refresh_coins();
-            refresh_notebooks();
+            app.borrow().refresh_home(&ui_weak);
+            app.borrow().refresh_notes(&ui_weak);
+            app.borrow().refresh_coins(&ui_weak, &fs);
+            app.borrow().refresh_notebooks(&ui_weak, &fs);
         });
     }
 
@@ -5936,8 +5916,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let persist_config = persist_config.clone();
-        let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_chunk_changed(move || {
             let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -5971,11 +5949,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             save_state(&fs, &st);
             // Chunk is device-level (wallet-wide): persist it in config too.
             app.borrow_mut().device_chunk = st.chunk_override;
-            persist_config();
+            app.borrow().persist_config(&fs);
             drop(st);
             // Reflect the effective size back into the field (auto/compat),
             // without touching a valid custom value.
-            refresh_home();
+            app.borrow().refresh_home(&ui_weak);
             // Re-price the draft immediately so the compose cost line is
             // already current when the user returns to it.
             ui.global::<Callbacks>().invoke_compose_changed();
@@ -5985,9 +5963,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // Transaction locktime (anti-fee-sniping). Wallet-level like the chunk
     // size, so it lives in config.json rather than any notebook's state.
     {
+        let fs = fs.clone();
         let ui_weak = ui_weak.clone();
         let app = app.clone();
-        let persist_config = persist_config.clone();
         ui.global::<Callbacks>().on_locktime_changed(move || {
             let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -6011,7 +5989,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 },
             };
             app.borrow_mut().lock_policy = policy;
-            persist_config();
+            app.borrow().persist_config(&fs);
             settings.set_locktime_error("".into());
             let tip = state.borrow().tip_height;
             let effective = resolve_locktime(policy, tip);
@@ -6043,18 +6021,19 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
 
     {
-        let refresh_home = refresh_home.clone();
-        ui.global::<Callbacks>().on_refresh_home(move || refresh_home());
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_refresh_home(move || app.borrow().refresh_home(&ui_weak));
     }
     {
-        let refresh_notes = refresh_notes.clone();
-        ui.global::<Callbacks>().on_refresh_notes(move || refresh_notes());
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_refresh_notes(move || app.borrow().refresh_notes(&ui_weak));
     }
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let refresh_notes = refresh_notes.clone();
         ui.global::<Callbacks>().on_toggle_sender(move |key, excluded| {
             let state = app.borrow().state.clone();
             let Some(_ui) = ui_weak.upgrade() else { return };
@@ -6067,12 +6046,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     st.excluded_senders.len()
                 );
             }
-            refresh_notes();
+            app.borrow().refresh_notes(&ui_weak);
         });
     }
     {
-        let refresh_contacts = refresh_contacts.clone();
-        ui.global::<Callbacks>().on_refresh_contacts(move || refresh_contacts());
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_refresh_contacts(move || app.borrow().refresh_contacts(&ui_weak));
     }
 
     // ---- notebook callbacks (screen 20 list) ----
@@ -6122,8 +6102,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let app = app.clone();
-        let refresh_notebooks = refresh_notebooks.clone();
         let switch_notebook = switch_notebook.clone();
         ui.global::<NotebookCb>().on_name_save(move || {
             let notebooks = app.borrow().notebooks.clone();
@@ -6157,7 +6135,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 log::info!(
                     "cb: create-notebook account={account} scheme=bip86 seed={seed} bip-account={bacct} index={index}"
                 );
-                refresh_notebooks();
+                app.borrow().refresh_notebooks(&ui_weak, &fs);
                 switch_notebook(account);
             } else {
                 let account = sel as u32;
@@ -6167,7 +6145,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     save_notebooks(&fs, &ix);
                 }
                 log::info!("cb: rename-notebook account={account}");
-                refresh_notebooks();
+                app.borrow().refresh_notebooks(&ui_weak, &fs);
                 // If it's the open notebook, update its home title.
                 if app.borrow().active == Some(account) {
                     let title = notebooks
@@ -6186,7 +6164,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let refresh_notebooks = refresh_notebooks.clone();
         ui.global::<NotebookCb>().on_archive(move |account, archived| {
             let notebooks = app.borrow().notebooks.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -6207,21 +6184,20 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 save_notebooks(&fs, &ix);
             }
             log::info!("cb: archive-notebook account={account} archived={archived}");
-            refresh_notebooks();
+            app.borrow().refresh_notebooks(&ui_weak, &fs);
         });
     }
     {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let refresh_notebooks = refresh_notebooks.clone();
         ui.global::<NotebookCb>().on_back_to_list(move || {
             let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             if app.borrow().active.is_some() {
                 save_state(&fs, &state.borrow());
             }
-            refresh_notebooks();
+            app.borrow().refresh_notebooks(&ui_weak, &fs);
             ui.global::<Ui>().set_screen(Screen::Notebooks);
         });
     }
@@ -6518,9 +6494,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let app = app.clone();
-        let persist_config = persist_config.clone();
-        let refresh_notebooks = refresh_notebooks.clone();
         let reveal_words = reveal_words.clone();
         ui.global::<Callbacks>().on_set_context(move || {
             let state = app.borrow().state.clone();
@@ -6547,7 +6520,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 }
                 app.borrow_mut().seed_idx = new_seed;
                 app.borrow_mut().bip_account = new_acct;
-                persist_config();
+                app.borrow().persist_config(&fs);
                 if seed_changed {
                     log::info!("cb: set-seed-index {new_seed}");
                 }
@@ -6556,7 +6529,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 }
                 // Rebuild the (now background) notebook list for the new
                 // context, and refresh the revealed words to the new seed.
-                refresh_notebooks();
+                app.borrow().refresh_notebooks(&ui_weak, &fs);
                 if !recovery.get_words_col1().is_empty() {
                     reveal_words();
                 }
@@ -6582,9 +6555,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     ui.global::<Ui>().set_screen(Screen::Notebooks);
 
     let boot_seed = {
+        let fs = fs.clone();
         let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let refresh_notebooks = refresh_notebooks.clone();
         move || {
             let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -6597,7 +6570,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 ui.global::<Ui>().set_error("Device locked or seed unavailable".into());
             }
             // Repaint: the rows drawn before the seed existed have no address.
-            refresh_notebooks();
+            app.borrow().refresh_notebooks(&ui_weak, &fs);
         }
     };
     // A frame's grace so the list is on screen behind the consent prompt,
