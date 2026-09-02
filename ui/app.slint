@@ -13,6 +13,7 @@ import { CoinsScreen } from "screens/coins.slint";
 import { SweepScreen } from "screens/sweep.slint";
 import { SettingsScreen } from "screens/settings.slint";
 import { AccountsScreen } from "screens/accounts.slint";
+import { RecoveryWordsScreen } from "screens/recovery-words.slint";
 
 export { Screen, Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, DeviceQuantumKey, Theme, ButtonVariant, ButtonState, ControlSize, Images }
 
@@ -116,73 +117,9 @@ export component AppWindow inherits Window {
         // Dedicated reveal, reached straight from Settings. Words/SeedQR
         // for the active seed; Back → Settings, clearing them
         // (reveal-close). Fits comfortably on its own, no scrolling.
-        if Ui.screen == Screen.recovery-words: VerticalLayout {
+        if Ui.screen == Screen.recovery-words: RecoveryWordsScreen {
             width: parent.width;
             height: parent.height;
-            padding-left: 24px;
-            padding-right: 24px;
-            padding-top: 16px + UISize.control-center-status-bar-height;
-            padding-bottom: 24px;
-            spacing: 14px;
-
-            ScreenHeader {
-                title: "Recovery words";
-                back => {
-                    Callbacks.reveal-close();
-                    Ui.screen = Screen.settings;
-                }
-            }
-
-            Text {
-                text: Recovery.title-line;
-                color: Theme.palette-foreground;
-                font-family: "Montserrat";
-                font-size: 16px;
-                font-weight: 600;
-            }
-
-            if !Recovery.show-qr: HorizontalLayout {
-                spacing: 16px;
-                Text {
-                    text: Recovery.words-col1;
-                    color: Theme.palette-foreground;
-                    font-family: "SourceCodePro";
-                    font-size: 16px;
-                    horizontal-stretch: 1;
-                }
-                Text {
-                    text: Recovery.words-col2;
-                    color: Theme.palette-foreground;
-                    font-family: "SourceCodePro";
-                    font-size: 16px;
-                    horizontal-stretch: 1;
-                }
-            }
-            if Recovery.show-qr: HorizontalLayout {
-                alignment: center;
-                Image {
-                    source: Recovery.qr;
-                    width: 220px;
-                    height: 220px;
-                    image-rendering: pixelated;
-                }
-            }
-
-            SecondaryAction {
-                width: 100%;
-                text: Recovery.show-qr ? "Show words" : "Show as SeedQR";
-                clicked => { Recovery.show-qr = !Recovery.show-qr; }
-            }
-
-            Text {
-                text: "Write these down and keep them offline. Anyone who has them controls this seed's funds and can read its private notes.";
-                color: Theme.palette-muted;
-                font-family: "Montserrat";
-                font-size: 13px;
-                wrap: word-wrap;
-            }
-
-            Rectangle { vertical-stretch: 1; }
         }
 
         // ------------------------------------- screen 23: PUBLIC keys
