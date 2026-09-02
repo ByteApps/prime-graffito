@@ -1,5 +1,6 @@
 # Workspace root: the KeyOS app binary plus the host-testable notes-core
-# library (wallet-core/pgp-core/bip85-core pattern — see ../CLAUDE.md).
+# (protocol) and graffito-core (shared policy) libraries
+# (wallet-core/pgp-core/bip85-core pattern — see ../CLAUDE.md).
 [package]
 name = "prime-graffito"
 version = "0.1.0"
@@ -8,7 +9,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [workspace]
-members = [".", "notes-core"]
+members = [".", "notes-core", "graffito-core"]
 
 # KeyOS's own getrandom override (vendored in vendor/getrandom): on
 # --cfg keyos (hardware) builds it sources entropy from the os TRNG server;
@@ -36,6 +37,9 @@ opt-level = 3
 
 [dependencies]
 notes-core = { path = "notes-core" }
+# Shared policy (compose Security copy — graffito-core/src/seclabel.rs);
+# the graffito Mac/mobile app pins the same rev of this repo for it.
+graffito-core = { path = "graffito-core" }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -125,6 +125,7 @@ dependencies = [
  "hex",
  "once_cell",
  "rkyv",
+ "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1161,7 +1162,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crypto"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "log",
  "num-derive",
@@ -1796,7 +1797,7 @@ dependencies = [
 
 [[package]]
 name = "foundation-themes"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "components",
@@ -1822,7 +1823,7 @@ dependencies = [
 
 [[package]]
 name = "fs"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bitflags 2.11.0",
  "log",
@@ -2076,6 +2077,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "graffito-core"
+version = "0.1.0"
+dependencies = [
+ "notes-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "grid"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2094,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "gui-server-api"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "app-manifest",
  "hex-literal",
@@ -2154,8 +2164,6 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -2176,6 +2184,8 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.2.0",
 ]
 
@@ -3656,11 +3666,11 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.13.0"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "227748d55f2f0ab4735d87fd623798cb6b664512fe979705f829c9f81c934465"
+checksum = "0d317b4b9eb398e6acce275758ec6125535505e7a146fb1a9b8bda2451b0ff4c"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -4870,6 +4880,7 @@ version = "0.1.0"
 dependencies = [
  "foundation-themes",
  "getrandom 0.2.10",
+ "graffito-core",
  "hex",
  "log",
  "notes-core",
@@ -5697,7 +5708,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "fs",
  "jiff",
