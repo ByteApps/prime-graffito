@@ -1,0 +1,79 @@
+// Screen.change — extracted verbatim from app.slint on 2026-09-01
+// (PLAN-graffito-arch.md phase 4a). The instantiation site in app.slint
+// still sets width/height to the window; everything else is the
+// original block body.
+// -------------------------------------------- screen 26: Change
+// Single-select destination for the compose in progress.
+
+import { Theme, UISize } from "@ui/theme.slint";
+import { Screen, Callbacks, Ui, ChangePick } from "../callbacks.slint";
+import { ScreenHeader, ChangeOptionRow } from "../components.slint";
+
+export component ChangeScreen inherits VerticalLayout {
+    padding-left: 24px;
+    padding-right: 24px;
+    padding-top: 8px + UISize.control-center-status-bar-height;
+    padding-bottom: 24px;
+    spacing: 10px;
+
+    ScreenHeader {
+        vertical-stretch: 0;
+        title: "Change";
+        back => { Callbacks.change-done(); Ui.screen = Screen.compose; }
+    }
+
+    ChangeOptionRow {
+        vertical-stretch: 0;
+        option-label: "Auto";
+        sub: ChangePick.auto-label;
+        selected: ChangePick.choice == "auto";
+        tapped => { Callbacks.change-pick("auto"); }
+    }
+    ChangeOptionRow {
+        vertical-stretch: 0;
+        option-label: "Notebook address";
+        sub: "Change returns to your notebook — the same address it goes to today.";
+        selected: ChangePick.choice == "notebook";
+        tapped => { Callbacks.change-pick("notebook"); }
+    }
+    ChangeOptionRow {
+        vertical-stretch: 0;
+        option-label: "Custom address…";
+        sub: "";
+        selected: ChangePick.choice == "custom";
+        tapped => { Callbacks.change-pick("custom"); }
+    }
+    if ChangePick.choice == "custom": VerticalLayout {
+        vertical-stretch: 0;
+        spacing: 6px;
+        Text {
+            text: ChangePick.custom-error == "" ? "Change address" : ChangePick.custom-error;
+            color: ChangePick.custom-error == "" ? Theme.palette-muted : Theme.palette-danger;
+            font-family: "Montserrat";
+            font-size: 13px;
+        }
+        Rectangle {
+            height: 44px;
+            background: Theme.palette-surface;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: change-addr-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+            clip: true;
+            change-addr-input := TextInput {
+                x: 14px;
+                width: parent.width - 28px;
+                height: 24px;
+                y: (parent.height - self.height) / 2;
+                text <=> ChangePick.custom-address;
+                color: Theme.palette-foreground;
+                font-family: "SourceCodePro";
+                font-size: 16px;
+                single-line: true;
+                edited => { Callbacks.change-address-changed(); }
+                accepted => { self.clear-focus(); }
+            }
+        }
+    }
+
+    Rectangle { vertical-stretch: 1; }
+}
