@@ -18,6 +18,7 @@ use notes_core::bundle::{
 };
 use notes_core::address::p2tr_script_pubkey;
 use notes_core::keys::generate_aux_rand;
+use graffito_core::seclabel::{self, MlKemLevel, SecurityChoice, SelfNoteCopy};
 use notes_core::pq;
 use notes_core::tx::{
     build_note_tx_mixed_exact_anchored_multi, build_sweep_tx_multi, estimate_sweep_vsize,
@@ -419,31 +420,17 @@ fn mlkem_alg_from_u8(id: u8) -> pq::MlKemAlg {
     pq::MlKemAlg::from_id(id).unwrap_or(pq::MlKemAlg::MlKem768)
 }
 
+/// Short display name ("ML-KEM-768") — the shared crate's `MlKemLevel::
+/// name()`, byte-identical on every platform.
 fn mlkem_alg_name(alg: pq::MlKemAlg) -> &'static str {
-    match alg {
-        pq::MlKemAlg::MlKem512 => "ML-KEM-512",
-        pq::MlKemAlg::MlKem768 => "ML-KEM-768",
-        pq::MlKemAlg::MlKem1024 => "ML-KEM-1024",
-    }
+    MlKemLevel::from(alg).name()
 }
 
-/// Verbatim-pinned description strings — same wording as the graffito
-/// Mac app's `MlKemLevel::describe()`, so a contact importing a Prime
-/// device's exported key sees identical copy on either platform.
+/// Level-picker sentence — the shared crate's `MlKemLevel::describe()`,
+/// so a contact importing a Prime device's exported key sees identical
+/// copy in either app.
 fn mlkem_alg_describe(alg: pq::MlKemAlg) -> &'static str {
-    match alg {
-        pq::MlKemAlg::MlKem512 => {
-            "Lowest parameter size; offers security roughly comparable to AES-128."
-        }
-        pq::MlKemAlg::MlKem768 => {
-            "Standard recommendation for most general applications; provides security \
-             comparable to AES-192."
-        }
-        pq::MlKemAlg::MlKem1024 => {
-            "Highest parameter size; offers security comparable to AES-256 for maximum \
-             long-term protection."
-        }
-    }
+    MlKemLevel::from(alg).describe()
 }
 
 /// Every one of a notebook's three ML-KEM receive keypairs (512/768/1024),
@@ -478,19 +465,22 @@ fn contact_pq_caption(armor: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Post-quantum status line for the compose Security section — mirrors the
-/// Mac app's `passphrase::security_label` wording verbatim (ported for
-/// cross-platform copy parity). Reachable from two shapes: a directed
-/// private single-recipient draft (`directed == true`, both layers
-/// possible) and a private SELF-note (`directed == false`,
-/// PLAN-graffito-self-pw.md for the passphrase layer; PLAN-graffito-
-/// quantum-key.md for `mlkem_level`, which is `Some` on a self-note ONLY
-/// when the device's personal quantum key is active for this draft — a
-/// self-note never offers a seed-derived KEM, so `Some` here always means
-/// the non-seed device key). `passphrase_verified` = the typed text is
-/// byte-identical to the last `passphrase::generate()` output (the ONLY
-/// way a passphrase counts toward quantum resistance — an unverified
-/// typed/pasted phrase never does, however long).
+/// Post-quantum status line for the compose Security section — the shared
+/// policy in `graffito_core::seclabel` (PLAN-graffito-arch.md, phase 2),
+/// rendered in this app's `Detailed` self-note flavor; the table is pinned
+/// there in `tests/seclabel_table.rs`, this fn only maps the shell's state
+/// onto it. Reachable from two shapes: a directed private single-recipient
+/// draft (`directed == true`, both layers possible) and a private SELF-note
+/// (`directed == false`, PLAN-graffito-self-pw.md for the passphrase layer;
+/// PLAN-graffito-quantum-key.md for `mlkem_level`, which is `Some` on a
+/// self-note ONLY when the device's personal quantum key is active for this
+/// draft — a self-note never offers a seed-derived KEM, so `Some` here
+/// always means the non-seed device key). `passphrase_verified` = the typed
+/// text is byte-identical to the last `passphrase::generate()` output (the
+/// ONLY way a passphrase counts toward quantum resistance — an unverified
+/// typed/pasted phrase never does, however long); with no strength
+/// estimator on the device, `SecurityChoice::without_estimator` is the
+/// documented mapping of (active, verified) onto the shared inputs.
 fn pq_security_label(
     private: bool,
     directed: bool,
@@ -498,82 +488,16 @@ fn pq_security_label(
     passphrase_verified: bool,
     mlkem_level: Option<pq::MlKemAlg>,
 ) -> String {
-    if !private {
-        return "Public note: anyone can read it on the blockchain, forever.".to_string();
-    }
-    let passphrase_counts = passphrase_active && passphrase_verified;
-    if !directed {
-        // Self-note: already sealed with a seed-derived key, so a
-        // passphrase here guards a DIFFERENT threat than the directed
-        // case's on-chain-ECDH harvest-now-decrypt-later — seed
-        // compromise, or a quantum-recovered leaf secret from an exported
-        // xpub/descriptor. Forgetting the password makes the note
-        // unrecoverable, seed or no seed, which every password-mentioning
-        // branch below says plainly. `mlkem_level` (PLAN-graffito-
-        // quantum-key.md): the device's own non-seed quantum key — unlike
-        // the password, losing THIS key (not just forgetting it) makes
-        // the note unrecoverable, so the copy below says "readable only
-        // where this quantum key is present" rather than reusing the
-        // directed case's "hybrid encryption" framing.
-        return match (mlkem_level, passphrase_active) {
-            (None, false) => "Private note: sealed with a key derived from your seed. Already \
-                 quantum-resistant — no public-key material ever touches the chain."
-                .to_string(),
-            (None, true) if passphrase_counts => format!(
-                "Password-protected: not even your seed reads this back without it \
-                 (~{:.0}-bit passphrase). Forget it and the note is gone forever, seed \
-                 or no seed.",
-                passphrase::GENERATED_BITS
-            ),
-            (None, true) => "Password added — strength unverifiable. Forget it and the note is \
-                 gone forever, seed or no seed."
-                .to_string(),
-            (Some(level), false) => format!(
-                "Quantum-resistant: readable only on this device — or another holding your \
-                 {} personal quantum key. Losing that key loses the note, seed or no seed.",
-                mlkem_alg_name(level)
-            ),
-            (Some(level), true) if passphrase_counts => format!(
-                "Quantum-resistant: readable only where your {} personal quantum key is \
-                 present, plus a strong passphrase (~{:.0} bits). Losing either loses the \
-                 note.",
-                mlkem_alg_name(level),
-                passphrase::GENERATED_BITS
-            ),
-            (Some(level), true) => format!(
-                "Quantum-resistant: readable only where your {} personal quantum key is \
-                 present — passphrase layer added but unverified.",
-                mlkem_alg_name(level)
-            ),
-        };
-    }
-    match (mlkem_level, passphrase_active) {
-        (None, false) => {
-            "Directed note: end-to-end encrypted (~128-bit ECDH), but NOT quantum-resistant."
-                .to_string()
-        }
-        (None, true) if !passphrase_counts => {
-            "Passphrase added — strength unverifiable, not counted as quantum-resistant."
-                .to_string()
-        }
-        (None, true) => format!(
-            "Quantum-resistant: protected by a strong passphrase (~{:.0} bits).",
-            passphrase::GENERATED_BITS
+    seclabel::security_label(
+        &SecurityChoice::without_estimator(
+            private,
+            directed,
+            passphrase_active,
+            passphrase_verified,
+            mlkem_level.map(MlKemLevel::from),
         ),
-        (Some(level), false) => format!(
-            "Quantum-resistant: protected by {} hybrid encryption.",
-            mlkem_alg_name(level)
-        ),
-        (Some(level), true) if passphrase_counts => format!(
-            "Quantum-resistant: {} hybrid encryption plus a strong passphrase (~{:.0} bits).",
-            mlkem_alg_name(level),
-            passphrase::GENERATED_BITS
-        ),
-        (Some(level), true) => format!(
-            "Quantum-resistant via {} hybrid encryption — passphrase layer added but unverified.",
-            mlkem_alg_name(level)
-        ),
-    }
+        SelfNoteCopy::Detailed,
+    )
 }
 
 /// The active notebook's leaf key rendered as (raw hex, WIF) for the

@@ -37,6 +37,9 @@ opt-level = 3
 
 [dependencies]
 notes-core = { path = "notes-core" }
+# Shared policy (compose Security copy — graffito-core/src/seclabel.rs);
+# the graffito Mac/mobile app pins the same rev of this repo for it.
+graffito-core = { path = "graffito-core" }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

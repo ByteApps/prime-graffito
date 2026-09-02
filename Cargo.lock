@@ -4880,6 +4880,7 @@ version = "0.1.0"
 dependencies = [
  "foundation-themes",
  "getrandom 0.2.10",
+ "graffito-core",
  "hex",
  "log",
  "notes-core",
