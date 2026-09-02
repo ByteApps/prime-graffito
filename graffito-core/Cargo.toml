@@ -1,0 +1,23 @@
+# Shared, UI-free Graffito POLICY library — the product decisions both
+# shells (this repo's KeyOS app and the graffito Mac/iOS/Android app's
+# app-core) must render identically, starting with the compose screen's
+# security copy (`seclabel`). Sibling of notes-core (the FROZEN protocol
+# pieces); consumed by app-core as a git dependency pinned to the SAME rev
+# as notes-core (PLAN-graffito-arch.md, phase 2).
+#
+# Dependency-minimal BY RULE: notes-core + serde only. No zxcvbn (strength
+# estimation stays in app-core), no getrandom, no rust-bitcoin — nothing
+# that would enter the device build graph through this crate.
+[package]
+name = "graffito-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+notes-core = { path = "../notes-core" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Test-only (the variant-name serde pin); never in a shipped graph.
+serde_json = "1"
