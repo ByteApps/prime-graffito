@@ -16,6 +16,7 @@ import { AccountsScreen } from "screens/accounts.slint";
 import { RecoveryWordsScreen } from "screens/recovery-words.slint";
 import { PublicKeysScreen } from "screens/public-keys.slint";
 import { PrivateKeysScreen } from "screens/private-keys.slint";
+import { PayFromScreen } from "screens/pay-from.slint";
 
 export { Screen, Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, DeviceQuantumKey, Theme, ButtonVariant, ButtonState, ControlSize, Images }
 
@@ -145,113 +146,9 @@ export component AppWindow inherits Window {
         // wallet (P2WPKH) — with independent per-coin selection. Selecting
         // coins from both sources at once is allowed (signed in one pass
         // via wpkh::sign_mixed_inputs) and flagged with a linkage warning.
-        if Ui.screen == Screen.pay-from: VerticalLayout {
+        if Ui.screen == Screen.pay-from: PayFromScreen {
             width: parent.width;
             height: parent.height;
-            padding-left: 24px;
-            padding-right: 24px;
-            padding-top: 8px + UISize.control-center-status-bar-height;
-            padding-bottom: 24px;
-            spacing: 10px;
-
-            ScreenHeader {
-                vertical-stretch: 0;
-                title: "Pay from";
-                back => { Callbacks.funding-done(); Ui.screen = Screen.compose; }
-            }
-
-            if Funding.warning != "": Text {
-                vertical-stretch: 0;
-                text: Funding.warning;
-                color: Theme.palette-danger;
-                font-family: "Montserrat";
-                font-size: 13px;
-                wrap: word-wrap;
-            }
-
-            Flickable {
-                vertical-stretch: 1;
-                viewport-width: self.width;
-                viewport-height: 44px * 2 + 60px
-                    + Funding.notebook-coins.length * 56px
-                    + Funding.spending-coins.length * 56px;
-                VerticalLayout {
-                    spacing: 10px;
-                    Rectangle {
-                        height: 44px;
-                        TouchArea { clicked => { Funding.notebook-expanded = !Funding.notebook-expanded; } }
-                        HorizontalLayout {
-                            Text {
-                                text: "Notebook";
-                                color: Theme.palette-foreground;
-                                font-family: "Montserrat";
-                                font-size: 16px;
-                                font-weight: 600;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
-                            Text {
-                                text: Funding.notebook-summary + (Funding.notebook-expanded ? " ^" : " v");
-                                color: Theme.palette-muted;
-                                font-family: "Montserrat";
-                                font-size: 14px;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-                    if Funding.notebook-expanded: VerticalLayout {
-                        spacing: 6px;
-                        for c in Funding.notebook-coins: FundingCoinEntry {
-                            entry: c;
-                            tapped => { Callbacks.funding-toggle-coin(c.key); }
-                        }
-                        if Funding.notebook-coins.length == 0: Text {
-                            text: "No spendable notebook coins.";
-                            color: Theme.palette-muted;
-                            font-family: "Montserrat";
-                            font-size: 13px;
-                        }
-                    }
-                    Rectangle {
-                        height: 44px;
-                        TouchArea { clicked => { Funding.spending-expanded = !Funding.spending-expanded; } }
-                        HorizontalLayout {
-                            Text {
-                                text: "Spending wallet";
-                                color: Theme.palette-foreground;
-                                font-family: "Montserrat";
-                                font-size: 16px;
-                                font-weight: 600;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
-                            Text {
-                                text: Funding.spending-summary + (Funding.spending-expanded ? " ^" : " v");
-                                color: Theme.palette-muted;
-                                font-family: "Montserrat";
-                                font-size: 14px;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-                    if Funding.spending-expanded: VerticalLayout {
-                        spacing: 6px;
-                        for c in Funding.spending-coins: FundingCoinEntry {
-                            entry: c;
-                            tapped => { Callbacks.funding-toggle-coin(c.key); }
-                        }
-                        if Funding.spending-coins.length == 0: Text {
-                            text: Funding.spending-enabled
-                                ? "No spending-wallet coins yet — fund its address and import a sync bundle."
-                                : "Off — turn on \"Separate spending wallet\" in Settings first.";
-                            color: Theme.palette-muted;
-                            font-family: "Montserrat";
-                            font-size: 13px;
-                            wrap: word-wrap;
-                        }
-                    }
-                }
-            }
         }
 
         // -------------------------------------------- screen 26: Change
