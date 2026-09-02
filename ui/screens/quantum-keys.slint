@@ -1,0 +1,181 @@
+// Screen.quantum-keys — extracted verbatim from app.slint on 2026-09-01
+// (PLAN-graffito-arch.md phase 4a). The instantiation site in app.slint
+// still sets width/height to the window; everything else is the
+// original block body.
+// --------------------------------- screen 27: Quantum keys (pq.rs)
+// This notebook's post-quantum (ML-KEM) receive identity: level
+// picker, fingerprint, and a scannable QR of the armored public
+// key for a contact to import. Public-key export only — the 24
+// recovery words (Settings → "Recovery words…") already
+// reconstruct every derived key, so no separate private-key
+// export lives here.
+
+import { Theme, UISize } from "@ui/theme.slint";
+import { Screen, Callbacks, Ui, Settings, Recovery, ExportNbRow, QuantumKeys } from "../callbacks.slint";
+import { ScreenHeader, PillOption } from "../components.slint";
+
+export component QuantumKeysScreen inherits VerticalLayout {
+    padding-left: 24px;
+    padding-right: 24px;
+    padding-top: 16px + UISize.control-center-status-bar-height;
+    padding-bottom: 24px;
+    spacing: 12px;
+
+    ScreenHeader {
+        title: "Quantum keys";
+        back => { Callbacks.quantum-keys-close(); Ui.screen = Screen.settings; }
+    }
+
+    Text {
+        text: "This notebook's ML-KEM receive key — derived from your seed, same on every device restored from it. Share the QR with a contact so they can send you quantum-resistant directed notes.";
+        color: Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 13px;
+        wrap: word-wrap;
+    }
+
+    // Notebook picker — same row design + selection convention as
+    // the Export-keys screen's "Notebook (whose private key)"
+    // picker (screen 23/24, `Recovery.export-notebooks` /
+    // `export-pick-notebook`), reusing the shared `ExportNbRow`
+    // struct. Each notebook has its own ML-KEM keypair (derived
+    // from its own BIP-86 leaf secret), so switching here must
+    // re-derive the fingerprint + QR for the newly picked notebook.
+    Text {
+        text: "Notebook:";
+        color: Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 13px;
+        font-weight: 600;
+    }
+    VerticalLayout {
+        spacing: 6px;
+        for nb in QuantumKeys.notebooks: Rectangle {
+            height: 40px;
+            background: nb.index == QuantumKeys.nb-index ? Theme.palette-primary : Theme.palette-surface;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: nb.index == QuantumKeys.nb-index ? Theme.palette-primary : Theme.palette-border;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 8px;
+                Text {
+                    text: nb.name;
+                    color: nb.index == QuantumKeys.nb-index ? #ffffff : Theme.palette-foreground;
+                    font-family: "Montserrat";
+                    font-size: 14px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                Text {
+                    text: nb.addr;
+                    color: nb.index == QuantumKeys.nb-index ? #ffffff : Theme.palette-muted;
+                    font-family: "SourceCodePro";
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+            TouchArea { clicked => { Callbacks.quantum-key-pick-notebook(nb.index); } }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 6px;
+        PillOption {
+            label: "512";
+            selected: QuantumKeys.level == 0;
+            horizontal-stretch: 1;
+            tapped => { Callbacks.quantum-key-level(0); }
+        }
+        PillOption {
+            label: "768";
+            selected: QuantumKeys.level == 1;
+            horizontal-stretch: 1;
+            tapped => { Callbacks.quantum-key-level(1); }
+        }
+        PillOption {
+            label: "1024";
+            selected: QuantumKeys.level == 2;
+            horizontal-stretch: 1;
+            tapped => { Callbacks.quantum-key-level(2); }
+        }
+    }
+    Text {
+        text: QuantumKeys.level-caption;
+        color: Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+
+    Text {
+        text: "Fingerprint";
+        color: Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 13px;
+        font-weight: 600;
+    }
+    Rectangle {
+        background: Theme.palette-surface;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.palette-border;
+        VerticalLayout {
+            padding: 12px;
+            Text {
+                text: QuantumKeys.fingerprint;
+                color: Theme.palette-foreground;
+                font-family: "SourceCodePro";
+                font-size: 15px;
+                wrap: char-wrap;
+            }
+        }
+    }
+
+    HorizontalLayout {
+        alignment: center;
+        Rectangle {
+            width: 176px;
+            height: 176px;
+            Image {
+                source: QuantumKeys.public-qr;
+                width: 176px;
+                height: 176px;
+                image-rendering: pixelated;
+            }
+            // LAST child so the tap isn't swallowed by the Image
+            // (slint: later sibling wins input — qr-zoom memory).
+            TouchArea {
+                clicked => {
+                    QuantumKeys.qr-zoom = true;
+                    Callbacks.quantum-qr-zoom(true);
+                }
+            }
+        }
+    }
+    // Legibility note: an armored ML-KEM public key is ~1.7 KB,
+    // rendered as one dense QR (no animated-UR encoder is wired
+    // in this app — the device only ever DECODES animated UR via
+    // the system scanner, e.g. for sync bundles; encoding one
+    // would need a different, not readily-reusable payload
+    // framing). A phone camera can still read a dense code, but
+    // it wants a steady hand and good light.
+    Text {
+        text: "Dense QR — hold steady and well-lit, or scan with the companion / graffito desktop app, which also accepts this key by file or paste.";
+        color: Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+    Text {
+        text: "This is your PUBLIC key — safe to share. Your device backup is the 24 recovery words (Settings → \"Recovery words…\"), which reconstruct this key too.";
+        color: Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+
+    Rectangle { vertical-stretch: 1; }
+}
