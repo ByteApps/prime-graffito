@@ -17,10 +17,11 @@ support-url = "https://byteapps.com"
 
 [permissions]
 template = ["gui-app", "fs-generic", "fs-access"]
-# Import bundles / export signed txs may use Airlock; nothing mounts it in
-# the hosted simulator, so mount lazily and format only after a failed
-# mount (paper-wallet pattern, see its NOTES.md).
-"os/fs" = ["MountAirlock", "FormatAirlock"]
+# No explicit os/fs grants: MountAirlock/FormatAirlock/FlushFs are
+# Foundation-only under SDK 1.0.0 (a third-party app is never granted them,
+# and the republished SDK fails the build on declaring them). Airlock is
+# reached through the fs-generic/fs-access templates only — the SYSTEM
+# mounts it when USB attaches (see ensure_airlock_mounted in main.rs).
 # GetAppSeed (HMAC-derived per-app seed, PIN-gated on hardware) is the sole
 # root of the notes identity key AND the note encryption key — the wipe
 # recovery story depends on it. NOT GetSeed: this app must never see the
