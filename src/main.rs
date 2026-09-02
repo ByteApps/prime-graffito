@@ -1348,6 +1348,59 @@ fn show_confirm_screen(
 
 // ---------------------------------------------------------------- main
 
+/// The shell's live, non-persisted-as-such state (PLAN-graffito-arch.md
+/// phase 4b): what `app_main` used to keep as ~15 ambient `Rc<RefCell<T>>`
+/// locals, each callback cloning a dozen of them. One `Rc<RefCell<App>>`
+/// handle now; per-notebook persisted state stays in [`State`].
+///
+/// Borrow discipline (the ONE runtime hazard of a `RefCell`): read fields
+/// into locals at the top of a callback, write with a scoped
+/// `app.borrow_mut().field = …`, never hold a `Ref`/`RefMut` across a call
+/// into anything that may borrow `app` again — `Timer::single_shot`
+/// bodies and nested closures are where that bites.
+struct App {
+    /// Device-level network (wallet-wide; `"mainnet" | "testnet4" |
+    /// "signet" | "regtest"`): one setting shared by every notebook — each
+    /// notebook's ledger is per-network on disk (`state-<net>-<account>.json`).
+    /// Persisted in `config.json` (`DeviceConfig.network`).
+    net: String,
+    /// The Settings chunk-size override (`None` = the DEFAULT_CHUNK relay
+    /// default): purely device-side relay policy, copied into the active
+    /// notebook's `State.chunk_override` on load so the compose cost line
+    /// prices with it. Persisted (`DeviceConfig.chunk_override`).
+    device_chunk: Option<usize>,
+    /// Active wallet context (recovery seeds): the rotation seed index.
+    /// New notebooks derive under (seed_idx, bip_account); the notebook list
+    /// and every wallet-level feature scope to that pair. Persisted
+    /// (`DeviceConfig.seed_index`).
+    seed_idx: u32,
+    /// Active wallet context: the BIP-86 account under `seed_idx`.
+    /// Persisted (`DeviceConfig.account`).
+    bip_account: u32,
+    /// Anti-fee-sniping `nLockTime` policy (wallet-level, like network and
+    /// chunk) — `Tip` by default, resolved against the last imported
+    /// bundle's tip at build time. Persisted (`DeviceConfig.lock_time`).
+    lock_policy: LockTimePolicy,
+    /// Default ML-KEM level id (`pq::MlKemAlg::id()`) the Quantum-keys
+    /// screen pre-selects. Persisted (`DeviceConfig.mlkem_level`).
+    mlkem_level: u8,
+}
+
+impl App {
+    /// The persisted projection of the wallet-level fields — the ONE
+    /// place `config.json`'s shape is assembled from live state.
+    fn device_config(&self) -> DeviceConfig {
+        DeviceConfig {
+            network: self.net.clone(),
+            chunk_override: self.device_chunk,
+            seed_index: self.seed_idx,
+            account: self.bip_account,
+            lock_time: self.lock_policy,
+            mlkem_level: self.mlkem_level,
+        }
+    }
+}
+
 fn app_main(cx: AppContext, ui: AppWindow) {
     log_server::init_wait(env!("CARGO_CRATE_NAME")).unwrap();
     log::set_max_level(log::LevelFilter::Info);
@@ -1383,18 +1436,20 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // Device-level network (wallet-wide): one setting shared by every
     // notebook; each notebook's ledger is per-network on disk.
     let device_cfg = boot_config(&fs, &notebooks.borrow());
-    let net: Rc<RefCell<String>> = Rc::new(RefCell::new(device_cfg.network.clone()));
-    let device_chunk: Rc<RefCell<Option<usize>>> =
-        Rc::new(RefCell::new(device_cfg.chunk_override));
-    // Active wallet context (recovery-seeds): rotation seed index + BIP-86
-    // account. New notebooks derive under it; the list + wallet features
-    // scope to it (legacy notebooks are context-free).
-    let seed_idx: Rc<RefCell<u32>> = Rc::new(RefCell::new(device_cfg.seed_index));
-    let bip_account: Rc<RefCell<u32>> = Rc::new(RefCell::new(device_cfg.account));
-    // Anti-fee-sniping policy (wallet-level, like network and chunk).
-    let lock_policy: Rc<RefCell<LockTimePolicy>> = Rc::new(RefCell::new(device_cfg.lock_time));
-    // Default ML-KEM level for the Quantum-keys screen (wallet-level).
-    let mlkem_level: Rc<RefCell<u8>> = Rc::new(RefCell::new(device_cfg.mlkem_level));
+    // The named app state (PLAN-graffito-arch.md phase 4b) — ONE handle every
+    // callback clones, instead of one `Rc<RefCell<T>>` per field. Borrow
+    // discipline: read a field into a local (`let x = app.borrow().x;`),
+    // write with a scoped `app.borrow_mut().x = …;`, and NEVER hold a borrow
+    // across a call that may borrow again — a double borrow compiles clean
+    // and panics at runtime.
+    let app: Rc<RefCell<App>> = Rc::new(RefCell::new(App {
+        net: device_cfg.network.clone(),
+        device_chunk: device_cfg.chunk_override,
+        seed_idx: device_cfg.seed_index,
+        bip_account: device_cfg.account,
+        lock_policy: device_cfg.lock_time,
+        mlkem_level: device_cfg.mlkem_level,
+    }));
     // Quantum-keys screen (27): which notebook's ML-KEM key is shown —
     // `None` until the picker is touched, meaning "active-or-first-visible"
     // (the screen's original single-notebook default); `Some(index)` once
@@ -1411,24 +1466,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // truth — inline DeviceConfig constructions drift as fields grow).
     let persist_config = {
         let fs = fs.clone();
-        let net = net.clone();
-        let device_chunk = device_chunk.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
-        let lock_policy = lock_policy.clone();
-        let mlkem_level = mlkem_level.clone();
+        let app = app.clone();
         Rc::new(move || {
-            save_config(
-                &fs,
-                &DeviceConfig {
-                    network: net.borrow().clone(),
-                    chunk_override: *device_chunk.borrow(),
-                    seed_index: *seed_idx.borrow(),
-                    account: *bip_account.borrow(),
-                    lock_time: *lock_policy.borrow(),
-                    mlkem_level: *mlkem_level.borrow(),
-                },
-            );
+            save_config(&fs, &app.borrow().device_config());
         })
     };
     // The ACTIVE notebook's state + identity (both swap on notebook switch);
@@ -1441,14 +1481,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let identity = identity.clone();
-        let net = net.clone();
-        let device_chunk = device_chunk.clone();
-        let lock_policy = lock_policy.clone();
+        let app = app.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
             let home = ui.global::<Home>();
-            home.set_network(net.borrow().clone().into()); // device-level network
+            home.set_network(app.borrow().net.clone().into()); // device-level network
             if let Some(id) = identity.borrow().as_ref() {
                 let addr = id.address(st.network());
                 home.set_qr(qr_image(&addr.to_uppercase()));
@@ -1476,7 +1514,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 .into(),
             );
             let settings = ui.global::<Settings>();
-            let dchunk = *device_chunk.borrow();
+            let dchunk = app.borrow().device_chunk;
             settings.set_chunk_mode(match dchunk {
                 None => 0,
                 Some(80) => 1,
@@ -1484,7 +1522,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             });
             let eff = dchunk.map(|c| c.clamp(MIN_CHUNK, DEFAULT_CHUNK)).unwrap_or(DEFAULT_CHUNK);
             settings.set_chunk_text(format!("{eff}").into());
-            let policy = *lock_policy.borrow();
+            let policy = app.borrow().lock_policy;
             settings.set_locktime_mode(match policy {
                 LockTimePolicy::Tip => 0,
                 LockTimePolicy::Zero => 1,
@@ -1615,9 +1653,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let fs = fs.clone();
         let notebooks = notebooks.clone();
         let app_seed = app_seed.clone();
-        let net = net.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             // Wallet-wide: every ACTIVE notebook's coins, each tagged with
@@ -1625,8 +1661,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             // current, then read all from disk.
             save_state(&fs, &state.borrow());
             let ix = notebooks.borrow();
-            let active_net = net.borrow().clone();
-            let ctx = (*seed_idx.borrow(), *bip_account.borrow());
+            let active_net = app.borrow().net.clone();
+            let ctx = (app.borrow().seed_idx, app.borrow().bip_account);
             let btc_usd = state.borrow().btc_usd;
             // (value, notebook name, txid, vout) across the wallet.
             let mut all: Vec<(u64, String, String, u32)> = Vec::new();
@@ -1676,8 +1712,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let state = state.clone();
         let fs = fs.clone();
         let notebooks = notebooks.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let sweep = ui.global::<Sweep>();
@@ -1693,7 +1728,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 &fs,
                 &notebooks.borrow(),
                 &st.network,
-                (*seed_idx.borrow(), *bip_account.borrow()),
+                (app.borrow().seed_idx, app.borrow().bip_account),
             );
             sweep.set_inputs_line(format!("Inputs · {n} coin(s) · {total} sats (all notebooks)").into());
             if n == 0 {
@@ -1765,19 +1800,17 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let notebooks = notebooks.clone();
-        let net = net.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         let active = active.clone();
         let app_seed = app_seed.clone();
         let funding_pick = funding_pick.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
-            let active_net = net.borrow().clone();
+            let active_net = app.borrow().net.clone();
             let ix = notebooks.borrow();
             let ctx = notebook_ctx(&ix, *active.borrow())
-                .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
+                .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
             let section = ix.spending(&active_net, ctx.0, ctx.1).cloned();
             drop(ix);
             let pick = funding_pick.borrow();
@@ -1997,15 +2030,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let notebooks = notebooks.clone();
         let active = active.clone();
         let app_seed = app_seed.clone();
-        let net = net.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         Rc::new(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let ix = notebooks.borrow();
             let active_acct = *active.borrow();
-            let dev_net = net.borrow().clone();
-            let ctx = (*seed_idx.borrow(), *bip_account.borrow());
+            let dev_net = app.borrow().net.clone();
+            let ctx = (app.borrow().seed_idx, app.borrow().bip_account);
             let build = |m: &notebooks::NotebookMeta| -> NotebookRow {
                 let st = load_state(&fs, &dev_net, m.account);
                 let addr = derive_identity(app_seed_get(&app_seed), m, &dev_net)
@@ -2063,8 +2094,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let active = active.clone();
         let notebooks = notebooks.clone();
         let app_seed = app_seed.clone();
-        let net = net.clone();
-        let device_chunk = device_chunk.clone();
+        let app = app.clone();
         let refresh_home = refresh_home.clone();
         let refresh_notes = refresh_notes.clone();
         let refresh_coins = refresh_coins.clone();
@@ -2079,9 +2109,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             *identity.borrow_mut() = notebooks
                 .borrow()
                 .get(account)
-                .and_then(|m| derive_identity(app_seed_get(&app_seed), m, &net.borrow()));
-            let mut loaded = load_state(&fs, &net.borrow(), account);
-            loaded.chunk_override = *device_chunk.borrow(); // chunk is device-level
+                .and_then(|m| derive_identity(app_seed_get(&app_seed), m, &app.borrow().net));
+            let mut loaded = load_state(&fs, &app.borrow().net, account);
+            loaded.chunk_override = app.borrow().device_chunk; // chunk is device-level
             *state.borrow_mut() = loaded;
             let short = identity
                 .borrow()
@@ -2109,9 +2139,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let fs = fs.clone();
         let update_sweep = update_sweep.clone();
         let notebooks = notebooks.clone();
-        let net = net.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         let active = active.clone();
         let funding_pick = funding_pick.clone();
         let change_pick = change_pick.clone();
@@ -2219,8 +2247,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let st = state.borrow();
                 let ix = notebooks.borrow();
                 let ctx = notebook_ctx(&ix, *active.borrow())
-                    .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
-                let section = ix.spending(&net.borrow(), ctx.0, ctx.1).cloned();
+                    .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
+                let section = ix.spending(&app.borrow().net, ctx.0, ctx.1).cloned();
                 drop(ix);
                 *funding_pick.borrow_mut() = default_funding_pick(&st, section.as_ref());
                 drop(st);
@@ -2399,17 +2427,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let refresh_quantum_keys = {
         let ui_weak = ui_weak.clone();
         let notebooks = notebooks.clone();
-        let net = net.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         let active = active.clone();
         let app_seed = app_seed.clone();
-        let mlkem_level = mlkem_level.clone();
         let quantum_nb = quantum_nb.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let qk = ui.global::<QuantumKeys>();
-            let alg = mlkem_alg_from_u8(*mlkem_level.borrow());
+            let alg = mlkem_alg_from_u8(app.borrow().mlkem_level);
             let level_idx = match alg {
                 pq::MlKemAlg::MlKem512 => 0,
                 pq::MlKemAlg::MlKem768 => 1,
@@ -2419,9 +2444,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             qk.set_level_caption(mlkem_alg_describe(alg).into());
 
             let ix = notebooks.borrow();
-            let net_s = net.borrow().clone();
+            let net_s = app.borrow().net.clone();
             let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
-            let ctx = (*seed_idx.borrow(), *bip_account.borrow());
+            let ctx = (app.borrow().seed_idx, app.borrow().bip_account);
 
             // Picker rows: every visible notebook in this wallet context,
             // same shape/derivation as `export_rows`.
@@ -2508,7 +2533,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     {
         let ui_weak = ui_weak.clone();
-        let mlkem_level = mlkem_level.clone();
+        let app = app.clone();
         let persist_config = persist_config.clone();
         let refresh_quantum_keys = refresh_quantum_keys.clone();
         ui.global::<Callbacks>().on_quantum_key_level(move |level_idx| {
@@ -2518,7 +2543,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 2 => pq::MlKemAlg::MlKem1024,
                 _ => pq::MlKemAlg::MlKem768,
             };
-            *mlkem_level.borrow_mut() = alg.id();
+            app.borrow_mut().mlkem_level = alg.id();
             persist_config();
             log::info!("cb: pq-key level={}", mlkem_alg_name(alg));
             refresh_quantum_keys();
@@ -2895,9 +2920,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let notebooks = notebooks.clone();
         let app_seed = app_seed.clone();
         let active = active.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
-        let lock_policy = lock_policy.clone();
+        let app = app.clone();
         ui.global::<Callbacks>().on_sweep_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
@@ -2909,9 +2932,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let notebooks = notebooks.clone();
             let app_seed = app_seed.clone();
             let active = active.clone();
-            let seed_idx = seed_idx.clone();
-            let bip_account = bip_account.clone();
-            let lock_policy = lock_policy.clone();
+            let app = app.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
@@ -2930,7 +2951,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     &notebooks.borrow(),
                     app_seed_get(&app_seed),
                     &st.network,
-                    (*seed_idx.borrow(), *bip_account.borrow()),
+                    (app.borrow().seed_idx, app.borrow().bip_account),
                 );
                 let dest_account = active.borrow().unwrap_or(0);
                 let id_guard = identity.borrow();
@@ -2959,7 +2980,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             &sources,
                             dest_spk,
                             rate,
-                            resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                            resolve_locktime(app.borrow().lock_policy, st.tip_height),
                             generate_aux_rand,
                         )
                             .map_err(|e| e.to_string())
@@ -2998,7 +3019,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         // prevout labels come straight from it.
                         let ix = notebooks.borrow();
                         let (self_spks, spending_spks) =
-                            confirm_self_spks(&ix, app_seed_get(&app_seed), &st.network, (*seed_idx.borrow(), *bip_account.borrow()));
+                            confirm_self_spks(&ix, app_seed_get(&app_seed), &st.network, (app.borrow().seed_idx, app.borrow().bip_account));
                         let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> =
                             BTreeMap::new();
                         for (acct, ox, _, coins) in &sources_raw {
@@ -3077,16 +3098,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let fs = fs.clone();
         let notebooks = notebooks.clone();
-        let net = net.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         let active = active.clone();
         let refresh_funding = refresh_funding.clone();
         ui.global::<Callbacks>().on_set_spending_enabled(move |on| {
             let mut ix = notebooks.borrow_mut();
             let ctx = notebook_ctx(&ix, *active.borrow())
-                .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
-            let net_s = net.borrow().clone();
+                .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
+            let net_s = app.borrow().net.clone();
             ix.spending_mut(&net_s, ctx.0, ctx.1).enabled = on;
             save_notebooks(&fs, &ix);
             drop(ix);
@@ -3189,9 +3208,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let funding_pick = funding_pick.clone();
         let change_pick = change_pick.clone();
         let notebooks = notebooks.clone();
-        let net = net.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         let active = active.clone();
         let pq_generated = pq_generated.clone();
         let fs = fs.clone();
@@ -3346,8 +3363,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             }
             let ix = notebooks.borrow();
             let ctx = notebook_ctx(&ix, *active.borrow())
-                .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
-            let net_s = net.borrow().clone();
+                .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
+            let net_s = app.borrow().net.clone();
             let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
             drop(ix);
             if st.utxos.is_empty() && section.as_ref().map(|s| s.balance()).unwrap_or(0) == 0 {
@@ -3702,14 +3719,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let identity = identity.clone();
         let plan = plan.clone();
         let notebooks = notebooks.clone();
-        let net = net.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         let active = active.clone();
         let app_seed = app_seed.clone();
         let funding_pick = funding_pick.clone();
         let change_pick = change_pick.clone();
-        let lock_policy = lock_policy.clone();
         let fs = fs.clone();
         let device_pq_key = device_pq_key.clone();
         ui.global::<Callbacks>().on_compose_continue(move || {
@@ -3720,14 +3734,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let identity = identity.clone();
             let plan = plan.clone();
             let notebooks = notebooks.clone();
-            let net = net.clone();
-            let seed_idx = seed_idx.clone();
-            let bip_account = bip_account.clone();
+            let app = app.clone();
             let active = active.clone();
             let app_seed = app_seed.clone();
             let funding_pick = funding_pick.clone();
             let change_pick = change_pick.clone();
-            let lock_policy = lock_policy.clone();
             let fs = fs.clone();
             let device_pq_key = device_pq_key.clone();
             // Let the busy overlay paint one frame before the blocking work.
@@ -3756,8 +3767,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let change_choice = change_pick.borrow().clone();
                 let ix = notebooks.borrow();
                 let ctx = notebook_ctx(&ix, *active.borrow())
-                    .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
-                let net_s = net.borrow().clone();
+                    .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
+                let net_s = app.borrow().net.clone();
                 let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
                 drop(ix);
 
@@ -3897,7 +3908,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     Some(change_spk.as_slice()),
                                     st.effective_chunk(),
                                     rate,
-                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
                                     || generate_aux_rand(),
                                 )
                             } else if pq_active {
@@ -3915,7 +3926,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     Some(change_spk.as_slice()),
                                     st.effective_chunk(),
                                     rate,
-                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
                                     || generate_aux_rand(),
                                 )
                             } else if !recipients_vec.is_empty() {
@@ -3929,7 +3940,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     Some(change_spk.as_slice()),
                                     st.effective_chunk(),
                                     rate,
-                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
                                     || generate_aux_rand(),
                                 )
                             } else {
@@ -3941,7 +3952,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     Some(change_spk.as_slice()),
                                     st.effective_chunk(),
                                     rate,
-                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
                                     || generate_aux_rand(),
                                 )
                             }
@@ -3989,7 +4000,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     Some(change_spk.as_slice()),
                                     st.effective_chunk(),
                                     rate,
-                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
                                     || generate_aux_rand(),
                                 )
                             } else if pq_active {
@@ -4003,7 +4014,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     Some(change_spk.as_slice()),
                                     st.effective_chunk(),
                                     rate,
-                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
                                     || generate_aux_rand(),
                                 )
                             } else if !recipients_vec.is_empty() {
@@ -4017,7 +4028,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     Some(change_spk.as_slice()),
                                     st.effective_chunk(),
                                     rate,
-                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
                                     || generate_aux_rand(),
                                 )
                             } else {
@@ -4029,7 +4040,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     Some(change_spk.as_slice()),
                                     st.effective_chunk(),
                                     rate,
-                                    resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
                                     || generate_aux_rand(),
                                 )
                             }
@@ -4171,7 +4182,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 &notebook_dust_spk,
                                 &change_spk,
                                 rate,
-                                resolve_locktime(*lock_policy.borrow(), st.tip_height),
+                                resolve_locktime(app.borrow().lock_policy, st.tip_height),
                                 || generate_aux_rand(),
                             )
                             .map_err(|e| e.to_string())?;
@@ -4424,9 +4435,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let fs = fs.clone();
         let refresh_notes = refresh_notes.clone();
         let notebooks = notebooks.clone();
-        let net = net.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         let active = active.clone();
         let refresh_funding = refresh_funding.clone();
         let funding_pick = funding_pick.clone();
@@ -4445,7 +4454,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     let state = state.clone();
                     let fs = fs.clone();
                     let active = active.clone();
-                    let net = net.clone();
+                    let app = app.clone();
                     let refresh_home = refresh_home.clone();
                     Timer::single_shot(Duration::from_millis(150), move || {
                         let Some(ui) = ui_weak.upgrade() else { return };
@@ -4463,7 +4472,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             if *acct == active_acct {
                                 st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
                             } else {
-                                let mut other = load_state(&fs, &net.borrow(), *acct);
+                                let mut other = load_state(&fs, &app.borrow().net, *acct);
                                 other.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
                                 save_state(&fs, &other);
                             }
@@ -4473,7 +4482,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             if p.dest_account == active_acct {
                                 st.utxos.push(coin);
                             } else {
-                                let mut dest = load_state(&fs, &net.borrow(), p.dest_account);
+                                let mut dest = load_state(&fs, &app.borrow().net, p.dest_account);
                                 dest.utxos.push(coin);
                                 save_state(&fs, &dest);
                             }
@@ -4601,9 +4610,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     let fs = fs.clone();
                     let refresh_notes = refresh_notes.clone();
                     let notebooks = notebooks.clone();
-                    let net = net.clone();
-                    let seed_idx = seed_idx.clone();
-                    let bip_account = bip_account.clone();
+                    let app = app.clone();
                     let active = active.clone();
                     let refresh_funding = refresh_funding.clone();
                     let funding_pick = funding_pick.clone();
@@ -4667,8 +4674,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         if !p.spending_spent.is_empty() || p.spending_change_addr.is_some() {
                             let mut ix = notebooks.borrow_mut();
                             let ctx = notebook_ctx(&ix, *active.borrow())
-                                .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
-                            let net_s = net.borrow().clone();
+                                .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
+                            let net_s = app.borrow().net.clone();
                             let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
                             let change_coin =
                                 if p.note.change > 0 { p.spending_change_addr.as_ref() } else { None };
@@ -5035,7 +5042,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let fs = fs.clone();
         let identity = identity.clone();
         let notebooks = notebooks.clone();
-        let net = net.clone();
+        let app = app.clone();
         let active = active.clone();
         let app_seed = app_seed.clone();
         let device_pq_key = device_pq_key.clone();
@@ -5070,7 +5077,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 if received {
                     if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
                         let ix = notebooks.borrow();
-                        let net_s = net.borrow().clone();
+                        let net_s = app.borrow().net.clone();
                         let leaf = (*active.borrow())
                             .and_then(|acc| ix.get(acc))
                             .and_then(|meta| derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s));
@@ -5182,9 +5189,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let identity = identity.clone();
         let fs = fs.clone();
         let notebooks = notebooks.clone();
-        let net = net.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         let active = active.clone();
         let app_seed = app_seed.clone();
         Rc::new(move |json: &str, src: &str| -> Result<String, String> {
@@ -5208,8 +5213,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // with the producer's spends_from_self, never narrows).
                 let ix = notebooks.borrow();
                 let ctx = notebook_ctx(&ix, *active.borrow())
-                    .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
-                let net_s = net.borrow().clone();
+                    .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
+                let net_s = app.borrow().net.clone();
                 let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
                 // DISPLAY-OWNER dedup anchor set (device CLAUDE.md): every
                 // VISIBLE (non-archived) notebook's own spk in the active
@@ -5698,9 +5703,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let identity = identity.clone();
         let notebooks = notebooks.clone();
-        let net = net.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         let app_seed = app_seed.clone();
         let psbt_pending = psbt_pending.clone();
         ui.global::<Callbacks>().on_sign_psbt(move || {
@@ -5750,9 +5753,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 return;
             }
 
-            let net_dev = net.borrow().clone();
+            let net_dev = app.borrow().net.clone();
             let mut network = Network::from_str_opt(&net_dev).unwrap_or(Network::Mainnet);
-            let wallet_ctx = (*seed_idx.borrow(), *bip_account.borrow());
+            let wallet_ctx = (app.borrow().seed_idx, app.borrow().bip_account);
             let ix = notebooks.borrow();
             let (self_spks, spending_spks) = confirm_self_spks(&ix, app_seed_get(&app_seed), &net_dev, wallet_ctx);
             drop(ix);
@@ -5865,9 +5868,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let state = state.clone();
         let identity = identity.clone();
         let fs = fs.clone();
-        let net = net.clone();
+        let app = app.clone();
         let active = active.clone();
-        let device_chunk = device_chunk.clone();
         let notebooks = notebooks.clone();
         let app_seed = app_seed.clone();
         let persist_config = persist_config.clone();
@@ -5883,19 +5885,19 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             if active.borrow().is_some() {
                 save_state(&fs, &state.borrow());
             }
-            let next = match net.borrow().as_str() {
+            let next = match app.borrow().net.as_str() {
                 "mainnet" => "testnet4",
                 "testnet4" => "signet",
                 "signet" => "regtest",
                 _ => "mainnet",
             }
             .to_string();
-            *net.borrow_mut() = next.clone();
+            app.borrow_mut().net = next.clone();
             persist_config();
             log::info!("cb: set-network {next}");
             if let Some(account) = *active.borrow() {
                 let mut fresh = load_state(&fs, &next, account);
-                fresh.chunk_override = *device_chunk.borrow();
+                fresh.chunk_override = app.borrow().device_chunk;
                 *state.borrow_mut() = fresh;
                 // Legacy identities are network-independent (only the
                 // address ENCODING changes), but bip86 notebooks use the
@@ -5917,7 +5919,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let fs = fs.clone();
-        let device_chunk = device_chunk.clone();
+        let app = app.clone();
         let persist_config = persist_config.clone();
         let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_chunk_changed(move || {
@@ -5951,7 +5953,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             settings.set_chunk_error("".into());
             save_state(&fs, &st);
             // Chunk is device-level (wallet-wide): persist it in config too.
-            *device_chunk.borrow_mut() = st.chunk_override;
+            app.borrow_mut().device_chunk = st.chunk_override;
             persist_config();
             drop(st);
             // Reflect the effective size back into the field (auto/compat),
@@ -5968,7 +5970,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
-        let lock_policy = lock_policy.clone();
+        let app = app.clone();
         let persist_config = persist_config.clone();
         ui.global::<Callbacks>().on_locktime_changed(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -5991,7 +5993,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     }
                 },
             };
-            *lock_policy.borrow_mut() = policy;
+            app.borrow_mut().lock_policy = policy;
             persist_config();
             settings.set_locktime_error("".into());
             let tip = state.borrow().tip_height;
@@ -6102,8 +6104,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let notebooks = notebooks.clone();
         let active = active.clone();
         let app_seed = app_seed.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         let refresh_notebooks = refresh_notebooks.clone();
         let switch_notebook = switch_notebook.clone();
         ui.global::<NotebookCb>().on_name_save(move || {
@@ -6125,7 +6126,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     ui.global::<Ui>().set_error("Device locked — can't create a notebook.".into());
                     return;
                 }
-                let (seed, bacct) = (*seed_idx.borrow(), *bip_account.borrow());
+                let (seed, bacct) = (app.borrow().seed_idx, app.borrow().bip_account);
                 let account = {
                     let mut ix = notebooks.borrow_mut();
                     let account = ix.create_bip86(seed, bacct, &name);
@@ -6165,7 +6166,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let notebooks = notebooks.clone();
-        let net = net.clone();
+        let app = app.clone();
         let refresh_notebooks = refresh_notebooks.clone();
         ui.global::<NotebookCb>().on_archive(move |account, archived| {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -6173,7 +6174,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             if archived {
                 // Guard: a notebook with coins must be emptied first
                 // (sweep/consolidate). Zero active notebooks is allowed.
-                let bal = load_state(&fs, &net.borrow(), account).balance();
+                let bal = load_state(&fs, &app.borrow().net, account).balance();
                 if bal > 0 {
                     ui.global::<Ui>()
                         .set_error(format!("This notebook holds {bal} sats — empty it first.").into());
@@ -6215,11 +6216,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let reveal_words: Rc<dyn Fn()> = {
         let ui_weak = ui_weak.clone();
         let app_seed = app_seed.clone();
-        let seed_idx = seed_idx.clone();
+        let app = app.clone();
         Rc::new(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let recovery = ui.global::<Recovery>();
-            let index = *seed_idx.borrow();
+            let index = app.borrow().seed_idx;
             let Some(seed) = app_seed_get(&app_seed).as_ref() else {
                 ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
                 log::warn!("cb: reveal-seed index={index} err=locked");
@@ -6339,22 +6340,20 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let app_seed = app_seed.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
-        let net = net.clone();
+        let app = app.clone();
         let apply_export = apply_export.clone();
         let export_rows = export_rows.clone();
         ui.global::<Callbacks>().on_reveal_public(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let r = ui.global::<Recovery>();
-            let si = *seed_idx.borrow();
-            let acct = *bip_account.borrow();
+            let si = app.borrow().seed_idx;
+            let acct = app.borrow().bip_account;
             let Some(seed) = app_seed_get(&app_seed).as_ref() else {
                 ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
                 log::warn!("cb: reveal-public seed={si} account={acct} err=locked");
                 return;
             };
-            let network = Network::from_str_opt(&net.borrow()).unwrap_or(Network::Mainnet);
+            let network = Network::from_str_opt(&app.borrow().net).unwrap_or(Network::Mainnet);
             let derived = (|| -> Result<(), notes_core::Error> {
                 r.set_export_xpub(notes_core::export::account_xpub(seed, si, network, acct)?.into());
                 r.set_export_descriptor(
@@ -6376,23 +6375,21 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let app_seed = app_seed.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
-        let net = net.clone();
+        let app = app.clone();
         let apply_export = apply_export.clone();
         let export_rows = export_rows.clone();
         let reveal_words = reveal_words.clone();
         ui.global::<Callbacks>().on_reveal_private(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let r = ui.global::<Recovery>();
-            let si = *seed_idx.borrow();
-            let acct = *bip_account.borrow();
+            let si = app.borrow().seed_idx;
+            let acct = app.borrow().bip_account;
             let Some(seed) = app_seed_get(&app_seed).as_ref() else {
                 ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
                 log::warn!("cb: reveal-private seed={si} account={acct} err=locked");
                 return;
             };
-            let net_s = net.borrow().clone();
+            let net_s = app.borrow().net.clone();
             let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
             let (rows, sel, sel_name) = export_rows(si, acct, &net_s, network);
             let derived = (|| -> Result<(), notes_core::Error> {
@@ -6425,18 +6422,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         // Pick which notebook's private key hex/WIF export (hex/WIF only).
         let ui_weak = ui_weak.clone();
         let app_seed = app_seed.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
-        let net = net.clone();
+        let app = app.clone();
         let notebooks = notebooks.clone();
         let apply_export = apply_export.clone();
         ui.global::<Callbacks>().on_export_pick_notebook(move |index| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let r = ui.global::<Recovery>();
-            let si = *seed_idx.borrow();
-            let acct = *bip_account.borrow();
+            let si = app.borrow().seed_idx;
+            let acct = app.borrow().bip_account;
             let Some(seed) = app_seed_get(&app_seed).as_ref() else { return };
-            let net_s = net.borrow().clone();
+            let net_s = app.borrow().net.clone();
             let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
             let name = {
                 let ixb = notebooks.borrow();
@@ -6503,8 +6498,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let fs = fs.clone();
         let state = state.clone();
         let active = active.clone();
-        let seed_idx = seed_idx.clone();
-        let bip_account = bip_account.clone();
+        let app = app.clone();
         let persist_config = persist_config.clone();
         let refresh_notebooks = refresh_notebooks.clone();
         let reveal_words = reveal_words.clone();
@@ -6523,15 +6517,15 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 return;
             };
             recovery.set_context_error("".into());
-            let seed_changed = *seed_idx.borrow() != new_seed;
-            let acct_changed = *bip_account.borrow() != new_acct;
+            let seed_changed = app.borrow().seed_idx != new_seed;
+            let acct_changed = app.borrow().bip_account != new_acct;
             if seed_changed || acct_changed {
                 if active.borrow().is_some() {
                     save_state(&fs, &state.borrow());
                     *active.borrow_mut() = None;
                 }
-                *seed_idx.borrow_mut() = new_seed;
-                *bip_account.borrow_mut() = new_acct;
+                app.borrow_mut().seed_idx = new_seed;
+                app.borrow_mut().bip_account = new_acct;
                 persist_config();
                 if seed_changed {
                     log::info!("cb: set-seed-index {new_seed}");
@@ -6562,8 +6556,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // therefore painted seed-free first — rows render without their addresses
     // — and the timer below primes the seed once the loop is live, then
     // repaints the list with them.
-    ui.global::<Recovery>().set_seed_text(format!("{}", *seed_idx.borrow()).into());
-    ui.global::<Recovery>().set_account_text(format!("{}", *bip_account.borrow()).into());
+    ui.global::<Recovery>().set_seed_text(format!("{}", app.borrow().seed_idx).into());
+    ui.global::<Recovery>().set_account_text(format!("{}", app.borrow().bip_account).into());
     ui.global::<Ui>().set_screen(Screen::Notebooks);
 
     let boot_seed = {
