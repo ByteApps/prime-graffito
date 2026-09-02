@@ -8,6 +8,7 @@ import { NoteScreen } from "screens/note.slint";
 import { ComposeScreen } from "screens/compose.slint";
 import { ConfirmSignScreen } from "screens/confirm-sign.slint";
 import { SyncScreen } from "screens/sync.slint";
+import { SignedScreen } from "screens/signed.slint";
 
 export { Screen, Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, QuantumKeys, DeviceQuantumKey, Theme, ButtonVariant, ButtonState, ControlSize, Images }
 
@@ -70,55 +71,9 @@ export component AppWindow inherits Window {
         }
 
         // -------------------------------------------- screen 8: signed PSBT
-        if Ui.screen == Screen.signed: VerticalLayout {
+        if Ui.screen == Screen.signed: SignedScreen {
             width: parent.width;
             height: parent.height;
-            padding-left: 24px;
-            padding-right: 24px;
-            padding-top: 16px + UISize.control-center-status-bar-height;
-            padding-bottom: 24px;
-            spacing: 14px;
-
-            ScreenHeader {
-                title: "Signed";
-                back => { Ui.screen = SignPsbt.back-screen; }
-            }
-            Text {
-                text: SignPsbt.summary;
-                color: Theme.palette-foreground;
-                font-family: "SourceCodePro";
-                font-size: 15px;
-                wrap: word-wrap;
-            }
-            if SignPsbt.has-qr: HorizontalLayout {
-                alignment: center;
-                Rectangle {
-                    width: 264px;
-                    height: 264px;
-                    background: #FFFFFF;
-                    border-radius: 12px;
-                    Image {
-                        source: SignPsbt.qr;
-                        width: 240px;
-                        height: 240px;
-                        x: 12px;
-                        y: 12px;
-                    }
-                }
-            }
-            Text {
-                text: "Scan this with the companion or desktop app to broadcast. Also saved to /graffito/outbox.";
-                color: Theme.palette-muted;
-                font-family: "SourceCodePro";
-                font-size: 13px;
-                wrap: word-wrap;
-            }
-            Rectangle { vertical-stretch: 1; }
-            PrimaryAction {
-                width: 100%;
-                text: "Done";
-                clicked => { Callbacks.refresh-home(); Ui.screen = Screen.home; }
-            }
         }
 
         // ------------------------------------ screen 9: coins (viewer-first)
