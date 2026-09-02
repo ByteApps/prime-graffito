@@ -1,0 +1,83 @@
+// Screen.coins — extracted verbatim from app.slint on 2026-09-01
+// (PLAN-graffito-arch.md phase 4a). The instantiation site in app.slint
+// still sets width/height to the window; everything else is the
+// original block body.
+// ------------------------------------ screen 9: coins (viewer-first)
+// The UTXO ledger as of the last sync bundle. ONE action — the
+// consolidate button on top — opens the shared sweep screen (10).
+
+import { Theme, UISize } from "@ui/theme.slint";
+import { Screen, Callbacks, Ui, Coins } from "../callbacks.slint";
+import { PrimaryAction, ScreenHeader } from "../components.slint";
+
+export component CoinsScreen inherits VerticalLayout {
+    padding-left: 24px;
+    padding-right: 24px;
+    padding-top: 16px + UISize.control-center-status-bar-height;
+    padding-bottom: 24px;
+    spacing: 12px;
+
+    ScreenHeader {
+        title: "Wallet coins";
+        back => { Ui.screen = Screen.settings; }
+    }
+
+    Text {
+        text: Coins.summary;
+        color: Theme.palette-foreground;
+        font-family: "Montserrat";
+        font-size: 17px;
+        font-weight: 600;
+    }
+
+    PrimaryAction {
+        width: 100%;
+        text: "Consolidate wallet…";
+        disabled: !Coins.can-consolidate;
+        clicked => { Callbacks.consolidate-open(); }
+    }
+
+    if !Coins.can-consolidate: Text {
+        text: Coins.rows.length == 0
+            ? "No spendable coins anywhere — fund a notebook's address and import a sync bundle."
+            : "Nothing to consolidate — the wallet already holds a single coin.";
+        color: Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 13px;
+        wrap: word-wrap;
+    }
+
+    Flickable {
+        vertical-stretch: 1;
+        viewport-height: Coins.rows.length * 72px;
+        VerticalLayout {
+            spacing: 8px;
+            alignment: start;
+            for coin in Coins.rows: Rectangle {
+                height: 64px;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 4px;
+                    Text {
+                        text: coin.label;
+                        color: Theme.palette-foreground;
+                        font-family: "Montserrat";
+                        font-size: 18px;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: coin.meta;
+                        color: Theme.palette-muted;
+                        font-family: "SourceCodePro";
+                        font-size: 13px;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+    }
+}
