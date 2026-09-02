@@ -1,0 +1,79 @@
+// Screen.recovery-words — extracted verbatim from app.slint on 2026-09-01
+// (PLAN-graffito-arch.md phase 4a). The instantiation site in app.slint
+// still sets width/height to the window; everything else is the
+// original block body.
+// ---------------------------------- screen 22: recovery words
+// Dedicated reveal, reached straight from Settings. Words/SeedQR
+// for the active seed; Back → Settings, clearing them
+// (reveal-close). Fits comfortably on its own, no scrolling.
+
+import { Theme, UISize } from "@ui/theme.slint";
+import { Screen, Callbacks, Ui, Recovery } from "../callbacks.slint";
+import { SecondaryAction, ScreenHeader } from "../components.slint";
+
+export component RecoveryWordsScreen inherits VerticalLayout {
+    padding-left: 24px;
+    padding-right: 24px;
+    padding-top: 16px + UISize.control-center-status-bar-height;
+    padding-bottom: 24px;
+    spacing: 14px;
+
+    ScreenHeader {
+        title: "Recovery words";
+        back => {
+            Callbacks.reveal-close();
+            Ui.screen = Screen.settings;
+        }
+    }
+
+    Text {
+        text: Recovery.title-line;
+        color: Theme.palette-foreground;
+        font-family: "Montserrat";
+        font-size: 16px;
+        font-weight: 600;
+    }
+
+    if !Recovery.show-qr: HorizontalLayout {
+        spacing: 16px;
+        Text {
+            text: Recovery.words-col1;
+            color: Theme.palette-foreground;
+            font-family: "SourceCodePro";
+            font-size: 16px;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: Recovery.words-col2;
+            color: Theme.palette-foreground;
+            font-family: "SourceCodePro";
+            font-size: 16px;
+            horizontal-stretch: 1;
+        }
+    }
+    if Recovery.show-qr: HorizontalLayout {
+        alignment: center;
+        Image {
+            source: Recovery.qr;
+            width: 220px;
+            height: 220px;
+            image-rendering: pixelated;
+        }
+    }
+
+    SecondaryAction {
+        width: 100%;
+        text: Recovery.show-qr ? "Show words" : "Show as SeedQR";
+        clicked => { Recovery.show-qr = !Recovery.show-qr; }
+    }
+
+    Text {
+        text: "Write these down and keep them offline. Anyone who has them controls this seed's funds and can read its private notes.";
+        color: Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 13px;
+        wrap: word-wrap;
+    }
+
+    Rectangle { vertical-stretch: 1; }
+}

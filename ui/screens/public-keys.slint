@@ -1,0 +1,93 @@
+// Screen.public-keys — extracted verbatim from app.slint on 2026-09-01
+// (PLAN-graffito-arch.md phase 4a). The instantiation site in app.slint
+// still sets width/height to the window; everything else is the
+// original block body.
+// ------------------------------------- screen 23: PUBLIC keys
+// Watch-only exports for the active account: xpub + tr() descriptor
+// (whole account, all addresses). Safe to share.
+
+import { Theme, UISize } from "@ui/theme.slint";
+import { Screen, Callbacks, Ui, Recovery } from "../callbacks.slint";
+import { ScreenHeader, PillOption } from "../components.slint";
+
+export component PublicKeysScreen inherits VerticalLayout {
+    padding-left: 24px;
+    padding-right: 24px;
+    padding-top: 16px + UISize.control-center-status-bar-height;
+    padding-bottom: 24px;
+    spacing: 12px;
+
+    ScreenHeader {
+        title: "Public keys";
+        back => {
+            Callbacks.export-close();
+            Ui.screen = Screen.settings;
+        }
+    }
+
+    Text {
+        text: Recovery.export-title;
+        color: Theme.palette-foreground;
+        font-family: "Montserrat";
+        font-size: 16px;
+        font-weight: 600;
+    }
+
+    HorizontalLayout {
+        spacing: 6px;
+        PillOption {
+            label: "xpub";
+            selected: Recovery.export-which == 0;
+            horizontal-stretch: 1;
+            tapped => { Callbacks.export-select(0); }
+        }
+        PillOption {
+            label: "descriptor";
+            selected: Recovery.export-which == 1;
+            horizontal-stretch: 1;
+            tapped => { Callbacks.export-select(1); }
+        }
+    }
+
+    Text {
+        text: Recovery.export-label;
+        color: Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 13px;
+        font-weight: 600;
+    }
+    Rectangle {
+        background: Theme.palette-surface;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.palette-border;
+        VerticalLayout {
+            padding: 12px;
+            Text {
+                text: Recovery.export-value;
+                color: Theme.palette-foreground;
+                font-family: "SourceCodePro";
+                font-size: 13px;
+                wrap: char-wrap;
+            }
+        }
+    }
+    HorizontalLayout {
+        alignment: center;
+        Image {
+            source: Recovery.export-qr;
+            width: 176px;
+            height: 176px;
+            image-rendering: pixelated;
+        }
+    }
+    Text {
+        text: "Import into any wallet to WATCH this account — see its balance and public notes across all addresses. It cannot spend or read private notes. The descriptor also tells the wallet the script type + key origin.";
+        color: Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+
+    Rectangle { vertical-stretch: 1; }
+}

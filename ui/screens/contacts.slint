@@ -1,0 +1,158 @@
+// Screen.contacts — extracted verbatim from app.slint on 2026-09-01
+// (PLAN-graffito-arch.md phase 4a). The instantiation site in app.slint
+// still sets width/height to the window; everything else is the
+// original block body.
+// ------------------------------------ screen 7: contacts (send-to)
+// The one input slot doubles as manual address entry and, when a
+// row's "name" zone was tapped, the contact-name editor. Errors go
+// in the label above the field so the keyboard can't hide them.
+
+import { Theme, UISize } from "@ui/theme.slint";
+import { Screen, Callbacks, Ui, Contacts, Coins, Sweep } from "../callbacks.slint";
+import { SecondaryAction, ScreenHeader, PillOption, ContactEntry } from "../components.slint";
+
+export component ContactsScreen inherits VerticalLayout {
+    padding-left: 24px;
+    padding-right: 24px;
+    padding-top: 16px + UISize.control-center-status-bar-height;
+    padding-bottom: 24px;
+    spacing: 10px;
+
+    ScreenHeader {
+        vertical-stretch: 0;
+        title: Contacts.pick-mode == "sweep" ? "Sweep to" : "Send to";
+        back => {
+            if Contacts.pick-mode == "sweep" {
+                Contacts.pick-mode = "compose";
+                Ui.screen = Screen.settings;
+            } else {
+                Callbacks.refresh-home();
+                Ui.screen = Screen.home;
+            }
+        }
+    }
+
+    Text {
+        vertical-stretch: 0;
+        height: 18px;
+        text: Contacts.input-error != "" ? Contacts.input-error
+            : Contacts.pick-mode == "sweep" ? "Destination address" : "Recipient address";
+        color: Contacts.input-error != "" ? Theme.palette-danger : Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 14px;
+        overflow: elide;
+    }
+    HorizontalLayout {
+        vertical-stretch: 0;
+        height: 44px;
+        spacing: 8px;
+        Rectangle {
+            height: 44px;
+            horizontal-stretch: 1;
+            background: Theme.palette-surface;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: contact-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+            clip: true;
+            contact-input := TextInput {
+                x: 14px;
+                width: parent.width - 28px;
+                height: 24px;
+                y: (parent.height - self.height) / 2;
+                text <=> Contacts.input-text;
+                color: Theme.palette-foreground;
+                font-family: "SourceCodePro";
+                font-size: 15px;
+                single-line: true;
+                edited => { Contacts.input-error = ""; }
+                // Keyboard "Done" blurs → KeyOS hides the keyboard.
+                accepted => { self.clear-focus(); }
+            }
+            Text {
+                x: 14px;
+                height: parent.height;
+                text: Contacts.input-text == "" && contact-input.preedit-text == ""
+                    ? "Paste or type an address…" : "";
+                color: Theme.palette-muted;
+                font-family: "SourceCodePro";
+                font-size: 15px;
+                vertical-alignment: center;
+            }
+        }
+        // Fixed width so the address field gets the room.
+        PillOption {
+            width: 72px;
+            label: "Use";
+            selected: true;
+            tapped => { Callbacks.pick-contact(Contacts.input-text); }
+        }
+    }
+
+    // First and handiest option: the classic self-notebook note.
+    // Hidden in sweep mode — sweep-to-self is the Coins screen's
+    // consolidate, not a picker choice.
+    if Contacts.pick-mode != "sweep": Rectangle {
+        vertical-stretch: 0;
+        height: 56px;
+        border-radius: 12px;
+        background: self-touch.has-hover ? Theme.palette-surface : transparent;
+        border-width: 1px;
+        border-color: Theme.palette-primary;
+        self-touch := TouchArea { clicked => { Callbacks.pick-contact(""); } }
+        VerticalLayout {
+            padding: 10px;
+            spacing: 2px;
+            Text {
+                text: "To: Self";
+                color: Theme.palette-foreground;
+                font-family: "Montserrat";
+                font-size: 18px;
+                font-weight: 600;
+            }
+            Text {
+                text: "my notebook — this device's own address";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+            }
+        }
+    }
+
+    SecondaryAction {
+        vertical-stretch: 0;
+        height: 52px;
+        width: 100%;
+        text: "Scan address QR";
+        clicked => { Callbacks.scan-contact(); }
+    }
+
+    Text {
+        vertical-stretch: 0;
+        height: 16px;
+        text: Contacts.rows.length > 0 ? "Recent"
+            : "Addresses you send to appear here.";
+        color: Theme.palette-muted;
+        font-family: "Montserrat";
+        font-size: 13px;
+    }
+
+    Flickable {
+        vertical-stretch: 1;
+        viewport-height: Contacts.rows.length * 72px;
+        VerticalLayout {
+            spacing: 8px;
+            alignment: start;
+            for entry in Contacts.rows: ContactEntry {
+                entry: entry;
+                tapped => { Callbacks.pick-contact(entry.address); }
+                rename => {
+                    Contacts.naming-address = entry.address;
+                    Contacts.name-text = entry.name;
+                    Contacts.naming-label = "Name for " + entry.meta;
+                    Contacts.naming-pq-caption = entry.pq-caption;
+                    Contacts.naming-pq-error = "";
+                }
+            }
+        }
+    }
+}

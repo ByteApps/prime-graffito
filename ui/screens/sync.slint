@@ -1,0 +1,111 @@
+// Screen.sync — extracted verbatim from app.slint on 2026-09-01
+// (PLAN-graffito-arch.md phase 4a). The instantiation site in app.slint
+// still sets width/height to the window; everything else is the
+// original block body.
+// ------------------------------------------------- screen 5: sync
+
+import { Theme, UISize } from "@ui/theme.slint";
+import { Screen, Callbacks, Ui, Sync } from "../callbacks.slint";
+import { PrimaryAction, SecondaryAction, ScreenHeader } from "../components.slint";
+
+export component SyncScreen inherits VerticalLayout {
+    padding-left: 24px;
+    padding-right: 24px;
+    padding-top: 16px + UISize.control-center-status-bar-height;
+    padding-bottom: 24px;
+    spacing: 14px;
+
+    ScreenHeader {
+        title: "Sync";
+        back => { Sync.picking = false; Callbacks.refresh-home(); Ui.screen = Screen.home; }
+    }
+
+    Text {
+        text: Sync.status;
+        color: Theme.palette-foreground;
+        font-family: "SourceCodePro";
+        font-size: 15px;
+        wrap: word-wrap;
+    }
+
+    // Normal actions — hidden while the import picker is open.
+    if !Sync.picking: VerticalLayout {
+        spacing: 14px;
+        PrimaryAction {
+            width: 100%;
+            text: "Import sync bundle";
+            clicked => { Callbacks.list-bundles(); }
+        }
+        SecondaryAction {
+            width: 100%;
+            text: "Export pending txs";
+            clicked => { Callbacks.export-pending(); }
+        }
+        SecondaryAction {
+            width: 100%;
+            text: "Scan bundle 📷";
+            clicked => { Callbacks.scan-bundle(); }
+        }
+        SecondaryAction {
+            width: 100%;
+            text: "Sign external tx ✍";
+            clicked => { Callbacks.sign-psbt(); }
+        }
+    }
+
+    // Import picker: the actual files found in the inboxes, so the
+    // user chooses one (no silent auto-pick). Empty → instructions.
+    if Sync.picking: VerticalLayout {
+        spacing: 10px;
+        Text {
+            text: "Choose a bundle to import";
+            color: Theme.palette-foreground;
+            font-family: "Montserrat";
+            font-size: 16px;
+            font-weight: 600;
+        }
+        for b in Sync.bundles: SecondaryAction {
+            width: 100%;
+            text: b.label;
+            clicked => { Callbacks.pick-bundle(b.name, b.loc); }
+        }
+        if Sync.bundles.length == 0: Text {
+            text: Sync.empty-hint;
+            color: Theme.palette-muted;
+            font-family: "Montserrat";
+            font-size: 14px;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            SecondaryAction {
+                horizontal-stretch: 1;
+                text: "Refresh";
+                clicked => { Callbacks.list-bundles(); }
+            }
+            SecondaryAction {
+                horizontal-stretch: 1;
+                text: "Cancel";
+                clicked => { Sync.picking = false; }
+            }
+        }
+    }
+
+    Text {
+        text: Sync.result;
+        color: Ui.error == "" ? Theme.palette-muted : Theme.palette-danger;
+        font-family: "SourceCodePro";
+        font-size: 14px;
+        wrap: word-wrap;
+    }
+
+    Rectangle { vertical-stretch: 1; }
+
+    Text {
+        text: "Bundles: /graffito/inbox on Internal or Airlock.\nSigned txs land in /graffito/outbox.";
+        color: Theme.palette-muted;
+        font-family: "SourceCodePro";
+        font-size: 13px;
+        wrap: word-wrap;
+    }
+}

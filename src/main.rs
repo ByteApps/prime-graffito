@@ -1342,7 +1342,7 @@ fn show_confirm_screen(
         summary.outputs.len(),
         u8::from(summary.warn.is_some()),
     );
-    ui.global::<Ui>().set_screen(4);
+    ui.global::<Ui>().set_screen(Screen::ConfirmSign);
     Ok(())
 }
 
@@ -2096,7 +2096,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             refresh_coins();
             refresh_contacts();
             refresh_funding();
-            ui.global::<Ui>().set_screen(0);
+            ui.global::<Ui>().set_screen(Screen::Home);
         })
     };
 
@@ -2169,7 +2169,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 contacts_g.set_input_error("".into());
                 contacts_g.set_naming_address("".into());
                 log::info!("cb: pick-contact to={addr} extra=true");
-                ui.global::<Ui>().set_screen(3);
+                ui.global::<Ui>().set_screen(Screen::Compose);
                 return;
             }
 
@@ -2212,7 +2212,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             contacts_g.set_naming_address("".into());
             if sweep_mode {
                 update_sweep();
-                ui.global::<Ui>().set_screen(10);
+                ui.global::<Ui>().set_screen(Screen::Sweep);
             } else {
                 // Fresh compose: reset the funding/change picks to their
                 // default rule (spending only when enabled AND funded).
@@ -2228,7 +2228,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 refresh_funding();
                 refresh_change();
                 ui.global::<Callbacks>().invoke_compose_changed();
-                ui.global::<Ui>().set_screen(3);
+                ui.global::<Ui>().set_screen(Screen::Compose);
             }
         }
     };
@@ -2248,7 +2248,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             ui.global::<Contacts>().set_picking_extra(true);
             ui.global::<Contacts>().set_pick_mode("compose".into());
             ui.global::<Callbacks>().invoke_refresh_contacts();
-            ui.global::<Ui>().set_screen(7);
+            ui.global::<Ui>().set_screen(Screen::Contacts);
         });
     }
 
@@ -2876,7 +2876,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             sweep.set_tier(1);
             log::info!("cb: sweep-open kind=consolidate to=self");
             update_sweep();
-            ui.global::<Ui>().set_screen(10);
+            ui.global::<Ui>().set_screen(Screen::Sweep);
         });
     }
 
@@ -4524,7 +4524,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         } else {
                             sp.set_has_qr(false);
                         }
-                        sp.set_back_screen(0);
+                        sp.set_back_screen(Screen::Home);
 
                         // Reset the sweep flow so nothing leaks into the next run.
                         let sweep = ui.global::<Sweep>();
@@ -4537,7 +4537,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
                         ui.global::<Ui>().set_busy(false);
                         refresh_home();
-                        ui.global::<Ui>().set_screen(8);
+                        ui.global::<Ui>().set_screen(Screen::Signed);
                     });
                 }
                 "psbt" => {
@@ -4546,7 +4546,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     let Some(id) = id_guard.as_ref() else {
                         drop(id_guard);
                         ui.global::<Sync>().set_result("Device locked — no signing key.".into());
-                        ui.global::<Ui>().set_screen(5);
+                        ui.global::<Ui>().set_screen(Screen::Sync);
                         return;
                     };
                     let output_x = id.output_x;
@@ -4564,7 +4564,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 Err(e) => {
                                     ui.global::<Ui>().set_busy(false);
                                     ui.global::<Sync>().set_result(format!("Sign failed: {e}").into());
-                                    ui.global::<Ui>().set_screen(5);
+                                    ui.global::<Ui>().set_screen(Screen::Sync);
                                     return;
                                 }
                             };
@@ -4589,7 +4589,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         }
                         ui.global::<Ui>().set_error("".into());
                         ui.global::<Ui>().set_busy(false);
-                        ui.global::<Ui>().set_screen(8);
+                        ui.global::<Ui>().set_screen(Screen::Signed);
                     });
                 }
                 _ => {
@@ -4795,7 +4795,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         ui.global::<ChangePick>().set_custom_address("".into());
                         ui.global::<Ui>().set_busy(false);
                         refresh_notes();
-                        ui.global::<Ui>().set_screen(2);
+                        ui.global::<Ui>().set_screen(Screen::Note);
                     });
                 }
             }
@@ -4827,9 +4827,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             cs.set_warn("".into());
             cs.set_kind("".into());
             let back = match kind.as_str() {
-                "sweep" | "consolidate" => 10,
-                "psbt" => 5,
-                _ => 3,
+                "sweep" | "consolidate" => Screen::Sweep,
+                "psbt" => Screen::Sync,
+                _ => Screen::Compose,
             };
             ui.global::<Ui>().set_screen(back);
         });
@@ -5013,7 +5013,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 n.from.as_deref().map(|f| format!(" from={f}")).unwrap_or_default(),
                 view.get_has_qr()
             );
-            ui.global::<Ui>().set_screen(2);
+            ui.global::<Ui>().set_screen(Screen::Note);
         });
     }
 
@@ -6201,7 +6201,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 save_state(&fs, &state.borrow());
             }
             refresh_notebooks();
-            ui.global::<Ui>().set_screen(20);
+            ui.global::<Ui>().set_screen(Screen::Notebooks);
         });
     }
 
@@ -6564,7 +6564,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // repaints the list with them.
     ui.global::<Recovery>().set_seed_text(format!("{}", *seed_idx.borrow()).into());
     ui.global::<Recovery>().set_account_text(format!("{}", *bip_account.borrow()).into());
-    ui.global::<Ui>().set_screen(20);
+    ui.global::<Ui>().set_screen(Screen::Notebooks);
 
     let boot_seed = {
         let ui_weak = ui_weak.clone();

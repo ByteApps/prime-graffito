@@ -1,25 +1,56 @@
-// Globals shared between Rust and the UI. Screen map:
-// 0 = home, 1 = notes list, 2 = note view, 3 = compose, 4 = confirm-sign,
-// 5 = sync (actions: import/export), 6 = settings (network, chunk size),
-// 7 = contacts (send-to picker: self / recents / scan / manual entry),
-// 8 = signed external PSBT, 9 = coins (viewer-first UTXO list),
-// 10 = sweep/consolidate (compose-like, shared via Sweep.kind),
-// 20 = notebook list (the MAIN screen — boot lands here; a notebook =
-//      an indexed identity, tapping a row opens its home = screen 0),
-// 21 = accounts (wallet-context switcher), 22 = recovery words reveal,
-// 23 = public-keys export, 24 = private-keys export (see Recovery below),
-// 25 = Pay-from (funding-unification: notebook / spending-wallet coin
-//      picker, reached from a compose nav row), 26 = Change (destination
-//      picker for the compose in progress), 27 = Quantum keys (post-
-//      quantum ML-KEM level picker + this notebook's public key QR, see
-//      QuantumKeys below), 28 = My quantum key — a single, NON-seed-
-//      derived personal ML-KEM keypair (generate/import, fingerprint,
-//      export QRs, replace/delete; see DeviceQuantumKey below). Distinct
-//      from 27: that screen's keys are seed-derived (one per notebook);
-//      this screen's key has no seed ancestry at all.
+// Globals shared between Rust and the UI.
+
+/// Every screen AppWindow can show — ONE name per `if Ui.screen == …`
+/// block in app.slint, and the value `Ui.screen` / `SignPsbt.back-screen`
+/// carry. Slint exports it to Rust as `Screen::<PascalCase>` (`home` ->
+/// `Screen::Home`, `recovery-words` -> `Screen::RecoveryWords`).
+///
+/// Named 2026-09-01 (PLAN-graffito-arch.md phase 4a) from the integers the
+/// app dispatched on until then — kept here so old prose/log references
+/// still resolve:
+///   0 home            a notebook's home (address QR, Notes/Compose/Sync)
+///   1 notes           the notes list           2 note      note view
+///   3 compose         compose                  4 confirm-sign  confirm & sign
+///   5 sync            sync (import/export)     6 settings  settings root
+///   7 contacts        send-to / sweep-to picker (self / recents / scan / manual)
+///   8 signed          signed external PSBT     9 coins     viewer-first UTXO list
+///  10 sweep           sweep/consolidate (compose-like, shared via Sweep.kind)
+///  20 notebooks       the notebook LIST — the MAIN screen, boot lands here;
+///                     a notebook = an indexed identity, a row opens its home
+///  21 accounts        wallet-context switcher  22 recovery-words  recovery words reveal
+///  23 public-keys     public-keys export       24 private-keys    private-keys export
+///  25 pay-from        Pay-from (funding-unification coin picker, from a compose nav row)
+///  26 change          Change destination picker for the compose in progress
+///  27 quantum-keys    post-quantum ML-KEM level picker + this notebook's public
+///                     key QR — keys are SEED-DERIVED, one per notebook (see QuantumKeys)
+///  28 device-quantum-key  "My quantum key": a single NON-seed-derived personal
+///                     ML-KEM keypair (generate/import/fingerprint/export/replace/
+///                     delete; see DeviceQuantumKey). No seed ancestry at all.
+export enum Screen {
+    home,
+    notes,
+    note,
+    compose,
+    confirm-sign,
+    sync,
+    settings,
+    contacts,
+    signed,
+    coins,
+    sweep,
+    notebooks,
+    accounts,
+    recovery-words,
+    public-keys,
+    private-keys,
+    pay-from,
+    change,
+    quantum-keys,
+    device-quantum-key,
+}
 
 export global Ui {
-    in-out property <int> screen: 0;
+    in-out property <Screen> screen: Screen.home;
     in-out property <bool> busy: false;
     in-out property <string> error: "";
 }
@@ -287,9 +318,9 @@ export global SignPsbt {
     in-out property <string> summary: "";
     in-out property <image> qr;
     in-out property <bool> has-qr: false;
-    // Where Back returns to: 5 (sync) for external PSBTs, 0 (home) after a
+    // Where Back returns to: sync for external PSBTs, home after a
     // sweep/consolidate — money flows return home.
-    in-out property <int> back-screen: 5;
+    in-out property <Screen> back-screen: Screen.sync;
 }
 
 export struct CoinRow {
