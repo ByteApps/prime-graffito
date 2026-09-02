@@ -3293,6 +3293,1554 @@ impl App {
     }
 }
 
+// ---- UI callbacks (cluster e): one method per slint callback; app_main
+// keeps a one-line forwarder each. Bodies are the closure bodies verbatim.
+impl App {
+    /// Compose's "+ Add recipient" row — opens the contacts picker in
+    /// append mode (Contacts.picking-extra), modeled on how the home
+    /// screen's "Compose note" button opens it in replace mode.
+    fn on_add_recipient_open(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        ui.global::<Contacts>().set_picking_extra(true);
+        ui.global::<Contacts>().set_pick_mode("compose".into());
+        self.refresh_contacts(ui_weak);
+        ui.global::<Ui>().set_screen(Screen::Contacts);
+    }
+
+    /// Drop an address from Compose.to-extra — no navigation.
+    fn on_remove_recipient(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, addr: SharedString) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let compose = ui.global::<Compose>();
+        let kept: Vec<ToRow> =
+            compose.get_to_extra().iter().filter(|r| r.address != addr).collect();
+        compose.set_to_extra(Rc::new(VecModel::from(kept)).into());
+        log::info!("cb: remove-recipient addr={addr}");
+    }
+
+    fn on_scan_contact(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let opts = ScanQrOptions {
+            header_title: "Scan recipient address".into(),
+            message: "Point at an address QR (a companion page or another Prime's home screen)"
+                .into(),
+            ..ScanQrOptions::default()
+        };
+        let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
+            Ok(Some(ScanQrResult::Qr { data, .. })) | Ok(Some(ScanQrResult::Ur2 { data, .. })) => data,
+            Ok(_) => {
+                log::info!("cb: scan-contact cancelled");
+                return;
+            }
+            Err(e) => {
+                log::warn!("cb: scan-contact err=scanner {e:?}");
+                ui.global::<Contacts>()
+                    .set_input_error(format!("QR scanner unavailable: {e:?}").into());
+                return;
+            }
+        };
+        // Address QRs are plain text, possibly a BIP21 URI, and
+        // legitimately ALL-UPPERCASE (our own home QR is) — normalize.
+        let text = String::from_utf8(data).unwrap_or_default();
+        let mut addr = text.trim();
+        if addr.len() >= 8 && addr[..8].eq_ignore_ascii_case("bitcoin:") {
+            addr = &addr[8..];
+        }
+        let addr = addr.split('?').next().unwrap_or("").trim().to_string();
+        let st = state.borrow();
+        let network = st.network();
+        let network_name = st.network.clone();
+        drop(st);
+        let resolved = if Recipient::parse(network, &addr).is_ok() {
+            Some(addr.clone())
+        } else {
+            let lower = addr.to_lowercase();
+            Recipient::parse(network, &lower).is_ok().then_some(lower)
+        };
+        match resolved {
+            Some(a) => {
+                log::info!("cb: scan-contact ok addr={a}");
+                self.pick_contact(&ui_weak, &fs, &a);
+            }
+            None => {
+                log::warn!("cb: scan-contact err=not an address");
+                ui.global::<Contacts>().set_input_error(
+                    format!("QR didn't contain a valid {network_name} address.").into(),
+                );
+            }
+        }
+    }
+
+    /// Quantum key scan (naming modal "Scan quantum key"): armored
+    /// ML-KEM public key only — `pq::import_public` rejects anything else
+    /// with a clear message (a private-key armor, a note, an address QR).
+    /// Scoped to `Contacts.naming-address` (set when the modal opened), so
+    /// scanning does NOT require re-saving the name field.
+    fn on_scan_contact_pq(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let contacts_g = ui.global::<Contacts>();
+        let addr = contacts_g.get_naming_address().to_string();
+        if addr.is_empty() {
+            return;
+        }
+        let opts = ScanQrOptions {
+            header_title: "Scan quantum key".into(),
+            message: "Point at a contact's ML-KEM public-key QR (their Settings → \
+                      \"Quantum keys…\" screen)."
+                .into(),
+            ..ScanQrOptions::default()
+        };
+        let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
+            Ok(Some(ScanQrResult::Qr { data, .. })) | Ok(Some(ScanQrResult::Ur2 { data, .. })) => {
+                data
+            }
+            Ok(_) => {
+                log::info!("cb: contact-pq-key cancelled");
+                return;
+            }
+            Err(e) => {
+                log::warn!("cb: contact-pq-key err=scanner {e:?}");
+                contacts_g.set_naming_pq_error(format!("QR scanner unavailable: {e:?}").into());
+                return;
+            }
+        };
+        let armor = String::from_utf8(data).unwrap_or_default();
+        match pq::import_public(&armor) {
+            Ok((alg, ek)) => {
+                let fp = pq::fingerprint(alg, &ek);
+                let mut st = state.borrow_mut();
+                if let Some(c) = st.contacts.iter_mut().find(|c| c.address == addr) {
+                    c.mlkem_ek = Some(armor);
+                }
+                save_state(&fs, &st);
+                drop(st);
+                log::info!("cb: contact-pq-key ok fp={fp}");
+                contacts_g
+                    .set_naming_pq_caption(format!("{} · {fp}", mlkem_alg_name(alg)).into());
+                contacts_g.set_naming_pq_error("".into());
+                self.refresh_contacts(&ui_weak);
+            }
+            Err(e) => {
+                log::warn!("cb: contact-pq-key err={e}");
+                contacts_g.set_naming_pq_error(format!("Not a quantum public key: {e}").into());
+            }
+        }
+    }
+
+    /// hasn't been touched (`quantum_nb == None`): the ACTIVE notebook when
+    /// one is open, else the wallet context's first visible notebook — the
+    /// screen's original single-notebook behavior, preserved as the
+    /// default. Public-key only: device backup is the 24 recovery words,
+    /// which already reconstruct every notebook's key.
+    fn on_open_quantum_keys(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        // Reopening the screen resets to the active-or-first default
+        // rather than remembering the last-picked notebook from a
+        // previous visit.
+        self.quantum_nb = None;
+        self.refresh_quantum_keys(&ui_weak);
+    }
+
+    fn on_quantum_key_level(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, level_idx: i32) {
+        let Some(_ui) = ui_weak.upgrade() else { return };
+        let alg = match level_idx {
+            0 => pq::MlKemAlg::MlKem512,
+            2 => pq::MlKemAlg::MlKem1024,
+            _ => pq::MlKemAlg::MlKem768,
+        };
+        self.mlkem_level = alg.id();
+        self.persist_config(&fs);
+        log::info!("cb: pq-key level={}", mlkem_alg_name(alg));
+        self.refresh_quantum_keys(&ui_weak);
+    }
+
+    fn on_quantum_key_pick_notebook(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, index: i32) {
+        self.quantum_nb = Some(index as u32);
+        log::info!("cb: pq-key notebook={index}");
+        self.refresh_quantum_keys(&ui_weak);
+    }
+
+    /// uninstall — it is what makes the self-note ML-KEM compose pill
+    /// (compose-changed, earlier) meaningful at all (pq.rs's module doc:
+    /// encapsulating to a seed-derived receive key on a self-note is
+    /// security theater, since that key shares the enc key's root).
+    /// ---------------------------------------------------------------------
+    fn on_open_device_quantum_key(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let dq = ui.global::<DeviceQuantumKey>();
+        // Reopening always starts at the summary/generate-or-import
+        // state, never wherever the last visit left off.
+        dq.set_view("".into());
+        dq.set_gen_level(1);
+        dq.set_gen_level_caption(mlkem_alg_describe(pq::MlKemAlg::MlKem768).into());
+        dq.set_gen_extra_text("".into());
+        dq.set_gen_error("".into());
+        dq.set_import_error("".into());
+        dq.set_qr_zoom(false);
+        dq.set_show_replace_confirm(false);
+        dq.set_show_delete_confirm(false);
+        self.refresh_device_quantum_key(&ui_weak, &fs);
+    }
+
+    fn on_device_quantum_key_close(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let dq = ui.global::<DeviceQuantumKey>();
+        // Wipe the sensitive private-key view (armor + QR) on the way
+        // out — never lingers in a UI prop after the screen closes,
+        // same hygiene as reveal-close/export-close.
+        dq.set_private_armor("".into());
+        dq.set_private_qr(Image::default());
+        dq.set_view("".into());
+        dq.set_qr_zoom(false);
+    }
+
+    fn on_device_quantum_key_gen_level(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, level_idx: i32) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let dq = ui.global::<DeviceQuantumKey>();
+        let alg = match level_idx {
+            0 => pq::MlKemAlg::MlKem512,
+            2 => pq::MlKemAlg::MlKem1024,
+            _ => pq::MlKemAlg::MlKem768,
+        };
+        dq.set_gen_level(level_idx);
+        dq.set_gen_level_caption(mlkem_alg_describe(alg).into());
+    }
+
+    fn on_device_quantum_key_generate(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let dq = ui.global::<DeviceQuantumKey>();
+        let alg = match dq.get_gen_level() {
+            0 => pq::MlKemAlg::MlKem512,
+            2 => pq::MlKemAlg::MlKem1024,
+            _ => pq::MlKemAlg::MlKem768,
+        };
+        let extra = dq.get_gen_extra_text().to_string();
+        let result = pq::MlKemKeypair::generate_with_extra(alg, extra.as_bytes())
+            .map_err(|e| e.to_string())
+            .and_then(|kp| save_device_quantum_key(&fs, kp.alg(), kp.seed()).map(|_| kp));
+        match result {
+            Ok(kp) => {
+                self.device_pq_key = Some(Some(kp));
+                dq.set_gen_error("".into());
+                dq.set_gen_extra_text("".into());
+                log::info!("cb: quantum-key generate level={} ok", mlkem_alg_name(alg));
+                self.refresh_device_quantum_key(&ui_weak, &fs);
+            }
+            Err(e) => {
+                log::warn!("cb: quantum-key generate level={} err={e}", mlkem_alg_name(alg));
+                dq.set_gen_error(format!("Couldn't generate a key: {e}").into());
+            }
+        }
+    }
+
+    fn on_device_quantum_key_import(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let dq = ui.global::<DeviceQuantumKey>();
+        let opts = ScanQrOptions {
+            header_title: "Import quantum key".into(),
+            message: "Point at an armored GRAFFITO ML-KEM PRIVATE KEY QR — from a backup, \
+                      this device's own export, or the graffito Mac app."
+                .into(),
+            ..ScanQrOptions::default()
+        };
+        let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
+            Ok(Some(ScanQrResult::Qr { data, .. })) | Ok(Some(ScanQrResult::Ur2 { data, .. })) => {
+                data
+            }
+            Ok(_) => {
+                log::info!("cb: quantum-key import cancelled");
+                return;
+            }
+            Err(e) => {
+                log::warn!("cb: quantum-key import err=scanner {e:?}");
+                dq.set_import_error(format!("QR scanner unavailable: {e:?}").into());
+                return;
+            }
+        };
+        let armor = String::from_utf8(data).unwrap_or_default();
+        match pq::import_private(&armor) {
+            Ok((alg, seed)) => match save_device_quantum_key(&fs, alg, &seed) {
+                Ok(()) => {
+                    self.device_pq_key =
+                        Some(Some(pq::MlKemKeypair::from_seed(alg, &seed)));
+                    dq.set_import_error("".into());
+                    log::info!("cb: quantum-key import ok");
+                    self.refresh_device_quantum_key(&ui_weak, &fs);
+                }
+                Err(e) => {
+                    log::warn!("cb: quantum-key import err={e}");
+                    dq.set_import_error(format!("Couldn't save the key: {e}").into());
+                }
+            },
+            Err(e) => {
+                // A clearer message for the common mix-up: scanning a
+                // PUBLIC key armor (this screen's own "Share public
+                // key" QR, or a contact's) instead of a private one.
+                let msg = if pq::import_public(&armor).is_ok() {
+                    "That's a PUBLIC quantum key — this needs the PRIVATE key armor \
+                     instead (\"Export private key…\" on the device that holds it)."
+                        .to_string()
+                } else {
+                    format!("Not a private quantum key: {e}")
+                };
+                log::warn!("cb: quantum-key import err={e}");
+                dq.set_import_error(msg.into());
+            }
+        }
+    }
+
+    fn on_device_quantum_key_reveal_private(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let dq = ui.global::<DeviceQuantumKey>();
+        let device_kp = self.device_quantum_key(fs);
+        let Some(kp) = device_kp else {
+            // Shouldn't be reachable (the button only shows when
+            // has-key is true) — fail safe back to the summary view.
+            dq.set_view("".into());
+            return;
+        };
+        let armor = pq::export_private(kp.alg(), kp.seed());
+        dq.set_private_armor(armor.clone().into());
+        if qr_fits(&armor) {
+            dq.set_private_fits_qr(true);
+            dq.set_private_qr(qr_image(&armor));
+        } else {
+            // Never reachable in practice — a private armor is always
+            // a fixed 66-byte payload regardless of level — but this
+            // is the same size guard `qr_image` needs everywhere else
+            // (it panics past capacity), so it stays generic rather
+            // than assuming the current sizes forever.
+            dq.set_private_fits_qr(false);
+            dq.set_private_qr(Image::default());
+        }
+        dq.set_view("private".into());
+        log::info!("cb: quantum-key export-private ok fp={}", kp.fingerprint());
+    }
+
+    fn on_device_quantum_key_hide_private(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let dq = ui.global::<DeviceQuantumKey>();
+        dq.set_private_armor("".into());
+        dq.set_private_qr(Image::default());
+        dq.set_view("".into());
+        dq.set_qr_zoom(false);
+    }
+
+    fn on_device_quantum_key_replace_confirm(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let dq = ui.global::<DeviceQuantumKey>();
+        // "Replace…" = delete the current key, then land back on the
+        // generate/import state — the confirm dialog is what named the
+        // consequence (notes sealed to it become unreadable) before
+        // this ran.
+        if let Err(e) = delete_device_quantum_key(fs) {
+            log::warn!("cb: quantum-key replace err={e}");
+        }
+        self.device_pq_key = Some(None);
+        dq.set_show_replace_confirm(false);
+        dq.set_view("".into());
+        dq.set_private_armor("".into());
+        dq.set_private_qr(Image::default());
+        dq.set_gen_level(1);
+        dq.set_gen_level_caption(mlkem_alg_describe(pq::MlKemAlg::MlKem768).into());
+        dq.set_gen_extra_text("".into());
+        log::info!("cb: quantum-key replace ok");
+        self.refresh_device_quantum_key(&ui_weak, &fs);
+    }
+
+    fn on_device_quantum_key_delete_confirm(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let dq = ui.global::<DeviceQuantumKey>();
+        if let Err(e) = delete_device_quantum_key(fs) {
+            log::warn!("cb: quantum-key delete err={e}");
+        }
+        self.device_pq_key = Some(None);
+        dq.set_show_delete_confirm(false);
+        dq.set_view("".into());
+        dq.set_private_armor("".into());
+        dq.set_private_qr(Image::default());
+        log::info!("cb: quantum-key delete ok");
+        self.refresh_device_quantum_key(&ui_weak, &fs);
+    }
+
+    fn on_device_quantum_key_qr_zoom(&self, open: bool) {
+        log::info!("cb: quantum-key qr-zoom={}", if open { "open" } else { "closed" });
+    }
+
+    fn on_save_contact_name(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let contacts_g = ui.global::<Contacts>();
+        let addr = contacts_g.get_naming_address().to_string();
+        if addr.is_empty() {
+            return;
+        }
+        let name = contacts_g.get_name_text().trim().to_string();
+        let mut st = state.borrow_mut();
+        // Naming does NOT bump recency — only use does, so the row
+        // being edited never jumps mid-interaction.
+        if let Some(c) = st.contacts.iter_mut().find(|c| c.address == addr) {
+            c.name = name.clone();
+        }
+        save_state(&fs, &st);
+        drop(st);
+        log::info!("cb: save-contact addr={addr} name-len={}", name.len());
+        contacts_g.set_naming_address("".into());
+        contacts_g.set_name_text("".into());
+        self.refresh_contacts(&ui_weak);
+    }
+
+    /// Coins → the shared sweep screen with kind=consolidate, dest=self.
+    fn on_consolidate_open(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let sweep = ui.global::<Sweep>();
+        sweep.set_kind("consolidate".into());
+        sweep.set_dest("".into());
+        sweep.set_dest_label("to: self — one consolidated coin".into());
+        sweep.set_tier(1);
+        log::info!("cb: sweep-open kind=consolidate to=self");
+        self.update_sweep(&ui_weak, &fs);
+        ui.global::<Ui>().set_screen(Screen::Sweep);
+    }
+
+    /// Spending wallet: Settings toggle.
+    fn on_set_spending_enabled(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, on: bool) {
+        let notebooks = self.notebooks.clone();
+        let mut ix = notebooks.borrow_mut();
+        let ctx = notebook_ctx(&ix, self.active)
+            .unwrap_or((self.seed_idx, self.bip_account));
+        let net_s = self.net.clone();
+        ix.spending_mut(&net_s, ctx.0, ctx.1).enabled = on;
+        save_notebooks(&fs, &ix);
+        drop(ix);
+        log::info!("cb: set-spending enabled={on}");
+        self.refresh_funding(&ui_weak);
+    }
+
+    /// Pay-from screen (25): notebook / spending-wallet per-coin selection.
+    fn on_funding_open(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        log::info!("cb: funding-open");
+        self.refresh_funding(&ui_weak);
+    }
+
+    /// Pay-from screen (25): notebook / spending-wallet per-coin selection.
+    fn on_funding_toggle_coin(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, key: SharedString) {
+        let Some(_ui) = ui_weak.upgrade() else { return };
+        if let Some((spending_src, txid, vout)) = parse_funding_key(key.as_str()) {
+            self.funding_pick.toggle(spending_src, txid, vout);
+        }
+        self.refresh_funding(&ui_weak);
+        self.refresh_change(&ui_weak);
+        self.compose_changed(ui_weak, fs);
+    }
+
+    fn on_funding_done(&self) {
+        let pick = self.funding_pick.clone();
+        log::info!(
+            "cb: pay-from {} coins={}",
+            pick.mode_label(),
+            pick.notebook.len() + pick.spending.len()
+        );
+    }
+
+    /// Change screen (26): compose destination for change.
+    fn on_change_open(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        self.refresh_change(&ui_weak);
+    }
+
+    /// Change screen (26): compose destination for change.
+    fn on_change_pick(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, choice: SharedString) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        self.change_pick.choice = choice.to_string();
+        ui.global::<ChangePick>().set_choice(choice.clone());
+        ui.global::<ChangePick>().set_custom_error("".into());
+        log::info!("cb: change-pick {choice}");
+        self.refresh_change(&ui_weak);
+        self.compose_changed(ui_weak, fs);
+    }
+
+    fn on_change_address_changed(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        self.change_pick.custom_address =
+            ui.global::<ChangePick>().get_custom_address().to_string();
+        ui.global::<ChangePick>().set_custom_error("".into());
+        self.compose_changed(ui_weak, fs);
+    }
+
+    fn on_change_done(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(_ui) = ui_weak.upgrade() else { return };
+        self.compose_changed(ui_weak, fs);
+    }
+
+    /// Post-quantum Security section: a typed edit un-certifies the
+    /// passphrase (compose-changed recomputes `pq-passphrase-verified`
+    /// from `pq_generated` vs. the current text) — this callback is just
+    /// the "recompute now" trigger `edited` fires, same shape as every
+    /// other compose field's `edited => { Callbacks.compose-changed(); }`.
+    fn on_pq_passphrase_changed(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(_ui) = ui_weak.upgrade() else { return };
+        self.compose_changed(ui_weak, fs);
+    }
+
+    fn on_pq_generate_passphrase(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        match passphrase::generate() {
+            Ok(phrase) => {
+                ui.global::<Compose>().set_pq_passphrase_text(phrase.clone().into());
+                self.pq_generated = Some(phrase);
+                log::info!("cb: pq-generate bits={:.0}", passphrase::GENERATED_BITS);
+                self.compose_changed(ui_weak, fs);
+            }
+            Err(e) => {
+                log::warn!("cb: pq-generate err={e}");
+            }
+        }
+    }
+
+    /// Back from the universal Confirm & sign screen (4): discard whatever
+    /// was staged (Plan/SweepPlan/the stashed Psbt) and clear the shown
+    /// rows, then return to the kind's origin screen.
+    fn on_confirm_cancel(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let kind = ui.global::<ConfirmSign>().get_kind().to_string();
+        log::info!("cb: confirm cancel kind={kind}");
+        self.plan = None;
+        self.sweep_plan = None;
+        self.psbt_pending = None;
+        let cs = ui.global::<ConfirmSign>();
+        cs.set_inputs(Rc::new(VecModel::from(Vec::<ConfirmRow>::new())).into());
+        cs.set_outputs(Rc::new(VecModel::from(Vec::<ConfirmRow>::new())).into());
+        cs.set_context("".into());
+        cs.set_txid("".into());
+        cs.set_note("".into());
+        cs.set_fee_line("".into());
+        cs.set_warn("".into());
+        cs.set_kind("".into());
+        let back = match kind.as_str() {
+            "sweep" | "consolidate" => Screen::Sweep,
+            "psbt" => Screen::Sync,
+            _ => Screen::Compose,
+        };
+        ui.global::<Ui>().set_screen(back);
+    }
+
+    fn on_open_note(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, id: SharedString) {
+        let state = self.state.clone();
+        let identity = self.identity.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let st = state.borrow();
+        let Some(n) = st.notes.iter().find(|n| n.id == id.as_str()) else { return };
+        let view = ui.global::<View>();
+        view.set_id(n.id.clone().into());
+        view.set_text(n.text.clone().into());
+        view.set_badge(if n.private { "PRIVATE" } else { "PUBLIC" }.into());
+        let where_line = match n.height {
+            Some(h) => format!("confirmed at block {h}"),
+            None => "pending — scan the tx QR with the companion to broadcast".to_string(),
+        };
+        let who_line = if n.recipients.len() > 1 {
+            let mut line = format!("\nto ({}): {}", n.recipients.len(), n.recipients[0]);
+            for addr in &n.recipients[1..] {
+                line.push_str(&format!("\n    {addr}"));
+            }
+            line
+        } else {
+            match (&n.from, &n.to) {
+                (Some(from), _) => format!("\nfrom: {from}"),
+                (None, Some(to)) => format!("\nto: {to}"),
+                _ => String::new(),
+            }
+        };
+        view.set_meta(format!("{where_line}{who_line}\ntxid: {}", n.txid).into());
+        set_view_qr(&view, n);
+        view.set_show_qr(false);
+
+        // Post-quantum lock state (pq.rs) — mirrors the Mac app's
+        // `refresh_note_unlock_ui`: an own (sent) DIRECTED note
+        // carrying FLAG_MLKEM can NEVER be re-opened (the ct was
+        // encapsulated to the RECIPIENT only — checked first,
+        // unconditionally, even if FLAG_PW is also set); a
+        // received/unlockable note with FLAG_PW gets the password
+        // field; anything else locked (a received ML-KEM-only note
+        // this device somehow couldn't auto-decrypt at scan time)
+        // gets an explanatory caption only.
+        //
+        // Self-notes have no sender OR recipient, so `n.from.is_none()`
+        // alone can't disambiguate a self-locked body from an own
+        // directed-sent one the way it used to — `is_self_locked`
+        // (`LockedBody::is_self`) does. A self body sealed under
+        // FLAG_MLKEM (PLAN-graffito-quantum-key.md) is now tried
+        // against this device's own personal quantum key, if one is
+        // stored: KEM-only unlocks automatically (view-only — nothing
+        // persisted, matching every other self-pq unlock); KEM+FLAG_PW
+        // still needs the typed password too, so it falls through to
+        // the normal password field with the stored key supplied
+        // alongside it at Unlock (`on_unlock_note`). No device key, or
+        // a present key that doesn't decrypt (e.g. after a Replace),
+        // falls back to an honest caption — never the directed
+        // "sealed to the recipient's key" message (there IS no
+        // recipient).
+        let locked = n.locked.is_some();
+        let is_self_locked = n.locked.as_ref().map(pq::LockedBody::is_self).unwrap_or(false);
+        let sender_cannot_reopen = locked
+            && !is_self_locked
+            && n.from.is_none()
+            && n.pq_flags & notes_core::envelope::FLAG_MLKEM != 0;
+        let self_kem_locked =
+            locked && is_self_locked && n.pq_flags & notes_core::envelope::FLAG_MLKEM != 0;
+        let self_kem_also_pw =
+            self_kem_locked && n.pq_flags & notes_core::envelope::FLAG_PW != 0;
+        let mut kem_auto_text: Option<String> = None;
+        let mut kem_key_present = false;
+        let mut kem_key_wrong = false;
+        if self_kem_locked {
+            // Bound first: an `if let` scrutinee's RefMut would live
+            // through the whole block.
+            let device_kp = self.device_quantum_key(fs);
+            if let Some(kp) = device_kp {
+                kem_key_present = true;
+                if !self_kem_also_pw {
+                    if let (Some(locked_body), Some(ident)) =
+                        (n.locked.as_ref(), identity.borrow().as_ref())
+                    {
+                        match pq::unlock_self(
+                            locked_body,
+                            &ident.enc_key,
+                            Some(&kp.secret()),
+                            None,
+                        ) {
+                            Ok(bytes) => {
+                                // Log-contract line for the UI suite
+                                // (graffito-selfpq.sh): the auto-unlock
+                                // is otherwise invisible to log greps.
+                                log::info!("cb: unlock-note auto=kem ok");
+                                kem_auto_text = Some(String::from_utf8_lossy(&bytes).to_string())
+                            }
+                            Err(_) => {
+                                log::warn!("cb: unlock-note auto=kem err=mismatch");
+                                kem_key_wrong = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let needs_password = (locked
+            && !sender_cannot_reopen
+            && !self_kem_locked
+            && n.pq_flags & notes_core::envelope::FLAG_PW != 0)
+            || (self_kem_also_pw && kem_key_present);
+        view.set_locked(locked && kem_auto_text.is_none());
+        view.set_needs_password(needs_password);
+        view.set_lock_caption(
+            if sender_cannot_reopen {
+                "Can't re-read this note — it's sealed to the recipient's key."
+            } else if self_kem_locked && (kem_auto_text.is_some() || needs_password) {
+                ""
+            } else if self_kem_locked && kem_key_wrong {
+                "This note's quantum key doesn't match the one stored on this device."
+            } else if self_kem_locked {
+                "Locked with a quantum key this device doesn't hold."
+            } else if locked && !needs_password {
+                "Sealed to a quantum key this device doesn't hold."
+            } else {
+                ""
+            }
+            .into(),
+        );
+        if let Some(text) = &kem_auto_text {
+            view.set_text(text.clone().into());
+        }
+        view.set_unlock_password("".into());
+        view.set_unlock_error("".into());
+
+        // Reply / Reply-all: a small local equivalent of notes-core's
+        // `bundle::reply_set` operating on the persisted `NoteRec`
+        // (plain display/UX logic, not a notes-core FROZEN invariant —
+        // deliberately not routed through notes-core, which only has
+        // the heavier `RecoveredNote` shape). `full_set` = {from} ∪
+        // recipients minus my own address, deduped, sender-first.
+        let my_address = identity.borrow().as_ref().map(|id| id.address(st.network()));
+        let mut full_set: Vec<String> = Vec::new();
+        let mut push_addr = |addr: &str, out: &mut Vec<String>| {
+            if Some(addr) != my_address.as_deref() && !out.iter().any(|a| a == addr) {
+                out.push(addr.to_string());
+            }
+        };
+        if let Some(from) = &n.from {
+            push_addr(from, &mut full_set);
+        }
+        if !n.recipients.is_empty() {
+            for r in &n.recipients {
+                push_addr(r, &mut full_set);
+            }
+        } else if let Some(to) = &n.to {
+            push_addr(to, &mut full_set);
+        }
+        // Received note: Reply is ALWAYS addressed to the sender,
+        // regardless of full_set's size. Own note: Reply is addressed
+        // to the sole other party only when there is exactly one — 2+
+        // hides Reply in favor of Reply-all (never both for an own
+        // note). A pure self-note (full_set empty) shows neither.
+        let reply_address = if let Some(from) = &n.from {
+            from.clone()
+        } else if full_set.len() == 1 {
+            full_set[0].clone()
+        } else {
+            String::new()
+        };
+        view.set_reply_address(reply_address.into());
+        let full_set_shared: Vec<SharedString> =
+            full_set.iter().map(SharedString::from).collect();
+        view.set_reply_set(Rc::new(VecModel::from(full_set_shared)).into());
+
+        log::info!(
+            "cb: open-note id={} status={}{} qr={}",
+            n.id,
+            n.status,
+            n.from.as_deref().map(|f| format!(" from={f}")).unwrap_or_default(),
+            view.get_has_qr()
+        );
+        ui.global::<Ui>().set_screen(Screen::Note);
+    }
+
+    /// notebook alongside the typed password (covers a combined
+    /// FLAG_MLKEM|FLAG_PW note, which `extract_notes_pq` never auto-tries);
+    /// an own (sent) DIRECTED note goes through `unlock_sent` instead —
+    /// already filtered to FLAG_PW-alone by `on_open_note`'s
+    /// `needs_password` gate, so `unlock_sent`'s `SenderCannotReopen` is
+    /// never actually reachable from here.
+    fn on_unlock_note(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, password: SharedString) {
+        let state = self.state.clone();
+        let identity = self.identity.clone();
+        let notebooks = self.notebooks.clone();
+        let app_seed = self.app_seed.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let id_str = ui.global::<View>().get_id().to_string();
+        let mut st = state.borrow_mut();
+        let Some(n) = st.notes.iter_mut().find(|n| n.id == id_str) else { return };
+        let Some(locked) = n.locked.clone() else { return };
+        let id_guard = identity.borrow();
+        let Some(ident) = id_guard.as_ref() else {
+            log::warn!("cb: unlock-note err=identity-unavailable");
+            return;
+        };
+        let pw = password.to_string();
+        let pw_opt = if pw.is_empty() { None } else { Some(pw.as_str()) };
+        let is_self = locked.is_self();
+        let result: Result<Vec<u8>, notes_core::Error> = if is_self {
+            // PLAN-graffito-quantum-key.md: a self body carrying
+            // FLAG_MLKEM only reaches here (needs_password set by
+            // `on_open_note`) when it ALSO carries FLAG_PW and the
+            // device key is present — KEM-only self bodies are tried
+            // automatically on open and never show the Unlock button.
+            let mlkem_secret = if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
+                self.device_quantum_key(fs).map(|kp| kp.secret())
+            } else {
+                None
+            };
+            pq::unlock_self(&locked, &ident.enc_key, mlkem_secret.as_ref(), pw_opt)
+        } else {
+            let received = n.from.is_some();
+            if received {
+                if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
+                    let ix = notebooks.borrow();
+                    let net_s = self.net.clone();
+                    let leaf = (self.active)
+                        .and_then(|acc| ix.get(acc))
+                        .and_then(|meta| derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s));
+                    drop(ix);
+                    let mut last = notes_core::Error::DecryptFailed;
+                    let mut ok: Option<Vec<u8>> = None;
+                    if let Some(leaf) = leaf {
+                        for kp in derive_mlkem_keypairs(&leaf) {
+                            let secret = kp.secret();
+                            match pq::unlock_received(&locked, &ident.tweaked_seckey, Some(&secret), pw_opt)
+                            {
+                                Ok(pt) => {
+                                    ok = Some(pt);
+                                    break;
+                                }
+                                Err(e) => last = e,
+                            }
+                        }
+                    }
+                    ok.ok_or(last)
+                } else {
+                    pq::unlock_received(&locked, &ident.tweaked_seckey, None, pw_opt)
+                }
+            } else {
+                pq::unlock_sent(&locked, &ident.tweaked_seckey, &ident.output_x, pw_opt)
+            }
+        };
+        drop(id_guard);
+        match result {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                // Self-pw unlock is VIEW-ONLY (PLAN-graffito-self-pw.md):
+                // the plaintext is shown for THIS viewing only —
+                // `n.text`/`n.locked` in the persisted store are left
+                // untouched, so re-opening the note (or a fresh boot)
+                // asks for the password again. A directed note's
+                // unlock keeps its existing fill-and-clear semantics.
+                if !is_self {
+                    n.text = text.clone();
+                    n.locked = None;
+                    save_state(&fs, &st);
+                }
+                log::info!("cb: unlock-note ok");
+                drop(st);
+                let view = ui.global::<View>();
+                view.set_text(text.into());
+                view.set_locked(false);
+                view.set_needs_password(false);
+                view.set_lock_caption("".into());
+                view.set_unlock_error("".into());
+                view.set_unlock_password("".into());
+            }
+            Err(e) => {
+                log::warn!("cb: unlock-note err={e}");
+                ui.global::<View>().set_unlock_error(format!("{e}").into());
+            }
+        }
+    }
+
+    /// Reply: fresh compose draft addressed to View.reply-address. Routed
+    /// through the SAME `pick_contact` funnel a manual pick uses (contact
+    /// name resolution, recency bump, funding/change reset, → screen 3) —
+    /// it already clears Compose.to-extra on its replace path, so a stale
+    /// extra-recipient list from a previous draft can't leak in.
+    fn on_reply_to_note(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let addr = ui.global::<View>().get_reply_address().to_string();
+        if addr.is_empty() {
+            return;
+        }
+        self.pick_contact(&ui_weak, &fs, &addr);
+    }
+
+    /// Reply-all: primary = the first address in View.reply-set (via the
+    /// same `pick_contact` funnel, which also resets to-extra), every
+    /// remaining address pushed directly onto Compose.to-extra — NOT
+    /// re-run through `pick_contact` (that would re-reset funding/change
+    /// and re-navigate on every entry).
+    fn on_reply_all_to_note(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let set: Vec<String> =
+            ui.global::<View>().get_reply_set().iter().map(|s| s.to_string()).collect();
+        let Some((first, rest)) = set.split_first() else { return };
+        self.pick_contact(&ui_weak, &fs, first);
+        let st = state.borrow();
+        let extra: Vec<ToRow> = rest
+            .iter()
+            .map(|a| ToRow { address: a.as_str().into(), label: to_label_for(&st, a).into() })
+            .collect();
+        drop(st);
+        ui.global::<Compose>().set_to_extra(Rc::new(VecModel::from(extra)).into());
+    }
+
+    /// Shared by file import AND camera scan: parse + merge a bundle,
+    /// logging `cb: import-bundle {src} … ok` (src keeps the file=/loc=
+    /// shape the UI tests grep).
+    fn on_import_bundle(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let result = (|| -> Result<String, String> {
+            let (name, loc, loc_label) =
+                first_inbox_bundle(&fs).ok_or("no .json bundle in /graffito/inbox")?;
+            let json = read_text(&fs, &format!("{INBOX_DIR}/{name}"), loc)?;
+            if loc == Location::Airlock {
+                unmount_airlock(&fs);
+            }
+            self.apply_bundle(&fs, &json, &format!("file={name} loc={loc_label}"))
+        })();
+        match result {
+            Ok(msg) => {
+                ui.global::<Sync>().set_result(msg.into());
+                ui.global::<Ui>().set_error("".into());
+            }
+            Err(e) => {
+                log::warn!("cb: import-bundle err={e}");
+                ui.global::<Sync>().set_result(e.into());
+            }
+        }
+        self.refresh_home(&ui_weak);
+    }
+
+    /// Import picker: list the bundle files actually present in the inboxes
+    /// so the user chooses one, instead of silently auto-picking the first.
+    fn on_list_bundles(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let sync = ui.global::<Sync>();
+        let found = list_inbox_bundles(&fs);
+        let rows: Vec<BundleRow> = found
+            .iter()
+            .map(|(name, loc, _)| {
+                let (loc_name, loc_idx) = if *loc == Location::Airlock {
+                    ("Airlock", 1)
+                } else {
+                    ("Internal", 0)
+                };
+                BundleRow {
+                    name: name.clone().into(),
+                    label: format!("{name}  ·  {loc_name}").into(),
+                    loc: loc_idx,
+                }
+            })
+            .collect();
+        sync.set_bundles(Rc::new(VecModel::from(rows)).into());
+        sync.set_empty_hint(
+            "No bundle files found. Put a .json bundle in /graffito/inbox on Internal (or the Airlock volume), then tap Refresh — or use \"Scan bundle\" to import by QR from the companion.".into(),
+        );
+        sync.set_picking(true);
+        log::info!("cb: list-bundles n={}", found.len());
+    }
+
+    fn on_pick_bundle(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, name: SharedString, loc_idx: i32) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let loc = if loc_idx == 1 { Location::Airlock } else { Location::User };
+        let result = (|| -> Result<String, String> {
+            if loc == Location::Airlock {
+                ensure_airlock_mounted(&fs)?;
+            }
+            let json = read_text(&fs, &format!("{INBOX_DIR}/{name}"), loc);
+            if loc == Location::Airlock {
+                unmount_airlock(&fs);
+            }
+            let loc_label = if loc == Location::Airlock { "airlock" } else { "internal" };
+            self.apply_bundle(&fs, &json?, &format!("file={name} loc={loc_label}"))
+        })();
+        let sync = ui.global::<Sync>();
+        sync.set_picking(false);
+        match result {
+            Ok(msg) => {
+                sync.set_result(msg.into());
+                ui.global::<Ui>().set_error("".into());
+            }
+            Err(e) => {
+                log::warn!("cb: pick-bundle err={e}");
+                sync.set_result(e.into());
+            }
+        }
+        self.refresh_home(&ui_weak);
+    }
+
+    fn on_scan_bundle(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let opts = ScanQrOptions {
+            header_title: "Scan sync bundle".into(),
+            message: "Point at the companion's bundle QR (static or animated)".into(),
+            ..ScanQrOptions::default()
+        };
+        // Blocks while the system scanner modal owns the screen; it
+        // reassembles animated UR sequences itself (foundation-ur).
+        let (kind, data) = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
+            Ok(Some(ScanQrResult::Qr { data, .. })) => ("qr", data),
+            Ok(Some(ScanQrResult::Ur2 { ur_type, data, .. })) => {
+                log::info!("cb: scan-bundle ur-type={ur_type}");
+                ("ur", data)
+            }
+            Ok(_) => {
+                log::info!("cb: scan-bundle cancelled");
+                return;
+            }
+            Err(e) => {
+                log::warn!("cb: scan-bundle err=scanner {e:?}");
+                ui.global::<Sync>()
+                    .set_result(format!("QR scanner unavailable: {e:?}").into());
+                return;
+            }
+        };
+        log::info!("cb: scan-bundle kind={kind} bytes={}", data.len());
+        let result = decode_scanned(&data)
+            .map_err(|e| e.to_string())
+            .and_then(|json| self.apply_bundle(&fs, &json, &format!("src=scan-{kind}")));
+        match result {
+            Ok(msg) => {
+                ui.global::<Sync>().set_result(msg.into());
+                ui.global::<Ui>().set_error("".into());
+            }
+            Err(e) => {
+                log::warn!("cb: scan-bundle err={e}");
+                ui.global::<Sync>().set_result(format!("Scan failed: {e}").into());
+            }
+        }
+        self.refresh_home(&ui_weak);
+    }
+
+    fn on_export_pending(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let st = state.borrow();
+        let pending: Vec<&NoteRec> = st
+            .notes
+            .iter()
+            .filter(|n| n.status == "pending" && !n.raw_hex.is_empty())
+            .collect();
+        let mut written = 0usize;
+        let airlock_ok = ensure_airlock_mounted(&fs).is_ok();
+        for n in &pending {
+            let file = format!("{OUTBOX_DIR}/{}.hex", n.txid);
+            if ensure_dir(&fs, OUTBOX_DIR, Location::User)
+                .and_then(|_| write_file(&fs, &file, Location::User, n.raw_hex.as_bytes()))
+                .is_ok()
+            {
+                written += 1;
+            }
+            if airlock_ok {
+                let _ = ensure_dir(&fs, OUTBOX_DIR, Location::Airlock).and_then(|_| {
+                    write_file(&fs, &file, Location::Airlock, n.raw_hex.as_bytes())
+                });
+            }
+        }
+        if airlock_ok {
+            unmount_airlock(&fs);
+        }
+        log::info!(
+            "cb: export-pending n={written} airlock={}",
+            if airlock_ok { "ok" } else { "err" }
+        );
+        ui.global::<Sync>()
+            .set_result(format!("Exported {written} pending tx(s) to {OUTBOX_DIR}.").into());
+    }
+
+    /// Sign an external transaction (PSBT) — stage A: scan it, validate it
+    /// pays THIS device's taproot address, and show the universal confirm
+    /// gate (screen 4) built from the UNSIGNED tx's own bytes + each input's
+    /// witness_utxo. The actual signing (+ outbox export) is stage B, in the
+    /// confirm-sign dispatcher below — nothing about a scanned PSBT touches
+    /// disk until the user taps Sign.
+    fn on_sign_psbt(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let identity = self.identity.clone();
+        let notebooks = self.notebooks.clone();
+        let app_seed = self.app_seed.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let id_guard = identity.borrow();
+        let Some(id) = id_guard.as_ref() else {
+            ui.global::<Sync>().set_result("Device locked — no signing key.".into());
+            return;
+        };
+        let opts = ScanQrOptions {
+            header_title: "Scan transaction".into(),
+            message: "Point at the desktop app's PSBT QR".into(),
+            ..ScanQrOptions::default()
+        };
+        let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
+            Ok(Some(ScanQrResult::Qr { data: d, .. })) | Ok(Some(ScanQrResult::Ur2 { data: d, .. })) => d,
+            Ok(_) => {
+                log::info!("cb: sign-psbt cancelled");
+                return;
+            }
+            Err(e) => {
+                log::warn!("cb: sign-psbt err=scanner {e:?}");
+                ui.global::<Sync>().set_result(format!("QR scanner unavailable: {e:?}").into());
+                return;
+            }
+        };
+        let bytes = normalize_psbt_bytes(&data);
+        let psbt = match notes_core::psbt::Psbt::deserialize(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("cb: sign-psbt err={e}");
+                ui.global::<Sync>().set_result(format!("Not a PSBT: {e}").into());
+                return;
+            }
+        };
+        let our_spk = p2tr_script_pubkey(&id.output_x);
+        let ours = psbt
+            .inputs
+            .iter()
+            .filter(|i| {
+                i.witness_utxo.as_ref().map(|w| w.script_pubkey == our_spk).unwrap_or(false)
+            })
+            .count();
+        if ours == 0 {
+            ui.global::<Sync>()
+                .set_result("No inputs belong to this device's address.".into());
+            return;
+        }
+
+        let net_dev = self.net.clone();
+        let mut network = Network::from_str_opt(&net_dev).unwrap_or(Network::Mainnet);
+        let wallet_ctx = (self.seed_idx, self.bip_account);
+        let ix = notebooks.borrow();
+        let (self_spks, spending_spks) = confirm_self_spks(&ix, app_seed_get(&app_seed), &net_dev, wallet_ctx);
+        drop(ix);
+
+        // Port B (network-display fix, 2026-07-19): a PSBT's
+        // scriptPubKeys carry NO network/HRP information at all — HRP
+        // is purely an address-ENCODING artifact, never part of the
+        // wire format — so rendering every address below with the
+        // DEVICE's current network setting is wrong whenever this PSBT
+        // was built for a different chain (it will show the right
+        // bytes with the wrong prefix). The only honest signal
+        // available at this call site is a BIP32 derivation path
+        // attached to one of OUR OWN recognized inputs (an external
+        // tool that imported this device's `export.rs` account
+        // descriptor would naturally embed one) — its hardened
+        // coin-type level (`seeds::coin_type`: 0' mainnet, else 1')
+        // reflects what that tool believed the network to be. Only
+        // inputs already proven ours (`witness_utxo.script_pubkey ==
+        // our_spk`) are consulted; a foreign/external-funding input's
+        // derivation convention is none of this device's business.
+        // coin-type 1' can't distinguish testnet4/signet/regtest from
+        // one another (this crate's own `coin_type()` doesn't either),
+        // but testnet4 and signet already share the "tb" HRP here, so
+        // `Testnet4` is the right display for the overwhelming
+        // majority of that bucket; a real external tool handing a
+        // REGTEST PSBT to a physical device is not a scenario this
+        // display-only fix needs to get byte-perfect. No derivation
+        // signal at all (the common case today) changes nothing —
+        // this only ever ADDS information on top of the existing
+        // device-network fallback, never removes it, and it can never
+        // affect signing/validation/tx bytes (display only).
+        let device_network_label = network.as_str();
+        let mut coin_types: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for (i, inp) in psbt.inputs.iter().enumerate() {
+            let is_ours = inp.witness_utxo.as_ref().map(|w| w.script_pubkey == our_spk).unwrap_or(false);
+            if !is_ours {
+                continue;
+            }
+            if let Some(ct) = psbt.input_derivation_coin_type(i) {
+                coin_types.insert(ct);
+            }
+        }
+        let mut network_warn: Option<String> = None;
+        if let [only] = coin_types.iter().collect::<Vec<_>>()[..] {
+            let derived_mainnet = *only == 0;
+            let device_mainnet = network == Network::Mainnet;
+            if derived_mainnet != device_mainnet {
+                let derived_label = if derived_mainnet { "mainnet" } else { "a test network" };
+                network_warn = Some(format!(
+                    "this transaction's key derivation indicates {derived_label}, but the device is set to {device_network_label} - addresses below use the derived network's encoding"
+                ));
+                network = if derived_mainnet { Network::Mainnet } else { Network::Testnet4 };
+            }
+        }
+
+        let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> = BTreeMap::new();
+        for (i, txin) in psbt.unsigned_tx.inputs.iter().enumerate() {
+            let Some(wu) = psbt.inputs.get(i).and_then(|p| p.witness_utxo.as_ref()) else {
+                continue;
+            };
+            let mut t = txin.txid;
+            t.reverse();
+            let is_ours = wu.script_pubkey == our_spk;
+            let address = notes_core::address::address_from_spk(&wu.script_pubkey, network);
+            let source =
+                if is_ours { "This notebook".to_string() } else { "External funding".to_string() };
+            prevouts.insert(
+                format!("{}:{}", hex::encode(t), txin.vout),
+                notes_core::confirm::PrevoutInfo { value: wu.value, address, source },
+            );
+        }
+        let note_preview = confirm_note_preview(&psbt.unsigned_tx.outputs);
+
+        let cctx = notes_core::confirm::ConfirmCtx {
+            network,
+            prevouts,
+            self_spks,
+            spending_spks,
+            expected_change: None,
+            recipient: None,
+            recipient_name: None,
+            recipients: Vec::new(),
+            note_preview,
+        };
+        let raw_hex = hex::encode(psbt.unsigned_tx.serialize_legacy());
+        drop(id_guard);
+
+        match show_confirm_screen(&ui, "psbt", &raw_hex, &cctx, "External funding tx".to_string(), "Sign & export") {
+            Ok(()) => {
+                if let Some(msg) = &network_warn {
+                    log::info!("cb: confirm network-mismatch derived={}", network.as_str());
+                    let cs = ui.global::<ConfirmSign>();
+                    let existing = cs.get_warn().to_string();
+                    cs.set_warn(
+                        if existing.is_empty() { msg.clone().into() } else { format!("{existing}; {msg}").into() },
+                    );
+                }
+                self.psbt_pending = Some(psbt);
+            }
+            Err(e) => {
+                log::warn!("cb: confirm summarize err={e}");
+                ui.global::<Sync>().set_result(format!("Cannot show confirm: {e}").into());
+            }
+        }
+    }
+
+    fn on_cycle_network(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let identity = self.identity.clone();
+        let notebooks = self.notebooks.clone();
+        let app_seed = self.app_seed.clone();
+        // Network is device-level (wallet-wide): flush the active
+        // notebook, cycle the shared network, persist it in config, and
+        // reload the active notebook's ledger for the new chain (each
+        // notebook keeps a per-network ledger in state-<net>-<account>).
+        if self.active.is_some() {
+            save_state(&fs, &state.borrow());
+        }
+        let next = match self.net.as_str() {
+            "mainnet" => "testnet4",
+            "testnet4" => "signet",
+            "signet" => "regtest",
+            _ => "mainnet",
+        }
+        .to_string();
+        self.net = next.clone();
+        self.persist_config(&fs);
+        log::info!("cb: set-network {next}");
+        let active = self.active;
+        if let Some(account) = active {
+            let mut fresh = load_state(&fs, &next, account);
+            fresh.chunk_override = self.device_chunk;
+            *state.borrow_mut() = fresh;
+            // Legacy identities are network-independent (only the
+            // address ENCODING changes), but bip86 notebooks use the
+            // BIP-44 coin type — their keys differ per network, so
+            // always re-derive from the meta.
+            if let Some(m) = notebooks.borrow().get(account) {
+                *identity.borrow_mut() = derive_identity(app_seed_get(&app_seed), m, &next);
+            }
+        }
+        let _ = &ui_weak;
+        self.refresh_home(&ui_weak);
+        self.refresh_notes(&ui_weak);
+        self.refresh_coins(&ui_weak, &fs);
+        self.refresh_notebooks(&ui_weak, &fs);
+    }
+
+    fn on_chunk_changed(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let settings = ui.global::<Settings>();
+        let mut st = state.borrow_mut();
+        match settings.get_chunk_mode() {
+            0 => st.chunk_override = None,
+            1 => st.chunk_override = Some(80),
+            _ => {
+                match settings.get_chunk_text().trim().parse::<usize>() {
+                    Ok(n) if (MIN_CHUNK..=DEFAULT_CHUNK).contains(&n) => {
+                        st.chunk_override = Some(n);
+                    }
+                    _ => {
+                        let msg = format!(
+                            "Chunk size must be {MIN_CHUNK}–{DEFAULT_CHUNK} bytes."
+                        );
+                        log::warn!("cb: set-chunk-size err={msg}");
+                        settings.set_chunk_error(msg.into());
+                        // Leave the user's text in place to fix.
+                        return;
+                    }
+                }
+            }
+        }
+        log::info!(
+            "cb: set-chunk-size {} ok",
+            st.chunk_override.map(|n| n.to_string()).unwrap_or("auto".into())
+        );
+        settings.set_chunk_error("".into());
+        save_state(&fs, &st);
+        // Chunk is device-level (wallet-wide): persist it in config too.
+        self.device_chunk = st.chunk_override;
+        self.persist_config(&fs);
+        drop(st);
+        // Reflect the effective size back into the field (auto/compat),
+        // without touching a valid custom value.
+        self.refresh_home(&ui_weak);
+        // Re-price the draft immediately so the compose cost line is
+        // already current when the user returns to it.
+        self.compose_changed(ui_weak, fs);
+    }
+
+    /// Transaction locktime (anti-fee-sniping). Wallet-level like the chunk
+    /// size, so it lives in config.json rather than any notebook's state.
+    fn on_locktime_changed(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let settings = ui.global::<Settings>();
+        let policy = match settings.get_locktime_mode() {
+            0 => LockTimePolicy::Tip,
+            1 => LockTimePolicy::Zero,
+            _ => match settings.get_locktime_text().trim().parse::<u32>() {
+                // A height at or above 500_000_000 is read by consensus
+                // as a UNIX timestamp, which is never what someone
+                // typing a block height means — reject it here rather
+                // than silently build an unspendable-until-2035 tx.
+                Ok(h) if h < 500_000_000 => LockTimePolicy::Custom { height: h },
+                _ => {
+                    let msg = "Locktime must be a block height below 500000000.".to_string();
+                    log::warn!("cb: set-locktime err={msg}");
+                    settings.set_locktime_error(msg.into());
+                    // Leave the user's text in place to fix.
+                    return;
+                }
+            },
+        };
+        self.lock_policy = policy;
+        self.persist_config(&fs);
+        settings.set_locktime_error("".into());
+        let tip = state.borrow().tip_height;
+        let effective = resolve_locktime(policy, tip);
+        settings.set_locktime_effective(locktime_caption(policy, tip).into());
+        log::info!("cb: set-locktime {} effective={effective} ok", policy.as_str());
+    }
+
+    /// Compose "too large" dialog → raise the chunk size to Standard (auto) and
+    /// reprice the draft in place. Only offered when the note fits at Standard.
+    fn on_oversize_bump(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        {
+            let mut st = state.borrow_mut();
+            st.chunk_override = None; // Standard / auto = DEFAULT_CHUNK
+            save_state(&fs, &st);
+        }
+        log::info!("cb: set-chunk-size auto ok (oversize-bump)");
+        let compose = ui.global::<Compose>();
+        compose.set_show_oversize(false);
+        ui.global::<Settings>().set_chunk_mode(0); // mirror into the settings pill
+        self.compose_changed(ui_weak, fs);
+    }
+
+    fn on_toggle_sender(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, key: SharedString, excluded: bool) {
+        let state = self.state.clone();
+        let Some(_ui) = ui_weak.upgrade() else { return };
+        {
+            let mut st = state.borrow_mut();
+            st.set_excluded(key.as_str(), excluded);
+            save_state(&fs, &st);
+            log::info!(
+                "cb: toggle-sender excluded={excluded} hidden={}",
+                st.excluded_senders.len()
+            );
+        }
+        self.refresh_notes(&ui_weak);
+    }
+
+    fn on_rename(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, account: i32) {
+        let notebooks = self.notebooks.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let nb = ui.global::<NotebooksUi>();
+        // Prefill the RAW local name (the display name may be an addr
+        // short form, which must not become a name by accident).
+        let raw = notebooks
+            .borrow()
+            .get(account.max(0) as u32)
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        nb.set_name_text(raw.into());
+        nb.set_name_account(account);
+    }
+
+    fn on_name_cancel(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        if let Some(ui) = ui_weak.upgrade() {
+            ui.global::<NotebooksUi>().set_name_account(-1);
+        }
+    }
+
+    fn on_name_save(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let notebooks = self.notebooks.clone();
+        let app_seed = self.app_seed.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let nb = ui.global::<NotebooksUi>();
+        let sel = nb.get_name_account();
+        if sel == -1 {
+            return;
+        }
+        let name = nb.get_name_text().trim().to_string();
+        nb.set_name_account(-1);
+        nb.set_name_text("".into());
+        if sel == -2 {
+            // CREATE: a bip86 notebook at the next unused receive
+            // index of the active (seed, account) context — the
+            // recovery-seeds scheme, words-recoverable anywhere.
+            // (Legacy notebooks are never created anymore.)
+            if app_seed_get(&app_seed).is_none() {
+                ui.global::<Ui>().set_error("Device locked — can't create a notebook.".into());
+                return;
+            }
+            let (seed, bacct) = (self.seed_idx, self.bip_account);
+            let account = {
+                let mut ix = notebooks.borrow_mut();
+                let account = ix.create_bip86(seed, bacct, &name);
+                save_notebooks(&fs, &ix);
+                account
+            };
+            let index = notebooks.borrow().get(account).map(|m| m.index).unwrap_or(0);
+            log::info!(
+                "cb: create-notebook account={account} scheme=bip86 seed={seed} bip-account={bacct} index={index}"
+            );
+            self.refresh_notebooks(&ui_weak, &fs);
+            self.switch_notebook(&ui_weak, &fs, account);
+        } else {
+            let account = sel as u32;
+            {
+                let mut ix = notebooks.borrow_mut();
+                ix.rename(account, &name);
+                save_notebooks(&fs, &ix);
+            }
+            log::info!("cb: rename-notebook account={account}");
+            self.refresh_notebooks(&ui_weak, &fs);
+            // If it's the open notebook, update its home title.
+            if self.active == Some(account) {
+                let title = notebooks
+                    .borrow()
+                    .get(account)
+                    .map(|m| m.name.clone())
+                    .filter(|n| !n.trim().is_empty());
+                if let Some(t) = title {
+                    nb.set_title(t.into());
+                }
+            }
+        }
+    }
+
+    fn on_archive(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, account: i32, archived: bool) {
+        let notebooks = self.notebooks.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let account = account.max(0) as u32;
+        if archived {
+            // Guard: a notebook with coins must be emptied first
+            // (sweep/consolidate). Zero active notebooks is allowed.
+            let bal = load_state(&fs, &self.net, account).balance();
+            if bal > 0 {
+                ui.global::<Ui>()
+                    .set_error(format!("This notebook holds {bal} sats — empty it first.").into());
+                return;
+            }
+        }
+        {
+            let mut ix = notebooks.borrow_mut();
+            ix.set_archived(account, archived);
+            save_notebooks(&fs, &ix);
+        }
+        log::info!("cb: archive-notebook account={account} archived={archived}");
+        self.refresh_notebooks(&ui_weak, &fs);
+    }
+
+    fn on_back_to_list(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        if self.active.is_some() {
+            save_state(&fs, &state.borrow());
+        }
+        self.refresh_notebooks(&ui_weak, &fs);
+        ui.global::<Ui>().set_screen(Screen::Notebooks);
+    }
+
+    /// to the new seed while they're shown). Keeps the SeedQR in sync.
+    fn on_reveal_close(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let recovery = ui.global::<Recovery>();
+        recovery.set_words_col1("".into());
+        recovery.set_words_col2("".into());
+        recovery.set_title_line("".into());
+        recovery.set_qr(Image::default());
+        recovery.set_show_qr(false);
+        log::info!("cb: reveal-seed cancelled");
+    }
+
+    /// addresses); hex + WIF are one notebook's leaf, picked from the
+    /// notebook list. No private xprv on the device (the 24 words recover
+    /// the whole seed). Values live in UI props only, wiped on close;
+    /// never logged.
+    /// The active account's notebooks as picker rows (index/name/short addr)
+    /// plus the default selection (first notebook, else a synthetic index 0).
+    fn on_reveal_public(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let app_seed = self.app_seed.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let r = ui.global::<Recovery>();
+        let si = self.seed_idx;
+        let acct = self.bip_account;
+        let Some(seed) = app_seed_get(&app_seed).as_ref() else {
+            ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
+            log::warn!("cb: reveal-public seed={si} account={acct} err=locked");
+            return;
+        };
+        let network = Network::from_str_opt(&self.net).unwrap_or(Network::Mainnet);
+        let derived = (|| -> Result<(), notes_core::Error> {
+            r.set_export_xpub(notes_core::export::account_xpub(seed, si, network, acct)?.into());
+            r.set_export_descriptor(
+                notes_core::export::account_descriptor(seed, si, network, acct)?.into(),
+            );
+            Ok(())
+        })();
+        if let Err(e) = derived {
+            ui.global::<Ui>().set_error(format!("Export failed: {e}").into());
+            log::warn!("cb: reveal-public seed={si} account={acct} err={e}");
+            return;
+        }
+        r.set_export_seed_view(false);
+        r.set_export_title(export_title(seed, si, acct).into());
+        self.apply_export(&ui_weak, 0);
+        log::info!("cb: reveal-public seed={si} account={acct} ok");
+    }
+
+    /// plus the default selection (first notebook, else a synthetic index 0).
+    fn on_reveal_private(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let app_seed = self.app_seed.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let r = ui.global::<Recovery>();
+        let si = self.seed_idx;
+        let acct = self.bip_account;
+        let Some(seed) = app_seed_get(&app_seed).as_ref() else {
+            ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
+            log::warn!("cb: reveal-private seed={si} account={acct} err=locked");
+            return;
+        };
+        let net_s = self.net.clone();
+        let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
+        let (rows, sel, sel_name) = self.export_rows(si, acct, &net_s, network);
+        let derived = (|| -> Result<(), notes_core::Error> {
+            let (hex, wif) = export_leaf_formats(seed, si, network, acct, sel as u32)?;
+            r.set_export_hex(hex.into());
+            r.set_export_wif(wif.into());
+            Ok(())
+        })();
+        if let Err(e) = derived {
+            ui.global::<Ui>().set_error(format!("Export failed: {e}").into());
+            log::warn!("cb: reveal-private seed={si} account={acct} err={e}");
+            return;
+        }
+        r.set_export_notebooks(Rc::new(VecModel::from(rows)).into());
+        r.set_export_nb_index(sel);
+        r.set_export_nb_name(sel_name.into());
+        // The 24 words (whole seed) into words-col1/2 + SeedQR.
+        self.reveal_words(&ui_weak);
+        r.set_export_title(export_title(seed, si, acct).into());
+        r.set_export_seed_view(true); // default to the seed-words view
+        self.apply_export(&ui_weak, 2); // pre-load the hex value/QR for a quick pill switch
+        log::info!("cb: reveal-private seed={si} account={acct} ok");
+    }
+
+    fn on_export_close(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let r = ui.global::<Recovery>();
+        r.set_export_xpub("".into());
+        r.set_export_descriptor("".into());
+        r.set_export_hex("".into());
+        r.set_export_wif("".into());
+        r.set_export_value("".into());
+        r.set_export_label("".into());
+        r.set_export_title("".into());
+        r.set_export_qr(Image::default());
+        r.set_export_which(0);
+        r.set_export_notebooks(Rc::new(VecModel::from(Vec::<ExportNbRow>::new())).into());
+        r.set_export_nb_index(0);
+        r.set_export_nb_name("".into());
+        // Also wipe the seed-words view (shared with reveal-seed props).
+        r.set_export_seed_view(false);
+        r.set_words_col1("".into());
+        r.set_words_col2("".into());
+        r.set_title_line("".into());
+        r.set_qr(Image::default());
+        r.set_show_qr(false);
+        log::info!("cb: reveal-export cancelled");
+    }
+}
+
 fn app_main(cx: AppContext, ui: AppWindow) {
     log_server::init_wait(env!("CARGO_CRATE_NAME")).unwrap();
     log::set_max_level(log::LevelFilter::Info);
@@ -3391,86 +4939,23 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // append mode (Contacts.picking-extra), modeled on how the home
     // screen's "Compose note" button opens it in replace mode.
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_add_recipient_open(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            ui.global::<Contacts>().set_picking_extra(true);
-            ui.global::<Contacts>().set_pick_mode("compose".into());
-            ui.global::<Callbacks>().invoke_refresh_contacts();
-            ui.global::<Ui>().set_screen(Screen::Contacts);
-        });
+        ui.global::<Callbacks>().on_add_recipient_open(move || app.borrow().on_add_recipient_open(&ui_weak));
     }
 
     // Drop an address from Compose.to-extra — no navigation.
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_remove_recipient(move |addr| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let compose = ui.global::<Compose>();
-            let kept: Vec<ToRow> =
-                compose.get_to_extra().iter().filter(|r| r.address != addr).collect();
-            compose.set_to_extra(Rc::new(VecModel::from(kept)).into());
-            log::info!("cb: remove-recipient addr={addr}");
-        });
+        ui.global::<Callbacks>().on_remove_recipient(move |addr| app.borrow().on_remove_recipient(&ui_weak, addr));
     }
 
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_scan_contact(move || {
-            let state = app.borrow().state.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let opts = ScanQrOptions {
-                header_title: "Scan recipient address".into(),
-                message: "Point at an address QR (a companion page or another Prime's home screen)"
-                    .into(),
-                ..ScanQrOptions::default()
-            };
-            let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
-                Ok(Some(ScanQrResult::Qr { data, .. })) | Ok(Some(ScanQrResult::Ur2 { data, .. })) => data,
-                Ok(_) => {
-                    log::info!("cb: scan-contact cancelled");
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("cb: scan-contact err=scanner {e:?}");
-                    ui.global::<Contacts>()
-                        .set_input_error(format!("QR scanner unavailable: {e:?}").into());
-                    return;
-                }
-            };
-            // Address QRs are plain text, possibly a BIP21 URI, and
-            // legitimately ALL-UPPERCASE (our own home QR is) — normalize.
-            let text = String::from_utf8(data).unwrap_or_default();
-            let mut addr = text.trim();
-            if addr.len() >= 8 && addr[..8].eq_ignore_ascii_case("bitcoin:") {
-                addr = &addr[8..];
-            }
-            let addr = addr.split('?').next().unwrap_or("").trim().to_string();
-            let st = state.borrow();
-            let network = st.network();
-            let network_name = st.network.clone();
-            drop(st);
-            let resolved = if Recipient::parse(network, &addr).is_ok() {
-                Some(addr.clone())
-            } else {
-                let lower = addr.to_lowercase();
-                Recipient::parse(network, &lower).is_ok().then_some(lower)
-            };
-            match resolved {
-                Some(a) => {
-                    log::info!("cb: scan-contact ok addr={a}");
-                    app.borrow_mut().pick_contact(&ui_weak, &fs, &a);
-                }
-                None => {
-                    log::warn!("cb: scan-contact err=not an address");
-                    ui.global::<Contacts>().set_input_error(
-                        format!("QR didn't contain a valid {network_name} address.").into(),
-                    );
-                }
-            }
-        });
+        ui.global::<Callbacks>().on_scan_contact(move || app.borrow_mut().on_scan_contact(&ui_weak, &fs));
     }
 
     // Quantum key scan (naming modal "Scan quantum key"): armored
@@ -3482,57 +4967,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_scan_contact_pq(move || {
-            let state = app.borrow().state.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let contacts_g = ui.global::<Contacts>();
-            let addr = contacts_g.get_naming_address().to_string();
-            if addr.is_empty() {
-                return;
-            }
-            let opts = ScanQrOptions {
-                header_title: "Scan quantum key".into(),
-                message: "Point at a contact's ML-KEM public-key QR (their Settings → \
-                          \"Quantum keys…\" screen)."
-                    .into(),
-                ..ScanQrOptions::default()
-            };
-            let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
-                Ok(Some(ScanQrResult::Qr { data, .. })) | Ok(Some(ScanQrResult::Ur2 { data, .. })) => {
-                    data
-                }
-                Ok(_) => {
-                    log::info!("cb: contact-pq-key cancelled");
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("cb: contact-pq-key err=scanner {e:?}");
-                    contacts_g.set_naming_pq_error(format!("QR scanner unavailable: {e:?}").into());
-                    return;
-                }
-            };
-            let armor = String::from_utf8(data).unwrap_or_default();
-            match pq::import_public(&armor) {
-                Ok((alg, ek)) => {
-                    let fp = pq::fingerprint(alg, &ek);
-                    let mut st = state.borrow_mut();
-                    if let Some(c) = st.contacts.iter_mut().find(|c| c.address == addr) {
-                        c.mlkem_ek = Some(armor);
-                    }
-                    save_state(&fs, &st);
-                    drop(st);
-                    log::info!("cb: contact-pq-key ok fp={fp}");
-                    contacts_g
-                        .set_naming_pq_caption(format!("{} · {fp}", mlkem_alg_name(alg)).into());
-                    contacts_g.set_naming_pq_error("".into());
-                    app.borrow().refresh_contacts(&ui_weak);
-                }
-                Err(e) => {
-                    log::warn!("cb: contact-pq-key err={e}");
-                    contacts_g.set_naming_pq_error(format!("Not a quantum public key: {e}").into());
-                }
-            }
-        });
+        ui.global::<Callbacks>().on_scan_contact_pq(move || app.borrow().on_scan_contact_pq(&ui_weak, &fs));
     }
 
     // Quantum-keys screen (27): every visible notebook in the active
@@ -3548,43 +4983,22 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // which already reconstruct every notebook's key.
 
     {
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
-        ui.global::<Callbacks>().on_open_quantum_keys(move || {
-            // Reopening the screen resets to the active-or-first default
-            // rather than remembering the last-picked notebook from a
-            // previous visit.
-            app.borrow_mut().quantum_nb = None;
-            app.borrow().refresh_quantum_keys(&ui_weak);
-        });
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_open_quantum_keys(move || app.borrow_mut().on_open_quantum_keys(&ui_weak));
     }
 
     {
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let ui_weak = ui_weak.clone();
-        let app = app.clone();
-        ui.global::<Callbacks>().on_quantum_key_level(move |level_idx| {
-            let Some(_ui) = ui_weak.upgrade() else { return };
-            let alg = match level_idx {
-                0 => pq::MlKemAlg::MlKem512,
-                2 => pq::MlKemAlg::MlKem1024,
-                _ => pq::MlKemAlg::MlKem768,
-            };
-            app.borrow_mut().mlkem_level = alg.id();
-            app.borrow().persist_config(&fs);
-            log::info!("cb: pq-key level={}", mlkem_alg_name(alg));
-            app.borrow().refresh_quantum_keys(&ui_weak);
-        });
+        ui.global::<Callbacks>().on_quantum_key_level(move |level_idx| app.borrow_mut().on_quantum_key_level(&ui_weak, &fs, level_idx));
     }
 
     {
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
-        ui.global::<Callbacks>().on_quantum_key_pick_notebook(move |index| {
-            app.borrow_mut().quantum_nb = Some(index as u32);
-            log::info!("cb: pq-key notebook={index}");
-            app.borrow().refresh_quantum_keys(&ui_weak);
-        });
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_quantum_key_pick_notebook(move |index| app.borrow_mut().on_quantum_key_pick_notebook(&ui_weak, index));
     }
 
     {
@@ -3613,273 +5027,74 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     {
         let app = app.clone();
-        let fs = fs.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_open_device_quantum_key(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let dq = ui.global::<DeviceQuantumKey>();
-            // Reopening always starts at the summary/generate-or-import
-            // state, never wherever the last visit left off.
-            dq.set_view("".into());
-            dq.set_gen_level(1);
-            dq.set_gen_level_caption(mlkem_alg_describe(pq::MlKemAlg::MlKem768).into());
-            dq.set_gen_extra_text("".into());
-            dq.set_gen_error("".into());
-            dq.set_import_error("".into());
-            dq.set_qr_zoom(false);
-            dq.set_show_replace_confirm(false);
-            dq.set_show_delete_confirm(false);
-            app.borrow_mut().refresh_device_quantum_key(&ui_weak, &fs);
-        });
-    }
-
-    {
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_close(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let dq = ui.global::<DeviceQuantumKey>();
-            // Wipe the sensitive private-key view (armor + QR) on the way
-            // out — never lingers in a UI prop after the screen closes,
-            // same hygiene as reveal-close/export-close.
-            dq.set_private_armor("".into());
-            dq.set_private_qr(Image::default());
-            dq.set_view("".into());
-            dq.set_qr_zoom(false);
-        });
-    }
-
-    {
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_gen_level(move |level_idx| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let dq = ui.global::<DeviceQuantumKey>();
-            let alg = match level_idx {
-                0 => pq::MlKemAlg::MlKem512,
-                2 => pq::MlKemAlg::MlKem1024,
-                _ => pq::MlKemAlg::MlKem768,
-            };
-            dq.set_gen_level(level_idx);
-            dq.set_gen_level_caption(mlkem_alg_describe(alg).into());
-        });
-    }
-
-    {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
+        ui.global::<Callbacks>().on_open_device_quantum_key(move || app.borrow_mut().on_open_device_quantum_key(&ui_weak, &fs));
+    }
+
+    {
         let app = app.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_generate(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let dq = ui.global::<DeviceQuantumKey>();
-            let alg = match dq.get_gen_level() {
-                0 => pq::MlKemAlg::MlKem512,
-                2 => pq::MlKemAlg::MlKem1024,
-                _ => pq::MlKemAlg::MlKem768,
-            };
-            let extra = dq.get_gen_extra_text().to_string();
-            let result = pq::MlKemKeypair::generate_with_extra(alg, extra.as_bytes())
-                .map_err(|e| e.to_string())
-                .and_then(|kp| save_device_quantum_key(&fs, kp.alg(), kp.seed()).map(|_| kp));
-            match result {
-                Ok(kp) => {
-                    app.borrow_mut().device_pq_key = Some(Some(kp));
-                    dq.set_gen_error("".into());
-                    dq.set_gen_extra_text("".into());
-                    log::info!("cb: quantum-key generate level={} ok", mlkem_alg_name(alg));
-                    app.borrow_mut().refresh_device_quantum_key(&ui_weak, &fs);
-                }
-                Err(e) => {
-                    log::warn!("cb: quantum-key generate level={} err={e}", mlkem_alg_name(alg));
-                    dq.set_gen_error(format!("Couldn't generate a key: {e}").into());
-                }
-            }
-        });
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_close(move || app.borrow().on_device_quantum_key_close(&ui_weak));
     }
 
     {
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
         let app = app.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_import(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let dq = ui.global::<DeviceQuantumKey>();
-            let opts = ScanQrOptions {
-                header_title: "Import quantum key".into(),
-                message: "Point at an armored GRAFFITO ML-KEM PRIVATE KEY QR — from a backup, \
-                          this device's own export, or the graffito Mac app."
-                    .into(),
-                ..ScanQrOptions::default()
-            };
-            let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
-                Ok(Some(ScanQrResult::Qr { data, .. })) | Ok(Some(ScanQrResult::Ur2 { data, .. })) => {
-                    data
-                }
-                Ok(_) => {
-                    log::info!("cb: quantum-key import cancelled");
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("cb: quantum-key import err=scanner {e:?}");
-                    dq.set_import_error(format!("QR scanner unavailable: {e:?}").into());
-                    return;
-                }
-            };
-            let armor = String::from_utf8(data).unwrap_or_default();
-            match pq::import_private(&armor) {
-                Ok((alg, seed)) => match save_device_quantum_key(&fs, alg, &seed) {
-                    Ok(()) => {
-                        app.borrow_mut().device_pq_key =
-                            Some(Some(pq::MlKemKeypair::from_seed(alg, &seed)));
-                        dq.set_import_error("".into());
-                        log::info!("cb: quantum-key import ok");
-                        app.borrow_mut().refresh_device_quantum_key(&ui_weak, &fs);
-                    }
-                    Err(e) => {
-                        log::warn!("cb: quantum-key import err={e}");
-                        dq.set_import_error(format!("Couldn't save the key: {e}").into());
-                    }
-                },
-                Err(e) => {
-                    // A clearer message for the common mix-up: scanning a
-                    // PUBLIC key armor (this screen's own "Share public
-                    // key" QR, or a contact's) instead of a private one.
-                    let msg = if pq::import_public(&armor).is_ok() {
-                        "That's a PUBLIC quantum key — this needs the PRIVATE key armor \
-                         instead (\"Export private key…\" on the device that holds it)."
-                            .to_string()
-                    } else {
-                        format!("Not a private quantum key: {e}")
-                    };
-                    log::warn!("cb: quantum-key import err={e}");
-                    dq.set_import_error(msg.into());
-                }
-            }
-        });
-    }
-
-    {
         let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        let app = app.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_reveal_private(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let dq = ui.global::<DeviceQuantumKey>();
-            let device_kp = app.borrow_mut().device_quantum_key(&fs);
-            let Some(kp) = device_kp else {
-                // Shouldn't be reachable (the button only shows when
-                // has-key is true) — fail safe back to the summary view.
-                dq.set_view("".into());
-                return;
-            };
-            let armor = pq::export_private(kp.alg(), kp.seed());
-            dq.set_private_armor(armor.clone().into());
-            if qr_fits(&armor) {
-                dq.set_private_fits_qr(true);
-                dq.set_private_qr(qr_image(&armor));
-            } else {
-                // Never reachable in practice — a private armor is always
-                // a fixed 66-byte payload regardless of level — but this
-                // is the same size guard `qr_image` needs everywhere else
-                // (it panics past capacity), so it stays generic rather
-                // than assuming the current sizes forever.
-                dq.set_private_fits_qr(false);
-                dq.set_private_qr(Image::default());
-            }
-            dq.set_view("private".into());
-            log::info!("cb: quantum-key export-private ok fp={}", kp.fingerprint());
-        });
-    }
-
-    {
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_hide_private(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let dq = ui.global::<DeviceQuantumKey>();
-            dq.set_private_armor("".into());
-            dq.set_private_qr(Image::default());
-            dq.set_view("".into());
-            dq.set_qr_zoom(false);
-        });
-    }
-
-    {
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        let app = app.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_replace_confirm(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let dq = ui.global::<DeviceQuantumKey>();
-            // "Replace…" = delete the current key, then land back on the
-            // generate/import state — the confirm dialog is what named the
-            // consequence (notes sealed to it become unreadable) before
-            // this ran.
-            if let Err(e) = delete_device_quantum_key(&fs) {
-                log::warn!("cb: quantum-key replace err={e}");
-            }
-            app.borrow_mut().device_pq_key = Some(None);
-            dq.set_show_replace_confirm(false);
-            dq.set_view("".into());
-            dq.set_private_armor("".into());
-            dq.set_private_qr(Image::default());
-            dq.set_gen_level(1);
-            dq.set_gen_level_caption(mlkem_alg_describe(pq::MlKemAlg::MlKem768).into());
-            dq.set_gen_extra_text("".into());
-            log::info!("cb: quantum-key replace ok");
-            app.borrow_mut().refresh_device_quantum_key(&ui_weak, &fs);
-        });
-    }
-
-    {
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        let app = app.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_delete_confirm(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let dq = ui.global::<DeviceQuantumKey>();
-            if let Err(e) = delete_device_quantum_key(&fs) {
-                log::warn!("cb: quantum-key delete err={e}");
-            }
-            app.borrow_mut().device_pq_key = Some(None);
-            dq.set_show_delete_confirm(false);
-            dq.set_view("".into());
-            dq.set_private_armor("".into());
-            dq.set_private_qr(Image::default());
-            log::info!("cb: quantum-key delete ok");
-            app.borrow_mut().refresh_device_quantum_key(&ui_weak, &fs);
-        });
-    }
-
-    {
-        ui.global::<Callbacks>().on_device_quantum_key_qr_zoom(move |open| {
-            log::info!("cb: quantum-key qr-zoom={}", if open { "open" } else { "closed" });
-        });
+        ui.global::<Callbacks>().on_device_quantum_key_gen_level(move |level_idx| app.borrow().on_device_quantum_key_gen_level(&ui_weak, level_idx));
     }
 
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_save_contact_name(move || {
-            let state = app.borrow().state.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let contacts_g = ui.global::<Contacts>();
-            let addr = contacts_g.get_naming_address().to_string();
-            if addr.is_empty() {
-                return;
-            }
-            let name = contacts_g.get_name_text().trim().to_string();
-            let mut st = state.borrow_mut();
-            // Naming does NOT bump recency — only use does, so the row
-            // being edited never jumps mid-interaction.
-            if let Some(c) = st.contacts.iter_mut().find(|c| c.address == addr) {
-                c.name = name.clone();
-            }
-            save_state(&fs, &st);
-            drop(st);
-            log::info!("cb: save-contact addr={addr} name-len={}", name.len());
-            contacts_g.set_naming_address("".into());
-            contacts_g.set_name_text("".into());
-            app.borrow().refresh_contacts(&ui_weak);
-        });
+        ui.global::<Callbacks>().on_device_quantum_key_generate(move || app.borrow_mut().on_device_quantum_key_generate(&ui_weak, &fs));
+    }
+
+    {
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_import(move || app.borrow_mut().on_device_quantum_key_import(&ui_weak, &fs));
+    }
+
+    {
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_reveal_private(move || app.borrow_mut().on_device_quantum_key_reveal_private(&ui_weak, &fs));
+    }
+
+    {
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_hide_private(move || app.borrow().on_device_quantum_key_hide_private(&ui_weak));
+    }
+
+    {
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_replace_confirm(move || app.borrow_mut().on_device_quantum_key_replace_confirm(&ui_weak, &fs));
+    }
+
+    {
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_delete_confirm(move || app.borrow_mut().on_device_quantum_key_delete_confirm(&ui_weak, &fs));
+    }
+
+    {
+        let app = app.clone();
+        ui.global::<Callbacks>().on_device_quantum_key_qr_zoom(move |open| app.borrow().on_device_quantum_key_qr_zoom(open));
+    }
+
+    {
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_save_contact_name(move || app.borrow().on_save_contact_name(&ui_weak, &fs));
     }
 
     {
@@ -3891,20 +5106,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     // Coins → the shared sweep screen with kind=consolidate, dest=self.
     {
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
+        let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_consolidate_open(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let sweep = ui.global::<Sweep>();
-            sweep.set_kind("consolidate".into());
-            sweep.set_dest("".into());
-            sweep.set_dest_label("to: self — one consolidated coin".into());
-            sweep.set_tier(1);
-            log::info!("cb: sweep-open kind=consolidate to=self");
-            app.borrow().update_sweep(&ui_weak, &fs);
-            ui.global::<Ui>().set_screen(Screen::Sweep);
-        });
+        ui.global::<Callbacks>().on_consolidate_open(move || app.borrow().on_consolidate_open(&ui_weak, &fs));
     }
 
     {
@@ -4092,95 +5297,52 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     // Spending wallet: Settings toggle.
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let app = app.clone();
-        ui.global::<Callbacks>().on_set_spending_enabled(move |on| {
-            let notebooks = app.borrow().notebooks.clone();
-            let mut ix = notebooks.borrow_mut();
-            let ctx = notebook_ctx(&ix, app.borrow().active)
-                .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
-            let net_s = app.borrow().net.clone();
-            ix.spending_mut(&net_s, ctx.0, ctx.1).enabled = on;
-            save_notebooks(&fs, &ix);
-            drop(ix);
-            log::info!("cb: set-spending enabled={on}");
-            app.borrow().refresh_funding(&ui_weak);
-        });
+        ui.global::<Callbacks>().on_set_spending_enabled(move |on| app.borrow().on_set_spending_enabled(&ui_weak, &fs, on));
     }
 
     // Pay-from screen (25): notebook / spending-wallet per-coin selection.
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_funding_open(move || {
-            log::info!("cb: funding-open");
-            app.borrow().refresh_funding(&ui_weak);
-        });
+        ui.global::<Callbacks>().on_funding_open(move || app.borrow().on_funding_open(&ui_weak));
     }
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let app = app.clone();
-        ui.global::<Callbacks>().on_funding_toggle_coin(move |key| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            if let Some((spending_src, txid, vout)) = parse_funding_key(key.as_str()) {
-                app.borrow_mut().funding_pick.toggle(spending_src, txid, vout);
-            }
-            app.borrow().refresh_funding(&ui_weak);
-            app.borrow().refresh_change(&ui_weak);
-            ui.global::<Callbacks>().invoke_compose_changed();
-        });
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_funding_toggle_coin(move |key| app.borrow_mut().on_funding_toggle_coin(&ui_weak, &fs, key));
     }
     {
         let app = app.clone();
-        ui.global::<Callbacks>().on_funding_done(move || {
-            let pick = app.borrow().funding_pick.clone();
-            log::info!(
-                "cb: pay-from {} coins={}",
-                pick.mode_label(),
-                pick.notebook.len() + pick.spending.len()
-            );
-        });
+        ui.global::<Callbacks>().on_funding_done(move || app.borrow().on_funding_done());
     }
 
     // Change screen (26): compose destination for change.
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_change_open(move || {
-            app.borrow().refresh_change(&ui_weak);
-        });
+        ui.global::<Callbacks>().on_change_open(move || app.borrow().on_change_open(&ui_weak));
     }
     {
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
-        ui.global::<Callbacks>().on_change_pick(move |choice| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            app.borrow_mut().change_pick.choice = choice.to_string();
-            ui.global::<ChangePick>().set_choice(choice.clone());
-            ui.global::<ChangePick>().set_custom_error("".into());
-            log::info!("cb: change-pick {choice}");
-            app.borrow().refresh_change(&ui_weak);
-            ui.global::<Callbacks>().invoke_compose_changed();
-        });
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_change_pick(move |choice| app.borrow_mut().on_change_pick(&ui_weak, &fs, choice));
     }
     {
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
-        ui.global::<Callbacks>().on_change_address_changed(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            app.borrow_mut().change_pick.custom_address =
-                ui.global::<ChangePick>().get_custom_address().to_string();
-            ui.global::<ChangePick>().set_custom_error("".into());
-            ui.global::<Callbacks>().invoke_compose_changed();
-        });
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_change_address_changed(move || app.borrow_mut().on_change_address_changed(&ui_weak, &fs));
     }
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_change_done(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            ui.global::<Callbacks>().invoke_compose_changed();
-        });
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_change_done(move || app.borrow_mut().on_change_done(&ui_weak, &fs));
     }
 
 
@@ -4200,30 +5362,17 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // the "recompute now" trigger `edited` fires, same shape as every
     // other compose field's `edited => { Callbacks.compose-changed(); }`.
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_pq_passphrase_changed(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            ui.global::<Callbacks>().invoke_compose_changed();
-        });
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_pq_passphrase_changed(move || app.borrow_mut().on_pq_passphrase_changed(&ui_weak, &fs));
     }
 
     {
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
-        ui.global::<Callbacks>().on_pq_generate_passphrase(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            match passphrase::generate() {
-                Ok(phrase) => {
-                    ui.global::<Compose>().set_pq_passphrase_text(phrase.clone().into());
-                    app.borrow_mut().pq_generated = Some(phrase);
-                    log::info!("cb: pq-generate bits={:.0}", passphrase::GENERATED_BITS);
-                    ui.global::<Callbacks>().invoke_compose_changed();
-                }
-                Err(e) => {
-                    log::warn!("cb: pq-generate err={e}");
-                }
-            }
-        });
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_pq_generate_passphrase(move || app.borrow_mut().on_pq_generate_passphrase(&ui_weak, &fs));
     }
 
     {
@@ -5294,216 +6443,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // was staged (Plan/SweepPlan/the stashed Psbt) and clear the shown
     // rows, then return to the kind's origin screen.
     {
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
-        ui.global::<Callbacks>().on_confirm_cancel(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let kind = ui.global::<ConfirmSign>().get_kind().to_string();
-            log::info!("cb: confirm cancel kind={kind}");
-            app.borrow_mut().plan = None;
-            app.borrow_mut().sweep_plan = None;
-            app.borrow_mut().psbt_pending = None;
-            let cs = ui.global::<ConfirmSign>();
-            cs.set_inputs(Rc::new(VecModel::from(Vec::<ConfirmRow>::new())).into());
-            cs.set_outputs(Rc::new(VecModel::from(Vec::<ConfirmRow>::new())).into());
-            cs.set_context("".into());
-            cs.set_txid("".into());
-            cs.set_note("".into());
-            cs.set_fee_line("".into());
-            cs.set_warn("".into());
-            cs.set_kind("".into());
-            let back = match kind.as_str() {
-                "sweep" | "consolidate" => Screen::Sweep,
-                "psbt" => Screen::Sync,
-                _ => Screen::Compose,
-            };
-            ui.global::<Ui>().set_screen(back);
-        });
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_confirm_cancel(move || app.borrow_mut().on_confirm_cancel(&ui_weak));
     }
 
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let app = app.clone();
-        ui.global::<Callbacks>().on_open_note(move |id| {
-            let state = app.borrow().state.clone();
-            let identity = app.borrow().identity.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let st = state.borrow();
-            let Some(n) = st.notes.iter().find(|n| n.id == id.as_str()) else { return };
-            let view = ui.global::<View>();
-            view.set_id(n.id.clone().into());
-            view.set_text(n.text.clone().into());
-            view.set_badge(if n.private { "PRIVATE" } else { "PUBLIC" }.into());
-            let where_line = match n.height {
-                Some(h) => format!("confirmed at block {h}"),
-                None => "pending — scan the tx QR with the companion to broadcast".to_string(),
-            };
-            let who_line = if n.recipients.len() > 1 {
-                let mut line = format!("\nto ({}): {}", n.recipients.len(), n.recipients[0]);
-                for addr in &n.recipients[1..] {
-                    line.push_str(&format!("\n    {addr}"));
-                }
-                line
-            } else {
-                match (&n.from, &n.to) {
-                    (Some(from), _) => format!("\nfrom: {from}"),
-                    (None, Some(to)) => format!("\nto: {to}"),
-                    _ => String::new(),
-                }
-            };
-            view.set_meta(format!("{where_line}{who_line}\ntxid: {}", n.txid).into());
-            set_view_qr(&view, n);
-            view.set_show_qr(false);
-
-            // Post-quantum lock state (pq.rs) — mirrors the Mac app's
-            // `refresh_note_unlock_ui`: an own (sent) DIRECTED note
-            // carrying FLAG_MLKEM can NEVER be re-opened (the ct was
-            // encapsulated to the RECIPIENT only — checked first,
-            // unconditionally, even if FLAG_PW is also set); a
-            // received/unlockable note with FLAG_PW gets the password
-            // field; anything else locked (a received ML-KEM-only note
-            // this device somehow couldn't auto-decrypt at scan time)
-            // gets an explanatory caption only.
-            //
-            // Self-notes have no sender OR recipient, so `n.from.is_none()`
-            // alone can't disambiguate a self-locked body from an own
-            // directed-sent one the way it used to — `is_self_locked`
-            // (`LockedBody::is_self`) does. A self body sealed under
-            // FLAG_MLKEM (PLAN-graffito-quantum-key.md) is now tried
-            // against this device's own personal quantum key, if one is
-            // stored: KEM-only unlocks automatically (view-only — nothing
-            // persisted, matching every other self-pq unlock); KEM+FLAG_PW
-            // still needs the typed password too, so it falls through to
-            // the normal password field with the stored key supplied
-            // alongside it at Unlock (`on_unlock_note`). No device key, or
-            // a present key that doesn't decrypt (e.g. after a Replace),
-            // falls back to an honest caption — never the directed
-            // "sealed to the recipient's key" message (there IS no
-            // recipient).
-            let locked = n.locked.is_some();
-            let is_self_locked = n.locked.as_ref().map(pq::LockedBody::is_self).unwrap_or(false);
-            let sender_cannot_reopen = locked
-                && !is_self_locked
-                && n.from.is_none()
-                && n.pq_flags & notes_core::envelope::FLAG_MLKEM != 0;
-            let self_kem_locked =
-                locked && is_self_locked && n.pq_flags & notes_core::envelope::FLAG_MLKEM != 0;
-            let self_kem_also_pw =
-                self_kem_locked && n.pq_flags & notes_core::envelope::FLAG_PW != 0;
-            let mut kem_auto_text: Option<String> = None;
-            let mut kem_key_present = false;
-            let mut kem_key_wrong = false;
-            if self_kem_locked {
-                // Bound first: an `if let` scrutinee's RefMut would live
-                // through the whole block.
-                let device_kp = app.borrow_mut().device_quantum_key(&fs);
-                if let Some(kp) = device_kp {
-                    kem_key_present = true;
-                    if !self_kem_also_pw {
-                        if let (Some(locked_body), Some(ident)) =
-                            (n.locked.as_ref(), identity.borrow().as_ref())
-                        {
-                            match pq::unlock_self(
-                                locked_body,
-                                &ident.enc_key,
-                                Some(&kp.secret()),
-                                None,
-                            ) {
-                                Ok(bytes) => {
-                                    // Log-contract line for the UI suite
-                                    // (graffito-selfpq.sh): the auto-unlock
-                                    // is otherwise invisible to log greps.
-                                    log::info!("cb: unlock-note auto=kem ok");
-                                    kem_auto_text = Some(String::from_utf8_lossy(&bytes).to_string())
-                                }
-                                Err(_) => {
-                                    log::warn!("cb: unlock-note auto=kem err=mismatch");
-                                    kem_key_wrong = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let needs_password = (locked
-                && !sender_cannot_reopen
-                && !self_kem_locked
-                && n.pq_flags & notes_core::envelope::FLAG_PW != 0)
-                || (self_kem_also_pw && kem_key_present);
-            view.set_locked(locked && kem_auto_text.is_none());
-            view.set_needs_password(needs_password);
-            view.set_lock_caption(
-                if sender_cannot_reopen {
-                    "Can't re-read this note — it's sealed to the recipient's key."
-                } else if self_kem_locked && (kem_auto_text.is_some() || needs_password) {
-                    ""
-                } else if self_kem_locked && kem_key_wrong {
-                    "This note's quantum key doesn't match the one stored on this device."
-                } else if self_kem_locked {
-                    "Locked with a quantum key this device doesn't hold."
-                } else if locked && !needs_password {
-                    "Sealed to a quantum key this device doesn't hold."
-                } else {
-                    ""
-                }
-                .into(),
-            );
-            if let Some(text) = &kem_auto_text {
-                view.set_text(text.clone().into());
-            }
-            view.set_unlock_password("".into());
-            view.set_unlock_error("".into());
-
-            // Reply / Reply-all: a small local equivalent of notes-core's
-            // `bundle::reply_set` operating on the persisted `NoteRec`
-            // (plain display/UX logic, not a notes-core FROZEN invariant —
-            // deliberately not routed through notes-core, which only has
-            // the heavier `RecoveredNote` shape). `full_set` = {from} ∪
-            // recipients minus my own address, deduped, sender-first.
-            let my_address = identity.borrow().as_ref().map(|id| id.address(st.network()));
-            let mut full_set: Vec<String> = Vec::new();
-            let mut push_addr = |addr: &str, out: &mut Vec<String>| {
-                if Some(addr) != my_address.as_deref() && !out.iter().any(|a| a == addr) {
-                    out.push(addr.to_string());
-                }
-            };
-            if let Some(from) = &n.from {
-                push_addr(from, &mut full_set);
-            }
-            if !n.recipients.is_empty() {
-                for r in &n.recipients {
-                    push_addr(r, &mut full_set);
-                }
-            } else if let Some(to) = &n.to {
-                push_addr(to, &mut full_set);
-            }
-            // Received note: Reply is ALWAYS addressed to the sender,
-            // regardless of full_set's size. Own note: Reply is addressed
-            // to the sole other party only when there is exactly one — 2+
-            // hides Reply in favor of Reply-all (never both for an own
-            // note). A pure self-note (full_set empty) shows neither.
-            let reply_address = if let Some(from) = &n.from {
-                from.clone()
-            } else if full_set.len() == 1 {
-                full_set[0].clone()
-            } else {
-                String::new()
-            };
-            view.set_reply_address(reply_address.into());
-            let full_set_shared: Vec<SharedString> =
-                full_set.iter().map(SharedString::from).collect();
-            view.set_reply_set(Rc::new(VecModel::from(full_set_shared)).into());
-
-            log::info!(
-                "cb: open-note id={} status={}{} qr={}",
-                n.id,
-                n.status,
-                n.from.as_deref().map(|f| format!(" from={f}")).unwrap_or_default(),
-                view.get_has_qr()
-            );
-            ui.global::<Ui>().set_screen(Screen::Note);
-        });
+        ui.global::<Callbacks>().on_open_note(move |id| app.borrow_mut().on_open_note(&ui_weak, &fs, id));
     }
 
     // Manual unlock of a locked pq note (FLAG_PW) — the note view's
@@ -5519,103 +6468,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // `needs_password` gate, so `unlock_sent`'s `SenderCannotReopen` is
     // never actually reachable from here.
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let app = app.clone();
-        ui.global::<Callbacks>().on_unlock_note(move |password| {
-            let state = app.borrow().state.clone();
-            let identity = app.borrow().identity.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let id_str = ui.global::<View>().get_id().to_string();
-            let mut st = state.borrow_mut();
-            let Some(n) = st.notes.iter_mut().find(|n| n.id == id_str) else { return };
-            let Some(locked) = n.locked.clone() else { return };
-            let id_guard = identity.borrow();
-            let Some(ident) = id_guard.as_ref() else {
-                log::warn!("cb: unlock-note err=identity-unavailable");
-                return;
-            };
-            let pw = password.to_string();
-            let pw_opt = if pw.is_empty() { None } else { Some(pw.as_str()) };
-            let is_self = locked.is_self();
-            let result: Result<Vec<u8>, notes_core::Error> = if is_self {
-                // PLAN-graffito-quantum-key.md: a self body carrying
-                // FLAG_MLKEM only reaches here (needs_password set by
-                // `on_open_note`) when it ALSO carries FLAG_PW and the
-                // device key is present — KEM-only self bodies are tried
-                // automatically on open and never show the Unlock button.
-                let mlkem_secret = if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
-                    app.borrow_mut().device_quantum_key(&fs).map(|kp| kp.secret())
-                } else {
-                    None
-                };
-                pq::unlock_self(&locked, &ident.enc_key, mlkem_secret.as_ref(), pw_opt)
-            } else {
-                let received = n.from.is_some();
-                if received {
-                    if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
-                        let ix = notebooks.borrow();
-                        let net_s = app.borrow().net.clone();
-                        let leaf = (app.borrow().active)
-                            .and_then(|acc| ix.get(acc))
-                            .and_then(|meta| derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s));
-                        drop(ix);
-                        let mut last = notes_core::Error::DecryptFailed;
-                        let mut ok: Option<Vec<u8>> = None;
-                        if let Some(leaf) = leaf {
-                            for kp in derive_mlkem_keypairs(&leaf) {
-                                let secret = kp.secret();
-                                match pq::unlock_received(&locked, &ident.tweaked_seckey, Some(&secret), pw_opt)
-                                {
-                                    Ok(pt) => {
-                                        ok = Some(pt);
-                                        break;
-                                    }
-                                    Err(e) => last = e,
-                                }
-                            }
-                        }
-                        ok.ok_or(last)
-                    } else {
-                        pq::unlock_received(&locked, &ident.tweaked_seckey, None, pw_opt)
-                    }
-                } else {
-                    pq::unlock_sent(&locked, &ident.tweaked_seckey, &ident.output_x, pw_opt)
-                }
-            };
-            drop(id_guard);
-            match result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes).to_string();
-                    // Self-pw unlock is VIEW-ONLY (PLAN-graffito-self-pw.md):
-                    // the plaintext is shown for THIS viewing only —
-                    // `n.text`/`n.locked` in the persisted store are left
-                    // untouched, so re-opening the note (or a fresh boot)
-                    // asks for the password again. A directed note's
-                    // unlock keeps its existing fill-and-clear semantics.
-                    if !is_self {
-                        n.text = text.clone();
-                        n.locked = None;
-                        save_state(&fs, &st);
-                    }
-                    log::info!("cb: unlock-note ok");
-                    drop(st);
-                    let view = ui.global::<View>();
-                    view.set_text(text.into());
-                    view.set_locked(false);
-                    view.set_needs_password(false);
-                    view.set_lock_caption("".into());
-                    view.set_unlock_error("".into());
-                    view.set_unlock_password("".into());
-                }
-                Err(e) => {
-                    log::warn!("cb: unlock-note err={e}");
-                    ui.global::<View>().set_unlock_error(format!("{e}").into());
-                }
-            }
-        });
+        ui.global::<Callbacks>().on_unlock_note(move |password| app.borrow_mut().on_unlock_note(&ui_weak, &fs, password));
     }
 
     // Reply: fresh compose draft addressed to View.reply-address. Routed
@@ -5624,17 +6480,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // it already clears Compose.to-extra on its replace path, so a stale
     // extra-recipient list from a previous draft can't leak in.
     {
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
+        let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_reply_to_note(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let addr = ui.global::<View>().get_reply_address().to_string();
-            if addr.is_empty() {
-                return;
-            }
-            app.borrow_mut().pick_contact(&ui_weak, &fs, &addr);
-        });
+        ui.global::<Callbacks>().on_reply_to_note(move || app.borrow_mut().on_reply_to_note(&ui_weak, &fs));
     }
 
     // Reply-all: primary = the first address in View.reply-set (via the
@@ -5646,21 +6495,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_reply_all_to_note(move || {
-            let state = app.borrow().state.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let set: Vec<String> =
-                ui.global::<View>().get_reply_set().iter().map(|s| s.to_string()).collect();
-            let Some((first, rest)) = set.split_first() else { return };
-            app.borrow_mut().pick_contact(&ui_weak, &fs, first);
-            let st = state.borrow();
-            let extra: Vec<ToRow> = rest
-                .iter()
-                .map(|a| ToRow { address: a.as_str().into(), label: to_label_for(&st, a).into() })
-                .collect();
-            drop(st);
-            ui.global::<Compose>().set_to_extra(Rc::new(VecModel::from(extra)).into());
-        });
+        ui.global::<Callbacks>().on_reply_all_to_note(move || app.borrow_mut().on_reply_all_to_note(&ui_weak, &fs));
     }
 
     // Shared by file import AND camera scan: parse + merge a bundle,
@@ -5671,184 +6506,36 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_import_bundle(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let result = (|| -> Result<String, String> {
-                let (name, loc, loc_label) =
-                    first_inbox_bundle(&fs).ok_or("no .json bundle in /graffito/inbox")?;
-                let json = read_text(&fs, &format!("{INBOX_DIR}/{name}"), loc)?;
-                if loc == Location::Airlock {
-                    unmount_airlock(&fs);
-                }
-                app.borrow().apply_bundle(&fs, &json, &format!("file={name} loc={loc_label}"))
-            })();
-            match result {
-                Ok(msg) => {
-                    ui.global::<Sync>().set_result(msg.into());
-                    ui.global::<Ui>().set_error("".into());
-                }
-                Err(e) => {
-                    log::warn!("cb: import-bundle err={e}");
-                    ui.global::<Sync>().set_result(e.into());
-                }
-            }
-            app.borrow().refresh_home(&ui_weak);
-        });
+        ui.global::<Callbacks>().on_import_bundle(move || app.borrow().on_import_bundle(&ui_weak, &fs));
     }
 
     // Import picker: list the bundle files actually present in the inboxes
     // so the user chooses one, instead of silently auto-picking the first.
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_list_bundles(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let sync = ui.global::<Sync>();
-            let found = list_inbox_bundles(&fs);
-            let rows: Vec<BundleRow> = found
-                .iter()
-                .map(|(name, loc, _)| {
-                    let (loc_name, loc_idx) = if *loc == Location::Airlock {
-                        ("Airlock", 1)
-                    } else {
-                        ("Internal", 0)
-                    };
-                    BundleRow {
-                        name: name.clone().into(),
-                        label: format!("{name}  ·  {loc_name}").into(),
-                        loc: loc_idx,
-                    }
-                })
-                .collect();
-            sync.set_bundles(Rc::new(VecModel::from(rows)).into());
-            sync.set_empty_hint(
-                "No bundle files found. Put a .json bundle in /graffito/inbox on Internal (or the Airlock volume), then tap Refresh — or use \"Scan bundle\" to import by QR from the companion.".into(),
-            );
-            sync.set_picking(true);
-            log::info!("cb: list-bundles n={}", found.len());
-        });
+        ui.global::<Callbacks>().on_list_bundles(move || app.borrow().on_list_bundles(&ui_weak, &fs));
     }
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_pick_bundle(move |name, loc_idx| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let loc = if loc_idx == 1 { Location::Airlock } else { Location::User };
-            let result = (|| -> Result<String, String> {
-                if loc == Location::Airlock {
-                    ensure_airlock_mounted(&fs)?;
-                }
-                let json = read_text(&fs, &format!("{INBOX_DIR}/{name}"), loc);
-                if loc == Location::Airlock {
-                    unmount_airlock(&fs);
-                }
-                let loc_label = if loc == Location::Airlock { "airlock" } else { "internal" };
-                app.borrow().apply_bundle(&fs, &json?, &format!("file={name} loc={loc_label}"))
-            })();
-            let sync = ui.global::<Sync>();
-            sync.set_picking(false);
-            match result {
-                Ok(msg) => {
-                    sync.set_result(msg.into());
-                    ui.global::<Ui>().set_error("".into());
-                }
-                Err(e) => {
-                    log::warn!("cb: pick-bundle err={e}");
-                    sync.set_result(e.into());
-                }
-            }
-            app.borrow().refresh_home(&ui_weak);
-        });
+        ui.global::<Callbacks>().on_pick_bundle(move |name, loc_idx| app.borrow().on_pick_bundle(&ui_weak, &fs, name, loc_idx));
     }
 
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_scan_bundle(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let opts = ScanQrOptions {
-                header_title: "Scan sync bundle".into(),
-                message: "Point at the companion's bundle QR (static or animated)".into(),
-                ..ScanQrOptions::default()
-            };
-            // Blocks while the system scanner modal owns the screen; it
-            // reassembles animated UR sequences itself (foundation-ur).
-            let (kind, data) = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
-                Ok(Some(ScanQrResult::Qr { data, .. })) => ("qr", data),
-                Ok(Some(ScanQrResult::Ur2 { ur_type, data, .. })) => {
-                    log::info!("cb: scan-bundle ur-type={ur_type}");
-                    ("ur", data)
-                }
-                Ok(_) => {
-                    log::info!("cb: scan-bundle cancelled");
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("cb: scan-bundle err=scanner {e:?}");
-                    ui.global::<Sync>()
-                        .set_result(format!("QR scanner unavailable: {e:?}").into());
-                    return;
-                }
-            };
-            log::info!("cb: scan-bundle kind={kind} bytes={}", data.len());
-            let result = decode_scanned(&data)
-                .map_err(|e| e.to_string())
-                .and_then(|json| app.borrow().apply_bundle(&fs, &json, &format!("src=scan-{kind}")));
-            match result {
-                Ok(msg) => {
-                    ui.global::<Sync>().set_result(msg.into());
-                    ui.global::<Ui>().set_error("".into());
-                }
-                Err(e) => {
-                    log::warn!("cb: scan-bundle err={e}");
-                    ui.global::<Sync>().set_result(format!("Scan failed: {e}").into());
-                }
-            }
-            app.borrow().refresh_home(&ui_weak);
-        });
+        ui.global::<Callbacks>().on_scan_bundle(move || app.borrow().on_scan_bundle(&ui_weak, &fs));
     }
 
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_export_pending(move || {
-            let state = app.borrow().state.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let st = state.borrow();
-            let pending: Vec<&NoteRec> = st
-                .notes
-                .iter()
-                .filter(|n| n.status == "pending" && !n.raw_hex.is_empty())
-                .collect();
-            let mut written = 0usize;
-            let airlock_ok = ensure_airlock_mounted(&fs).is_ok();
-            for n in &pending {
-                let file = format!("{OUTBOX_DIR}/{}.hex", n.txid);
-                if ensure_dir(&fs, OUTBOX_DIR, Location::User)
-                    .and_then(|_| write_file(&fs, &file, Location::User, n.raw_hex.as_bytes()))
-                    .is_ok()
-                {
-                    written += 1;
-                }
-                if airlock_ok {
-                    let _ = ensure_dir(&fs, OUTBOX_DIR, Location::Airlock).and_then(|_| {
-                        write_file(&fs, &file, Location::Airlock, n.raw_hex.as_bytes())
-                    });
-                }
-            }
-            if airlock_ok {
-                unmount_airlock(&fs);
-            }
-            log::info!(
-                "cb: export-pending n={written} airlock={}",
-                if airlock_ok { "ok" } else { "err" }
-            );
-            ui.global::<Sync>()
-                .set_result(format!("Exported {written} pending tx(s) to {OUTBOX_DIR}.").into());
-        });
+        ui.global::<Callbacks>().on_export_pending(move || app.borrow().on_export_pending(&ui_weak, &fs));
     }
 
     // Sign an external transaction (PSBT) — stage A: scan it, validate it
@@ -5858,299 +6545,32 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // confirm-sign dispatcher below — nothing about a scanned PSBT touches
     // disk until the user taps Sign.
     {
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
-        ui.global::<Callbacks>().on_sign_psbt(move || {
-            let identity = app.borrow().identity.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let id_guard = identity.borrow();
-            let Some(id) = id_guard.as_ref() else {
-                ui.global::<Sync>().set_result("Device locked — no signing key.".into());
-                return;
-            };
-            let opts = ScanQrOptions {
-                header_title: "Scan transaction".into(),
-                message: "Point at the desktop app's PSBT QR".into(),
-                ..ScanQrOptions::default()
-            };
-            let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
-                Ok(Some(ScanQrResult::Qr { data: d, .. })) | Ok(Some(ScanQrResult::Ur2 { data: d, .. })) => d,
-                Ok(_) => {
-                    log::info!("cb: sign-psbt cancelled");
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("cb: sign-psbt err=scanner {e:?}");
-                    ui.global::<Sync>().set_result(format!("QR scanner unavailable: {e:?}").into());
-                    return;
-                }
-            };
-            let bytes = normalize_psbt_bytes(&data);
-            let psbt = match notes_core::psbt::Psbt::deserialize(&bytes) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::warn!("cb: sign-psbt err={e}");
-                    ui.global::<Sync>().set_result(format!("Not a PSBT: {e}").into());
-                    return;
-                }
-            };
-            let our_spk = p2tr_script_pubkey(&id.output_x);
-            let ours = psbt
-                .inputs
-                .iter()
-                .filter(|i| {
-                    i.witness_utxo.as_ref().map(|w| w.script_pubkey == our_spk).unwrap_or(false)
-                })
-                .count();
-            if ours == 0 {
-                ui.global::<Sync>()
-                    .set_result("No inputs belong to this device's address.".into());
-                return;
-            }
-
-            let net_dev = app.borrow().net.clone();
-            let mut network = Network::from_str_opt(&net_dev).unwrap_or(Network::Mainnet);
-            let wallet_ctx = (app.borrow().seed_idx, app.borrow().bip_account);
-            let ix = notebooks.borrow();
-            let (self_spks, spending_spks) = confirm_self_spks(&ix, app_seed_get(&app_seed), &net_dev, wallet_ctx);
-            drop(ix);
-
-            // Port B (network-display fix, 2026-07-19): a PSBT's
-            // scriptPubKeys carry NO network/HRP information at all — HRP
-            // is purely an address-ENCODING artifact, never part of the
-            // wire format — so rendering every address below with the
-            // DEVICE's current network setting is wrong whenever this PSBT
-            // was built for a different chain (it will show the right
-            // bytes with the wrong prefix). The only honest signal
-            // available at this call site is a BIP32 derivation path
-            // attached to one of OUR OWN recognized inputs (an external
-            // tool that imported this device's `export.rs` account
-            // descriptor would naturally embed one) — its hardened
-            // coin-type level (`seeds::coin_type`: 0' mainnet, else 1')
-            // reflects what that tool believed the network to be. Only
-            // inputs already proven ours (`witness_utxo.script_pubkey ==
-            // our_spk`) are consulted; a foreign/external-funding input's
-            // derivation convention is none of this device's business.
-            // coin-type 1' can't distinguish testnet4/signet/regtest from
-            // one another (this crate's own `coin_type()` doesn't either),
-            // but testnet4 and signet already share the "tb" HRP here, so
-            // `Testnet4` is the right display for the overwhelming
-            // majority of that bucket; a real external tool handing a
-            // REGTEST PSBT to a physical device is not a scenario this
-            // display-only fix needs to get byte-perfect. No derivation
-            // signal at all (the common case today) changes nothing —
-            // this only ever ADDS information on top of the existing
-            // device-network fallback, never removes it, and it can never
-            // affect signing/validation/tx bytes (display only).
-            let device_network_label = network.as_str();
-            let mut coin_types: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-            for (i, inp) in psbt.inputs.iter().enumerate() {
-                let is_ours = inp.witness_utxo.as_ref().map(|w| w.script_pubkey == our_spk).unwrap_or(false);
-                if !is_ours {
-                    continue;
-                }
-                if let Some(ct) = psbt.input_derivation_coin_type(i) {
-                    coin_types.insert(ct);
-                }
-            }
-            let mut network_warn: Option<String> = None;
-            if let [only] = coin_types.iter().collect::<Vec<_>>()[..] {
-                let derived_mainnet = *only == 0;
-                let device_mainnet = network == Network::Mainnet;
-                if derived_mainnet != device_mainnet {
-                    let derived_label = if derived_mainnet { "mainnet" } else { "a test network" };
-                    network_warn = Some(format!(
-                        "this transaction's key derivation indicates {derived_label}, but the device is set to {device_network_label} - addresses below use the derived network's encoding"
-                    ));
-                    network = if derived_mainnet { Network::Mainnet } else { Network::Testnet4 };
-                }
-            }
-
-            let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> = BTreeMap::new();
-            for (i, txin) in psbt.unsigned_tx.inputs.iter().enumerate() {
-                let Some(wu) = psbt.inputs.get(i).and_then(|p| p.witness_utxo.as_ref()) else {
-                    continue;
-                };
-                let mut t = txin.txid;
-                t.reverse();
-                let is_ours = wu.script_pubkey == our_spk;
-                let address = notes_core::address::address_from_spk(&wu.script_pubkey, network);
-                let source =
-                    if is_ours { "This notebook".to_string() } else { "External funding".to_string() };
-                prevouts.insert(
-                    format!("{}:{}", hex::encode(t), txin.vout),
-                    notes_core::confirm::PrevoutInfo { value: wu.value, address, source },
-                );
-            }
-            let note_preview = confirm_note_preview(&psbt.unsigned_tx.outputs);
-
-            let cctx = notes_core::confirm::ConfirmCtx {
-                network,
-                prevouts,
-                self_spks,
-                spending_spks,
-                expected_change: None,
-                recipient: None,
-                recipient_name: None,
-                recipients: Vec::new(),
-                note_preview,
-            };
-            let raw_hex = hex::encode(psbt.unsigned_tx.serialize_legacy());
-            drop(id_guard);
-
-            match show_confirm_screen(&ui, "psbt", &raw_hex, &cctx, "External funding tx".to_string(), "Sign & export") {
-                Ok(()) => {
-                    if let Some(msg) = &network_warn {
-                        log::info!("cb: confirm network-mismatch derived={}", network.as_str());
-                        let cs = ui.global::<ConfirmSign>();
-                        let existing = cs.get_warn().to_string();
-                        cs.set_warn(
-                            if existing.is_empty() { msg.clone().into() } else { format!("{existing}; {msg}").into() },
-                        );
-                    }
-                    app.borrow_mut().psbt_pending = Some(psbt);
-                }
-                Err(e) => {
-                    log::warn!("cb: confirm summarize err={e}");
-                    ui.global::<Sync>().set_result(format!("Cannot show confirm: {e}").into());
-                }
-            }
-        });
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_sign_psbt(move || app.borrow_mut().on_sign_psbt(&ui_weak));
     }
 
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let app = app.clone();
-        ui.global::<Callbacks>().on_cycle_network(move || {
-            let state = app.borrow().state.clone();
-            let identity = app.borrow().identity.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
-            // Network is device-level (wallet-wide): flush the active
-            // notebook, cycle the shared network, persist it in config, and
-            // reload the active notebook's ledger for the new chain (each
-            // notebook keeps a per-network ledger in state-<net>-<account>).
-            if app.borrow().active.is_some() {
-                save_state(&fs, &state.borrow());
-            }
-            let next = match app.borrow().net.as_str() {
-                "mainnet" => "testnet4",
-                "testnet4" => "signet",
-                "signet" => "regtest",
-                _ => "mainnet",
-            }
-            .to_string();
-            app.borrow_mut().net = next.clone();
-            app.borrow().persist_config(&fs);
-            log::info!("cb: set-network {next}");
-            let active = app.borrow().active;
-            if let Some(account) = active {
-                let mut fresh = load_state(&fs, &next, account);
-                fresh.chunk_override = app.borrow().device_chunk;
-                *state.borrow_mut() = fresh;
-                // Legacy identities are network-independent (only the
-                // address ENCODING changes), but bip86 notebooks use the
-                // BIP-44 coin type — their keys differ per network, so
-                // always re-derive from the meta.
-                if let Some(m) = notebooks.borrow().get(account) {
-                    *identity.borrow_mut() = derive_identity(app_seed_get(&app_seed), m, &next);
-                }
-            }
-            let _ = &ui_weak;
-            app.borrow().refresh_home(&ui_weak);
-            app.borrow().refresh_notes(&ui_weak);
-            app.borrow().refresh_coins(&ui_weak, &fs);
-            app.borrow().refresh_notebooks(&ui_weak, &fs);
-        });
+        ui.global::<Callbacks>().on_cycle_network(move || app.borrow_mut().on_cycle_network(&ui_weak, &fs));
     }
 
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let app = app.clone();
-        ui.global::<Callbacks>().on_chunk_changed(move || {
-            let state = app.borrow().state.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let settings = ui.global::<Settings>();
-            let mut st = state.borrow_mut();
-            match settings.get_chunk_mode() {
-                0 => st.chunk_override = None,
-                1 => st.chunk_override = Some(80),
-                _ => {
-                    match settings.get_chunk_text().trim().parse::<usize>() {
-                        Ok(n) if (MIN_CHUNK..=DEFAULT_CHUNK).contains(&n) => {
-                            st.chunk_override = Some(n);
-                        }
-                        _ => {
-                            let msg = format!(
-                                "Chunk size must be {MIN_CHUNK}–{DEFAULT_CHUNK} bytes."
-                            );
-                            log::warn!("cb: set-chunk-size err={msg}");
-                            settings.set_chunk_error(msg.into());
-                            // Leave the user's text in place to fix.
-                            return;
-                        }
-                    }
-                }
-            }
-            log::info!(
-                "cb: set-chunk-size {} ok",
-                st.chunk_override.map(|n| n.to_string()).unwrap_or("auto".into())
-            );
-            settings.set_chunk_error("".into());
-            save_state(&fs, &st);
-            // Chunk is device-level (wallet-wide): persist it in config too.
-            app.borrow_mut().device_chunk = st.chunk_override;
-            app.borrow().persist_config(&fs);
-            drop(st);
-            // Reflect the effective size back into the field (auto/compat),
-            // without touching a valid custom value.
-            app.borrow().refresh_home(&ui_weak);
-            // Re-price the draft immediately so the compose cost line is
-            // already current when the user returns to it.
-            ui.global::<Callbacks>().invoke_compose_changed();
-        });
+        ui.global::<Callbacks>().on_chunk_changed(move || app.borrow_mut().on_chunk_changed(&ui_weak, &fs));
     }
 
     // Transaction locktime (anti-fee-sniping). Wallet-level like the chunk
     // size, so it lives in config.json rather than any notebook's state.
     {
-        let fs = fs.clone();
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
-        ui.global::<Callbacks>().on_locktime_changed(move || {
-            let state = app.borrow().state.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let settings = ui.global::<Settings>();
-            let policy = match settings.get_locktime_mode() {
-                0 => LockTimePolicy::Tip,
-                1 => LockTimePolicy::Zero,
-                _ => match settings.get_locktime_text().trim().parse::<u32>() {
-                    // A height at or above 500_000_000 is read by consensus
-                    // as a UNIX timestamp, which is never what someone
-                    // typing a block height means — reject it here rather
-                    // than silently build an unspendable-until-2035 tx.
-                    Ok(h) if h < 500_000_000 => LockTimePolicy::Custom { height: h },
-                    _ => {
-                        let msg = "Locktime must be a block height below 500000000.".to_string();
-                        log::warn!("cb: set-locktime err={msg}");
-                        settings.set_locktime_error(msg.into());
-                        // Leave the user's text in place to fix.
-                        return;
-                    }
-                },
-            };
-            app.borrow_mut().lock_policy = policy;
-            app.borrow().persist_config(&fs);
-            settings.set_locktime_error("".into());
-            let tip = state.borrow().tip_height;
-            let effective = resolve_locktime(policy, tip);
-            settings.set_locktime_effective(locktime_caption(policy, tip).into());
-            log::info!("cb: set-locktime {} effective={effective} ok", policy.as_str());
-        });
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_locktime_changed(move || app.borrow_mut().on_locktime_changed(&ui_weak, &fs));
     }
 
     // Compose "too large" dialog → raise the chunk size to Standard (auto) and
@@ -6159,20 +6579,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_oversize_bump(move || {
-            let state = app.borrow().state.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            {
-                let mut st = state.borrow_mut();
-                st.chunk_override = None; // Standard / auto = DEFAULT_CHUNK
-                save_state(&fs, &st);
-            }
-            log::info!("cb: set-chunk-size auto ok (oversize-bump)");
-            let compose = ui.global::<Compose>();
-            compose.set_show_oversize(false);
-            ui.global::<Settings>().set_chunk_mode(0); // mirror into the settings pill
-            ui.global::<Callbacks>().invoke_compose_changed();
-        });
+        ui.global::<Callbacks>().on_oversize_bump(move || app.borrow_mut().on_oversize_bump(&ui_weak, &fs));
     }
 
     {
@@ -6189,20 +6596,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_toggle_sender(move |key, excluded| {
-            let state = app.borrow().state.clone();
-            let Some(_ui) = ui_weak.upgrade() else { return };
-            {
-                let mut st = state.borrow_mut();
-                st.set_excluded(key.as_str(), excluded);
-                save_state(&fs, &st);
-                log::info!(
-                    "cb: toggle-sender excluded={excluded} hidden={}",
-                    st.excluded_senders.len()
-                );
-            }
-            app.borrow().refresh_notes(&ui_weak);
-        });
+        ui.global::<Callbacks>().on_toggle_sender(move |key, excluded| app.borrow().on_toggle_sender(&ui_weak, &fs, key, excluded));
     }
     {
         let app = app.clone();
@@ -6232,130 +6626,30 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let app = app.clone();
         let ui_weak = ui_weak.clone();
-        ui.global::<NotebookCb>().on_rename(move |account| {
-            let notebooks = app.borrow().notebooks.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let nb = ui.global::<NotebooksUi>();
-            // Prefill the RAW local name (the display name may be an addr
-            // short form, which must not become a name by accident).
-            let raw = notebooks
-                .borrow()
-                .get(account.max(0) as u32)
-                .map(|m| m.name.clone())
-                .unwrap_or_default();
-            nb.set_name_text(raw.into());
-            nb.set_name_account(account);
-        });
+        ui.global::<NotebookCb>().on_rename(move |account| app.borrow().on_rename(&ui_weak, account));
     }
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        ui.global::<NotebookCb>().on_name_cancel(move || {
-            if let Some(ui) = ui_weak.upgrade() {
-                ui.global::<NotebooksUi>().set_name_account(-1);
-            }
-        });
+        ui.global::<NotebookCb>().on_name_cancel(move || app.borrow().on_name_cancel(&ui_weak));
     }
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let app = app.clone();
-        ui.global::<NotebookCb>().on_name_save(move || {
-            let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let nb = ui.global::<NotebooksUi>();
-            let sel = nb.get_name_account();
-            if sel == -1 {
-                return;
-            }
-            let name = nb.get_name_text().trim().to_string();
-            nb.set_name_account(-1);
-            nb.set_name_text("".into());
-            if sel == -2 {
-                // CREATE: a bip86 notebook at the next unused receive
-                // index of the active (seed, account) context — the
-                // recovery-seeds scheme, words-recoverable anywhere.
-                // (Legacy notebooks are never created anymore.)
-                if app_seed_get(&app_seed).is_none() {
-                    ui.global::<Ui>().set_error("Device locked — can't create a notebook.".into());
-                    return;
-                }
-                let (seed, bacct) = (app.borrow().seed_idx, app.borrow().bip_account);
-                let account = {
-                    let mut ix = notebooks.borrow_mut();
-                    let account = ix.create_bip86(seed, bacct, &name);
-                    save_notebooks(&fs, &ix);
-                    account
-                };
-                let index = notebooks.borrow().get(account).map(|m| m.index).unwrap_or(0);
-                log::info!(
-                    "cb: create-notebook account={account} scheme=bip86 seed={seed} bip-account={bacct} index={index}"
-                );
-                app.borrow().refresh_notebooks(&ui_weak, &fs);
-                app.borrow_mut().switch_notebook(&ui_weak, &fs, account);
-            } else {
-                let account = sel as u32;
-                {
-                    let mut ix = notebooks.borrow_mut();
-                    ix.rename(account, &name);
-                    save_notebooks(&fs, &ix);
-                }
-                log::info!("cb: rename-notebook account={account}");
-                app.borrow().refresh_notebooks(&ui_weak, &fs);
-                // If it's the open notebook, update its home title.
-                if app.borrow().active == Some(account) {
-                    let title = notebooks
-                        .borrow()
-                        .get(account)
-                        .map(|m| m.name.clone())
-                        .filter(|n| !n.trim().is_empty());
-                    if let Some(t) = title {
-                        nb.set_title(t.into());
-                    }
-                }
-            }
-        });
+        ui.global::<NotebookCb>().on_name_save(move || app.borrow_mut().on_name_save(&ui_weak, &fs));
     }
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let app = app.clone();
-        ui.global::<NotebookCb>().on_archive(move |account, archived| {
-            let notebooks = app.borrow().notebooks.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let account = account.max(0) as u32;
-            if archived {
-                // Guard: a notebook with coins must be emptied first
-                // (sweep/consolidate). Zero active notebooks is allowed.
-                let bal = load_state(&fs, &app.borrow().net, account).balance();
-                if bal > 0 {
-                    ui.global::<Ui>()
-                        .set_error(format!("This notebook holds {bal} sats — empty it first.").into());
-                    return;
-                }
-            }
-            {
-                let mut ix = notebooks.borrow_mut();
-                ix.set_archived(account, archived);
-                save_notebooks(&fs, &ix);
-            }
-            log::info!("cb: archive-notebook account={account} archived={archived}");
-            app.borrow().refresh_notebooks(&ui_weak, &fs);
-        });
+        ui.global::<NotebookCb>().on_archive(move |account, archived| app.borrow().on_archive(&ui_weak, &fs, account, archived));
     }
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let app = app.clone();
-        ui.global::<NotebookCb>().on_back_to_list(move || {
-            let state = app.borrow().state.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            if app.borrow().active.is_some() {
-                save_state(&fs, &state.borrow());
-            }
-            app.borrow().refresh_notebooks(&ui_weak, &fs);
-            ui.global::<Ui>().set_screen(Screen::Notebooks);
-        });
+        ui.global::<NotebookCb>().on_back_to_list(move || app.borrow().on_back_to_list(&ui_weak, &fs));
     }
 
     // ---- recovery seeds (screen 21 + wallet context) ----
@@ -6371,17 +6665,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         ui.global::<Callbacks>().on_reveal_seed(move || app.borrow().reveal_words(&ui_weak));
     }
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_reveal_close(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let recovery = ui.global::<Recovery>();
-            recovery.set_words_col1("".into());
-            recovery.set_words_col2("".into());
-            recovery.set_title_line("".into());
-            recovery.set_qr(Image::default());
-            recovery.set_show_qr(false);
-            log::info!("cb: reveal-seed cancelled");
-        });
+        ui.global::<Callbacks>().on_reveal_close(move || app.borrow().on_reveal_close(&ui_weak));
     }
     // ---- export keys (screen 23) ----
     // Reveal the active (seed, account) context's importable formats:
@@ -6393,76 +6679,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // The active account's notebooks as picker rows (index/name/short addr)
     // plus the default selection (first notebook, else a synthetic index 0).
     {
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
-        ui.global::<Callbacks>().on_reveal_public(move || {
-            let app_seed = app.borrow().app_seed.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let r = ui.global::<Recovery>();
-            let si = app.borrow().seed_idx;
-            let acct = app.borrow().bip_account;
-            let Some(seed) = app_seed_get(&app_seed).as_ref() else {
-                ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
-                log::warn!("cb: reveal-public seed={si} account={acct} err=locked");
-                return;
-            };
-            let network = Network::from_str_opt(&app.borrow().net).unwrap_or(Network::Mainnet);
-            let derived = (|| -> Result<(), notes_core::Error> {
-                r.set_export_xpub(notes_core::export::account_xpub(seed, si, network, acct)?.into());
-                r.set_export_descriptor(
-                    notes_core::export::account_descriptor(seed, si, network, acct)?.into(),
-                );
-                Ok(())
-            })();
-            if let Err(e) = derived {
-                ui.global::<Ui>().set_error(format!("Export failed: {e}").into());
-                log::warn!("cb: reveal-public seed={si} account={acct} err={e}");
-                return;
-            }
-            r.set_export_seed_view(false);
-            r.set_export_title(export_title(seed, si, acct).into());
-            app.borrow().apply_export(&ui_weak, 0);
-            log::info!("cb: reveal-public seed={si} account={acct} ok");
-        });
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_reveal_public(move || app.borrow().on_reveal_public(&ui_weak));
     }
     {
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
-        ui.global::<Callbacks>().on_reveal_private(move || {
-            let app_seed = app.borrow().app_seed.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let r = ui.global::<Recovery>();
-            let si = app.borrow().seed_idx;
-            let acct = app.borrow().bip_account;
-            let Some(seed) = app_seed_get(&app_seed).as_ref() else {
-                ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
-                log::warn!("cb: reveal-private seed={si} account={acct} err=locked");
-                return;
-            };
-            let net_s = app.borrow().net.clone();
-            let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
-            let (rows, sel, sel_name) = app.borrow().export_rows(si, acct, &net_s, network);
-            let derived = (|| -> Result<(), notes_core::Error> {
-                let (hex, wif) = export_leaf_formats(seed, si, network, acct, sel as u32)?;
-                r.set_export_hex(hex.into());
-                r.set_export_wif(wif.into());
-                Ok(())
-            })();
-            if let Err(e) = derived {
-                ui.global::<Ui>().set_error(format!("Export failed: {e}").into());
-                log::warn!("cb: reveal-private seed={si} account={acct} err={e}");
-                return;
-            }
-            r.set_export_notebooks(Rc::new(VecModel::from(rows)).into());
-            r.set_export_nb_index(sel);
-            r.set_export_nb_name(sel_name.into());
-            // The 24 words (whole seed) into words-col1/2 + SeedQR.
-            app.borrow().reveal_words(&ui_weak);
-            r.set_export_title(export_title(seed, si, acct).into());
-            r.set_export_seed_view(true); // default to the seed-words view
-            app.borrow().apply_export(&ui_weak, 2); // pre-load the hex value/QR for a quick pill switch
-            log::info!("cb: reveal-private seed={si} account={acct} ok");
-        });
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_reveal_private(move || app.borrow().on_reveal_private(&ui_weak));
     }
     {
         let app = app.clone();
@@ -6511,31 +6735,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_export_close(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let r = ui.global::<Recovery>();
-            r.set_export_xpub("".into());
-            r.set_export_descriptor("".into());
-            r.set_export_hex("".into());
-            r.set_export_wif("".into());
-            r.set_export_value("".into());
-            r.set_export_label("".into());
-            r.set_export_title("".into());
-            r.set_export_qr(Image::default());
-            r.set_export_which(0);
-            r.set_export_notebooks(Rc::new(VecModel::from(Vec::<ExportNbRow>::new())).into());
-            r.set_export_nb_index(0);
-            r.set_export_nb_name("".into());
-            // Also wipe the seed-words view (shared with reveal-seed props).
-            r.set_export_seed_view(false);
-            r.set_words_col1("".into());
-            r.set_words_col2("".into());
-            r.set_title_line("".into());
-            r.set_qr(Image::default());
-            r.set_show_qr(false);
-            log::info!("cb: reveal-export cancelled");
-        });
+        ui.global::<Callbacks>().on_export_close(move || app.borrow().on_export_close(&ui_weak));
     }
     {
         // Commit the wallet context (seed index + BIP-86 account) from the
