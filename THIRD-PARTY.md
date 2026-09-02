@@ -1,6 +1,6 @@
 # Third-party libraries
 
-Direct dependencies of this app, its `notes-core` library, and the companion web pages. The complete transitive list (with exact versions) is pinned in [`Cargo.lock`](Cargo.lock).
+Direct dependencies of this app, its `notes-core` and `graffito-core` libraries, and the companion web pages. The complete transitive list (with exact versions) is pinned in [`Cargo.lock`](Cargo.lock).
 
 ## Rust crates
 
