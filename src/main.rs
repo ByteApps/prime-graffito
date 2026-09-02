@@ -1358,6 +1358,35 @@ fn show_confirm_screen(
 /// into anything that may borrow `app` again — `Timer::single_shot`
 /// bodies and nested closures are where that bites.
 struct App {
+    // ---- guard-held cells (kept as their own RefCell on purpose) --------
+    // These four are borrowed as `let mut st = state.borrow_mut();` guards
+    // held across other calls all over the callbacks. Keeping each behind
+    // its own cell — reached as `let state = app.borrow().state.clone();`
+    // at the top of a callback — preserves today's borrow granularity
+    // exactly; flattening one into a plain field means restructuring
+    // every callback that holds it, a per-field follow-up with the suite
+    // board as the net.
+
+    /// The app seed (GetAppSeed, PIN-gated on hardware) — kept so each
+    /// notebook's identity can be derived on demand (`Identity::from_bip86`
+    /// over the notebook's rotation seed + BIP-86 account/index). EMPTY
+    /// until the boot timer primes it: the fetch prompts the user on SDK
+    /// 1.0.0 (the app-scoped-seed sheet) and so cannot happen before the
+    /// event loop runs — see `app_seed_get`.
+    app_seed: Rc<OnceCell<Option<[u8; 32]>>>,
+    /// Notebooks: the index (account -> name/archived) persisted in
+    /// `/.graffito/notebooks.json`. A notebook = an indexed identity; boot
+    /// lands on the notebook LIST (empty on a fresh install — no onboarding).
+    notebooks: Rc<RefCell<notebooks::NotebookIndex>>,
+    /// The ACTIVE notebook's persisted state (notes, UTXO ledger, fee
+    /// tiers, contacts — `state-<net>-<account>.json`); an empty placeholder
+    /// until a notebook is opened, swapped on notebook switch.
+    state: Rc<RefCell<State>>,
+    /// The ACTIVE notebook's derived identity (keys + address), swapped
+    /// with `state`; `None` on the list.
+    identity: Rc<RefCell<Option<Identity>>>,
+
+    // ---- wallet-level config (persisted in config.json) ----------------
     /// Device-level network (wallet-wide; `"mainnet" | "testnet4" |
     /// "signet" | "regtest"`): one setting shared by every notebook — each
     /// notebook's ledger is per-network on disk (`state-<net>-<account>.json`).
@@ -1461,17 +1490,15 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // EMPTY here on purpose: the fetch prompts the user on SDK 1.0.0 and so
     // cannot happen before the event loop runs (see `app_seed_get`). The boot
     // timer at the end of `app_main` primes it.
-    let app_seed: Rc<OnceCell<Option<[u8; 32]>>> = Rc::new(OnceCell::new());
 
     // Notebooks: the index (account -> name/archived) + the ACTIVE notebook.
     // A notebook = an indexed identity; boot lands on the notebook LIST and
     // the active notebook is set when the user taps a row (empty on a fresh
     // install — the device has no onboarding).
-    let notebooks: Rc<RefCell<notebooks::NotebookIndex>> =
-        Rc::new(RefCell::new(boot_notebooks(&fs)));
+    let notebooks = boot_notebooks(&fs);
     // Device-level network (wallet-wide): one setting shared by every
     // notebook; each notebook's ledger is per-network on disk.
-    let device_cfg = boot_config(&fs, &notebooks.borrow());
+    let device_cfg = boot_config(&fs, &notebooks);
     // The named app state (PLAN-graffito-arch.md phase 4b) — ONE handle every
     // callback clones, instead of one `Rc<RefCell<T>>` per field. Borrow
     // discipline: read a field into a local (`let x = app.borrow().x;`),
@@ -1479,6 +1506,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // across a call that may borrow again — a double borrow compiles clean
     // and panics at runtime.
     let app: Rc<RefCell<App>> = Rc::new(RefCell::new(App {
+        app_seed: Rc::new(OnceCell::new()),
+        notebooks: Rc::new(RefCell::new(notebooks)),
+        state: Rc::new(RefCell::new(State::default())),
+        identity: Rc::new(RefCell::new(None)),
         net: device_cfg.network.clone(),
         device_chunk: device_cfg.chunk_override,
         seed_idx: device_cfg.seed_index,
@@ -1506,18 +1537,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             save_config(&fs, &app.borrow().device_config());
         })
     };
-    // The ACTIVE notebook's state + identity (both swap on notebook switch);
-    // an empty placeholder until a notebook is opened.
-    let state = Rc::new(RefCell::new(State::default()));
-    let identity: Rc<RefCell<Option<Identity>>> = Rc::new(RefCell::new(None));
 
 
     let refresh_home = {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
-        let identity = identity.clone();
         let app = app.clone();
         move || {
+            let state = app.borrow().state.clone();
+            let identity = app.borrow().identity.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
             let home = ui.global::<Home>();
@@ -1577,9 +1604,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     };
 
     let refresh_notes = {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         move || {
+            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
             // Sender filter: build the checklist + filter the list. A note
@@ -1652,9 +1680,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     };
 
     let refresh_contacts = {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         move || {
+            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
             // State order IS recency (front = latest use) — no re-sort.
@@ -1684,12 +1713,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // first. Viewer-first — consolidate is the screen's single action.
     let refresh_coins = {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let fs = fs.clone();
-        let notebooks = notebooks.clone();
-        let app_seed = app_seed.clone();
         let app = app.clone();
         move || {
+            let state = app.borrow().state.clone();
+            let notebooks = app.borrow().notebooks.clone();
+            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             // Wallet-wide: every ACTIVE notebook's coins, each tagged with
             // its notebook. Flush the active notebook first so its file is
@@ -1744,11 +1773,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // arithmetic (estimate_sweep_vsize is byte-exact vs build_sweep_tx).
     let update_sweep = {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let fs = fs.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
         move || {
+            let state = app.borrow().state.clone();
+            let notebooks = app.borrow().notebooks.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let sweep = ui.global::<Sweep>();
             let st = state.borrow();
@@ -1828,11 +1857,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // `state` + the active notebook's spending section + `funding_pick`.
     let refresh_funding = {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
-        let app_seed = app_seed.clone();
         move || {
+            let state = app.borrow().state.clone();
+            let notebooks = app.borrow().notebooks.clone();
+            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
             let active_net = app.borrow().net.clone();
@@ -2054,11 +2083,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let refresh_notebooks = {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
-        let app_seed = app_seed.clone();
         let app = app.clone();
         Rc::new(move || {
+            let notebooks = app.borrow().notebooks.clone();
+            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let ix = notebooks.borrow();
             let active_acct = app.borrow().active;
@@ -2116,11 +2145,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let switch_notebook = {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let state = state.clone();
-        let identity = identity.clone();
         let app = app.clone();
-        let notebooks = notebooks.clone();
-        let app_seed = app_seed.clone();
         let app = app.clone();
         let refresh_home = refresh_home.clone();
         let refresh_notes = refresh_notes.clone();
@@ -2128,6 +2153,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let refresh_contacts = refresh_contacts.clone();
         let refresh_funding = refresh_funding.clone();
         Rc::new(move |account: u32| {
+            let state = app.borrow().state.clone();
+            let identity = app.borrow().identity.clone();
+            let notebooks = app.borrow().notebooks.clone();
+            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             if app.borrow().active.is_some() {
                 save_state(&fs, &state.borrow());
@@ -2162,14 +2191,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // navigates. Invalid manual input stays on the picker with an error.
     let pick_contact = {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let fs = fs.clone();
         let update_sweep = update_sweep.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
         let refresh_funding = refresh_funding.clone();
         let refresh_change = refresh_change.clone();
         move |addr_raw: &str| {
+            let state = app.borrow().state.clone();
+            let notebooks = app.borrow().notebooks.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let addr = addr_raw.trim().to_string();
             let contacts_g = ui.global::<Contacts>();
@@ -2318,10 +2347,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
 
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let pick_contact = pick_contact.clone();
         ui.global::<Callbacks>().on_scan_contact(move || {
+            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let opts = ScanQrOptions {
                 header_title: "Scan recipient address".into(),
@@ -2381,11 +2411,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // Scoped to `Contacts.naming-address` (set when the modal opened), so
     // scanning does NOT require re-saving the name field.
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let fs = fs.clone();
         let refresh_contacts = refresh_contacts.clone();
         ui.global::<Callbacks>().on_scan_contact_pq(move || {
+            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let contacts_g = ui.global::<Contacts>();
             let addr = contacts_g.get_naming_address().to_string();
@@ -2450,10 +2481,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // which already reconstruct every notebook's key.
     let refresh_quantum_keys = {
         let ui_weak = ui_weak.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
-        let app_seed = app_seed.clone();
         move || {
+            let notebooks = app.borrow().notebooks.clone();
+            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let qk = ui.global::<QuantumKeys>();
             let alg = mlkem_alg_from_u8(app.borrow().mlkem_level);
@@ -2883,11 +2914,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
 
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let fs = fs.clone();
         let refresh_contacts = refresh_contacts.clone();
         ui.global::<Callbacks>().on_save_contact_name(move || {
+            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let contacts_g = ui.global::<Contacts>();
             let addr = contacts_g.get_naming_address().to_string();
@@ -2940,26 +2972,22 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // Build + sign the sweep (ALL coins, key-path), then the confirm dialog.
     {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
-        let identity = identity.clone();
         let app = app.clone();
         let fs = fs.clone();
-        let notebooks = notebooks.clone();
-        let app_seed = app_seed.clone();
         let app = app.clone();
         ui.global::<Callbacks>().on_sweep_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
             let ui_weak = ui_weak.clone();
-            let state = state.clone();
-            let identity = identity.clone();
             let app = app.clone();
             let fs = fs.clone();
-            let notebooks = notebooks.clone();
-            let app_seed = app_seed.clone();
             let app = app.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
+                let state = app.borrow().state.clone();
+                let identity = app.borrow().identity.clone();
+                let notebooks = app.borrow().notebooks.clone();
+                let app_seed = app.borrow().app_seed.clone();
                 let Some(ui) = ui_weak.upgrade() else { return };
                 let sweep = ui.global::<Sweep>();
                 let consolidate = sweep.get_kind() == "consolidate";
@@ -3122,10 +3150,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // Spending wallet: Settings toggle.
     {
         let fs = fs.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
         let refresh_funding = refresh_funding.clone();
         ui.global::<Callbacks>().on_set_spending_enabled(move |on| {
+            let notebooks = app.borrow().notebooks.clone();
             let mut ix = notebooks.borrow_mut();
             let ctx = notebook_ctx(&ix, app.borrow().active)
                 .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
@@ -3219,12 +3247,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // notes-core crypt::SEAL_OVERHEAD), so per-keystroke recompute is free.
     {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let app = app.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
         let fs = fs.clone();
         ui.global::<Callbacks>().on_compose_changed(move || {
+            let state = app.borrow().state.clone();
+            let notebooks = app.borrow().notebooks.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let compose = ui.global::<Compose>();
             let st = state.borrow();
@@ -3727,26 +3755,22 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
-        let identity = identity.clone();
         let app = app.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
-        let app_seed = app_seed.clone();
         let fs = fs.clone();
         ui.global::<Callbacks>().on_compose_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
             let ui_weak = ui_weak.clone();
-            let state = state.clone();
-            let identity = identity.clone();
             let app = app.clone();
-            let notebooks = notebooks.clone();
             let app = app.clone();
-            let app_seed = app_seed.clone();
             let fs = fs.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
+                let state = app.borrow().state.clone();
+                let identity = app.borrow().identity.clone();
+                let notebooks = app.borrow().notebooks.clone();
+                let app_seed = app.borrow().app_seed.clone();
                 let Some(ui) = ui_weak.upgrade() else { return };
                 let compose = ui.global::<Compose>();
                 let text = compose.get_text().to_string();
@@ -4431,16 +4455,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // re-entrancy). Ledger/outbox mutations happen ONLY past this point.
     {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let app = app.clone();
-        let identity = identity.clone();
         let fs = fs.clone();
         let refresh_notes = refresh_notes.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
         let refresh_funding = refresh_funding.clone();
         let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_confirm_sign(move || {
+            let identity = app.borrow().identity.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let kind = ui.global::<ConfirmSign>().get_kind().to_string();
             let txid = ui.global::<ConfirmSign>().get_txid().to_string();
@@ -4450,12 +4472,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     let Some(p) = app.borrow_mut().sweep_plan.take() else { return };
                     ui.global::<Ui>().set_busy(true);
                     let ui_weak = ui_weak.clone();
-                    let state = state.clone();
                     let fs = fs.clone();
                     let app = app.clone();
                     let app = app.clone();
                     let refresh_home = refresh_home.clone();
                     Timer::single_shot(Duration::from_millis(150), move || {
+                        let state = app.borrow().state.clone();
                         let Some(ui) = ui_weak.upgrade() else { return };
                         let mut st = state.borrow_mut();
                         let active_acct = app.borrow().active.unwrap_or(p.dest_account);
@@ -4605,13 +4627,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     let Some(p) = app.borrow_mut().plan.take() else { return };
                     ui.global::<Ui>().set_busy(true);
                     let ui_weak = ui_weak.clone();
-                    let state = state.clone();
                     let fs = fs.clone();
                     let refresh_notes = refresh_notes.clone();
-                    let notebooks = notebooks.clone();
                     let app = app.clone();
                     let refresh_funding = refresh_funding.clone();
                     Timer::single_shot(Duration::from_millis(150), move || {
+                        let state = app.borrow().state.clone();
+                        let notebooks = app.borrow().notebooks.clone();
                         let Some(ui) = ui_weak.upgrade() else { return };
                         let mut st = state.borrow_mut();
 
@@ -4838,11 +4860,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
-        let identity = identity.clone();
         let fs = fs.clone();
         let app = app.clone();
         ui.global::<Callbacks>().on_open_note(move |id| {
+            let state = app.borrow().state.clone();
+            let identity = app.borrow().identity.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
             let Some(n) = st.notes.iter().find(|n| n.id == id.as_str()) else { return };
@@ -5035,13 +5057,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // never actually reachable from here.
     {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let fs = fs.clone();
-        let identity = identity.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
-        let app_seed = app_seed.clone();
         ui.global::<Callbacks>().on_unlock_note(move |password| {
+            let state = app.borrow().state.clone();
+            let identity = app.borrow().identity.clone();
+            let notebooks = app.borrow().notebooks.clone();
+            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let id_str = ui.global::<View>().get_id().to_string();
             let mut st = state.borrow_mut();
@@ -5157,10 +5179,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // re-run through `pick_contact` (that would re-reset funding/change
     // and re-navigate on every entry).
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let pick_contact = pick_contact.clone();
         ui.global::<Callbacks>().on_reply_all_to_note(move || {
+            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let set: Vec<String> =
                 ui.global::<View>().get_reply_set().iter().map(|s| s.to_string()).collect();
@@ -5180,13 +5203,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // logging `cb: import-bundle {src} … ok` (src keeps the file=/loc=
     // shape the UI tests grep).
     let apply_bundle: Rc<dyn Fn(&str, &str) -> Result<String, String>> = {
-        let state = state.clone();
-        let identity = identity.clone();
         let fs = fs.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
-        let app_seed = app_seed.clone();
         Rc::new(move |json: &str, src: &str| -> Result<String, String> {
+            let state = app.borrow().state.clone();
+            let identity = app.borrow().identity.clone();
+            let notebooks = app.borrow().notebooks.clone();
+            let app_seed = app.borrow().app_seed.clone();
             let id_guard = identity.borrow();
             let id = id_guard.as_ref().ok_or("identity unavailable")?;
             {
@@ -5648,10 +5671,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
 
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let fs = fs.clone();
         ui.global::<Callbacks>().on_export_pending(move || {
+            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
             let pending: Vec<&NoteRec> = st
@@ -5695,11 +5719,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // disk until the user taps Sign.
     {
         let ui_weak = ui_weak.clone();
-        let identity = identity.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
-        let app_seed = app_seed.clone();
         ui.global::<Callbacks>().on_sign_psbt(move || {
+            let identity = app.borrow().identity.clone();
+            let notebooks = app.borrow().notebooks.clone();
+            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let id_guard = identity.borrow();
             let Some(id) = id_guard.as_ref() else {
@@ -5858,18 +5882,18 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
-        let identity = identity.clone();
         let fs = fs.clone();
         let app = app.clone();
-        let notebooks = notebooks.clone();
-        let app_seed = app_seed.clone();
         let persist_config = persist_config.clone();
         let refresh_home = refresh_home.clone();
         let refresh_notes = refresh_notes.clone();
         let refresh_coins = refresh_coins.clone();
         let refresh_notebooks = refresh_notebooks.clone();
         ui.global::<Callbacks>().on_cycle_network(move || {
+            let state = app.borrow().state.clone();
+            let identity = app.borrow().identity.clone();
+            let notebooks = app.borrow().notebooks.clone();
+            let app_seed = app.borrow().app_seed.clone();
             // Network is device-level (wallet-wide): flush the active
             // notebook, cycle the shared network, persist it in config, and
             // reload the active notebook's ledger for the new chain (each
@@ -5910,12 +5934,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let fs = fs.clone();
         let app = app.clone();
         let persist_config = persist_config.clone();
         let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_chunk_changed(move || {
+            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let settings = ui.global::<Settings>();
             let mut st = state.borrow_mut();
@@ -5962,10 +5986,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // size, so it lives in config.json rather than any notebook's state.
     {
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let app = app.clone();
         let persist_config = persist_config.clone();
         ui.global::<Callbacks>().on_locktime_changed(move || {
+            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let settings = ui.global::<Settings>();
             let policy = match settings.get_locktime_mode() {
@@ -5999,10 +6023,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // Compose "too large" dialog → raise the chunk size to Standard (auto) and
     // reprice the draft in place. Only offered when the note fits at Standard.
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let fs = fs.clone();
         ui.global::<Callbacks>().on_oversize_bump(move || {
+            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             {
                 let mut st = state.borrow_mut();
@@ -6026,11 +6051,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         ui.global::<Callbacks>().on_refresh_notes(move || refresh_notes());
     }
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let state = state.clone();
         let fs = fs.clone();
         let refresh_notes = refresh_notes.clone();
         ui.global::<Callbacks>().on_toggle_sender(move |key, excluded| {
+            let state = app.borrow().state.clone();
             let Some(_ui) = ui_weak.upgrade() else { return };
             {
                 let mut st = state.borrow_mut();
@@ -6067,9 +6093,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
     {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let notebooks = notebooks.clone();
         ui.global::<NotebookCb>().on_rename(move |account| {
+            let notebooks = app.borrow().notebooks.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let nb = ui.global::<NotebooksUi>();
             // Prefill the RAW local name (the display name may be an addr
@@ -6094,13 +6121,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
-        let app_seed = app_seed.clone();
         let app = app.clone();
         let refresh_notebooks = refresh_notebooks.clone();
         let switch_notebook = switch_notebook.clone();
         ui.global::<NotebookCb>().on_name_save(move || {
+            let notebooks = app.borrow().notebooks.clone();
+            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let nb = ui.global::<NotebooksUi>();
             let sel = nb.get_name_account();
@@ -6158,10 +6185,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let notebooks = notebooks.clone();
         let app = app.clone();
         let refresh_notebooks = refresh_notebooks.clone();
         ui.global::<NotebookCb>().on_archive(move |account, archived| {
+            let notebooks = app.borrow().notebooks.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let account = account.max(0) as u32;
             if archived {
@@ -6186,10 +6213,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let state = state.clone();
         let app = app.clone();
         let refresh_notebooks = refresh_notebooks.clone();
         ui.global::<NotebookCb>().on_back_to_list(move || {
+            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             if app.borrow().active.is_some() {
                 save_state(&fs, &state.borrow());
@@ -6208,9 +6235,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // to the new seed while they're shown). Keeps the SeedQR in sync.
     let reveal_words: Rc<dyn Fn()> = {
         let ui_weak = ui_weak.clone();
-        let app_seed = app_seed.clone();
         let app = app.clone();
         Rc::new(move || {
+            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let recovery = ui.global::<Recovery>();
             let index = app.borrow().seed_idx;
@@ -6299,9 +6326,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // The active account's notebooks as picker rows (index/name/short addr)
     // plus the default selection (first notebook, else a synthetic index 0).
     let export_rows: Rc<dyn Fn(u32, u32, &str, Network) -> (Vec<ExportNbRow>, i32, String)> = {
-        let app_seed = app_seed.clone();
-        let notebooks = notebooks.clone();
+        let app = app.clone();
         Rc::new(move |si: u32, acct: u32, net_s: &str, network: Network| {
+            let app_seed = app.borrow().app_seed.clone();
+            let notebooks = app.borrow().notebooks.clone();
             let mut rows: Vec<ExportNbRow> = Vec::new();
             let ixb = notebooks.borrow();
             for m in ixb.visible(si, acct) {
@@ -6332,11 +6360,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     };
     {
         let ui_weak = ui_weak.clone();
-        let app_seed = app_seed.clone();
         let app = app.clone();
         let apply_export = apply_export.clone();
         let export_rows = export_rows.clone();
         ui.global::<Callbacks>().on_reveal_public(move || {
+            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let r = ui.global::<Recovery>();
             let si = app.borrow().seed_idx;
@@ -6367,12 +6395,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
     {
         let ui_weak = ui_weak.clone();
-        let app_seed = app_seed.clone();
         let app = app.clone();
         let apply_export = apply_export.clone();
         let export_rows = export_rows.clone();
         let reveal_words = reveal_words.clone();
         ui.global::<Callbacks>().on_reveal_private(move || {
+            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let r = ui.global::<Recovery>();
             let si = app.borrow().seed_idx;
@@ -6414,11 +6442,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         // Pick which notebook's private key hex/WIF export (hex/WIF only).
         let ui_weak = ui_weak.clone();
-        let app_seed = app_seed.clone();
         let app = app.clone();
-        let notebooks = notebooks.clone();
         let apply_export = apply_export.clone();
         ui.global::<Callbacks>().on_export_pick_notebook(move |index| {
+            let app_seed = app.borrow().app_seed.clone();
+            let notebooks = app.borrow().notebooks.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let r = ui.global::<Recovery>();
             let si = app.borrow().seed_idx;
@@ -6489,13 +6517,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         // the new seed, and show an inline saved confirmation.
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let state = state.clone();
         let app = app.clone();
         let app = app.clone();
         let persist_config = persist_config.clone();
         let refresh_notebooks = refresh_notebooks.clone();
         let reveal_words = reveal_words.clone();
         ui.global::<Callbacks>().on_set_context(move || {
+            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let recovery = ui.global::<Recovery>();
             let parse = |s: &str| -> Option<u32> {
@@ -6554,10 +6582,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     ui.global::<Ui>().set_screen(Screen::Notebooks);
 
     let boot_seed = {
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        let app_seed = app_seed.clone();
         let refresh_notebooks = refresh_notebooks.clone();
         move || {
+            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             // First read of the seed in the app's life: this is what raises
             // the one-time "App-scoped seed" consent prompt, and the running
