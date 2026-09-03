@@ -46,7 +46,6 @@ impl App {
         let state = self.state.clone();
         let identity = self.identity.clone();
         let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         // Network is device-level (wallet-wide): flush the active
         // notebook, cycle the shared network, persist it in config, and
         // reload the active notebook's ledger for the new chain (each
@@ -74,7 +73,7 @@ impl App {
             // BIP-44 coin type — their keys differ per network, so
             // always re-derive from the meta.
             if let Some(m) = notebooks.borrow().get(account) {
-                *identity.borrow_mut() = derive_identity(app_seed_get(&app_seed), m, &next);
+                *identity.borrow_mut() = derive_identity(app_seed_get(&self.app_seed), m, &next);
             }
         }
         let _ = &ui_weak;

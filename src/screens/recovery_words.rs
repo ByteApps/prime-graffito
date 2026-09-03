@@ -16,11 +16,10 @@ impl App {
     /// by the reveal button AND the Switch action (which refreshes the words
     /// to the new seed while they're shown). Keeps the SeedQR in sync.
     pub(crate) fn reveal_words(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let recovery = ui.global::<Recovery>();
         let index = self.seed_idx;
-        let Some(seed) = app_seed_get(&app_seed).as_ref() else {
+        let Some(seed) = app_seed_get(&self.app_seed).as_ref() else {
             ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
             log::warn!("cb: reveal-seed index={index} err=locked");
             return;

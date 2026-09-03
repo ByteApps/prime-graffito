@@ -572,7 +572,6 @@ impl App {
             let state = app.borrow().state.clone();
             let identity = app.borrow().identity.clone();
             let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let compose = ui.global::<Compose>();
             let text = compose.get_text().to_string();
@@ -710,6 +709,7 @@ impl App {
                     }
 
                     if mode_auto {
+                            let app_seed_copy = *app_seed_get(&app.borrow().app_seed);
                         // Byte-identical input selection to before this
                         // feature — change destination is still
                         // independently resolvable (the picker screen).
@@ -719,7 +719,7 @@ impl App {
                             st.network(),
                             &id.output_x,
                             false,
-                            &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?,
+                            &*app_seed_copy.as_ref().ok_or("identity unavailable")?,
                             ctx.0,
                             ctx.1,
                             0,
@@ -805,13 +805,14 @@ impl App {
                         if inputs.is_empty() {
                             return Err("Select at least one coin to pay from.".into());
                         }
+                            let app_seed_copy = *app_seed_get(&app.borrow().app_seed);
                         let (change_spk, _) = resolve_change(
                             &change_choice.choice,
                             &change_choice.custom_address,
                             st.network(),
                             &id.output_x,
                             false,
-                            &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?,
+                            &*app_seed_copy.as_ref().ok_or("identity unavailable")?,
                             ctx.0,
                             ctx.1,
                             0,
@@ -877,6 +878,7 @@ impl App {
                         .map_err(|e| e.to_string())?;
                         Ok((note, Vec::new(), None, change_is_notebook, false, pq_flags_out))
                     } else {
+                            let app_seed_copy = *app_seed_get(&app.borrow().app_seed);
                         // Spending-wallet participates (pure spending or
                         // mixed with notebook coins) — mixed builder. The
                         // notebook dust-to-self anchor is emitted ONLY
@@ -886,7 +888,7 @@ impl App {
                         // 2026-07-18) — a notebook input already anchors
                         // the tx to the notebook's address history.
                         let seed: &[u8; 32] =
-                            &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?;
+                            &*app_seed_copy.as_ref().ok_or("identity unavailable")?;
                         let notebook_dust_spk = p2tr_script_pubkey(&id.output_x);
                         let mut mixed_inputs: Vec<MixedInput> = Vec::new();
                         let mut has_notebook_input = false;
@@ -1094,7 +1096,7 @@ impl App {
                         notebook_name(&ix, active_acct, &short)
                     };
                     let (mut self_spks, mut spending_spks) =
-                        confirm_self_spks(&ix, app_seed_get(&app_seed), &net_s, ctx);
+                        confirm_self_spks(&ix, app_seed_get(&app.borrow().app_seed), &net_s, ctx);
                     drop(ix);
                     // A fresh spending-wallet change address this very
                     // tx pays isn't in `used` yet (marked only after a
@@ -1126,7 +1128,8 @@ impl App {
                                     spending_spent.iter().any(|(t, v)| *t == u.txid && *v == u.vout)
                                 })
                                 .filter_map(|u| {
-                                    let seed_bytes = app_seed_get(&app_seed).as_ref()?;
+                                    let app_seed_copy = *app_seed_get(&app.borrow().app_seed);
+                                    let seed_bytes = app_seed_copy.as_ref()?;
                                     notes_core::seeds::derive_spending_key(
                                         seed_bytes,
                                         ctx.0,

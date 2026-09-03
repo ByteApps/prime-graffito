@@ -15,7 +15,6 @@ impl App {
     /// address-short · note count.
     pub(crate) fn refresh_notebooks(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
         let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let ix = notebooks.borrow();
         let active_acct = self.active;
@@ -23,7 +22,7 @@ impl App {
         let ctx = (self.seed_idx, self.bip_account);
         let build = |m: &notebooks::NotebookMeta| -> NotebookRow {
             let st = load_state(&fs, &dev_net, m.account);
-            let addr = derive_identity(app_seed_get(&app_seed), m, &dev_net)
+            let addr = derive_identity(app_seed_get(&self.app_seed), m, &dev_net)
                 .map(|id| id.address(Network::from_str_opt(&dev_net).unwrap_or(Network::Mainnet)))
                 .unwrap_or_default();
             let short = short_addr(&addr);
@@ -79,7 +78,6 @@ impl App {
         let state = self.state.clone();
         let identity = self.identity.clone();
         let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         if self.active.is_some() {
             save_state(&fs, &state.borrow());
@@ -88,7 +86,7 @@ impl App {
         *identity.borrow_mut() = notebooks
             .borrow()
             .get(account)
-            .and_then(|m| derive_identity(app_seed_get(&app_seed), m, &self.net));
+            .and_then(|m| derive_identity(app_seed_get(&self.app_seed), m, &self.net));
         let mut loaded = load_state(&fs, &self.net, account);
         loaded.chunk_override = self.device_chunk; // chunk is device-level
         *state.borrow_mut() = loaded;
@@ -116,12 +114,11 @@ impl App {
     /// — and the timer below primes the seed once the loop is live, then
     /// repaints the list with them.
     pub(crate) fn boot_seed(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         // First read of the seed in the app's life: this is what raises
         // the one-time "App-scoped seed" consent prompt, and the running
         // loop is what lets the user answer it.
-        let available = app_seed_get(&app_seed).is_some();
+        let available = app_seed_get(&self.app_seed).is_some();
         ui.global::<Recovery>().set_seed_available(available);
         if !available {
             ui.global::<Ui>().set_error("Device locked or seed unavailable".into());
@@ -153,7 +150,6 @@ impl App {
 
     pub(crate) fn on_name_save(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
         let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let nb = ui.global::<NotebooksUi>();
         let sel = nb.get_name_account();
@@ -168,7 +164,7 @@ impl App {
             // index of the active (seed, account) context — the
             // recovery-seeds scheme, words-recoverable anywhere.
             // (Legacy notebooks are never created anymore.)
-            if app_seed_get(&app_seed).is_none() {
+            if app_seed_get(&self.app_seed).is_none() {
                 ui.global::<Ui>().set_error("Device locked — can't create a notebook.".into());
                 return;
             }

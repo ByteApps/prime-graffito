@@ -1364,7 +1364,7 @@ struct App {
     /// until the boot timer primes it: the fetch prompts the user on SDK
     /// 1.0.0 (the app-scoped-seed sheet) and so cannot happen before the
     /// event loop runs — see `app_seed_get`.
-    app_seed: Rc<OnceCell<Option<[u8; 32]>>>,
+    app_seed: OnceCell<Option<[u8; 32]>>,
     /// Notebooks: the index (account -> name/archived) persisted in
     /// `/.graffito/notebooks.json`. A notebook = an indexed identity; boot
     /// lands on the notebook LIST (empty on a fresh install — no onboarding).
@@ -1513,7 +1513,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // across a call that may borrow again — a double borrow compiles clean
     // and panics at runtime.
     let app: Rc<RefCell<App>> = Rc::new(RefCell::new(App {
-        app_seed: Rc::new(OnceCell::new()),
+        app_seed: OnceCell::new(),
         notebooks: Rc::new(RefCell::new(notebooks)),
         state: Rc::new(RefCell::new(State::default())),
         identity: Rc::new(RefCell::new(None)),

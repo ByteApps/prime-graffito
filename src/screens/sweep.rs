@@ -108,7 +108,6 @@ impl App {
             let state = app.borrow().state.clone();
             let identity = app.borrow().identity.clone();
             let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let sweep = ui.global::<Sweep>();
             let consolidate = sweep.get_kind() == "consolidate";
@@ -123,7 +122,7 @@ impl App {
             let sources_raw = wallet_sources(
                 &fs,
                 &notebooks.borrow(),
-                app_seed_get(&app_seed),
+                app_seed_get(&app.borrow().app_seed),
                 &st.network,
                 (app.borrow().seed_idx, app.borrow().bip_account),
             );
@@ -193,7 +192,7 @@ impl App {
                     // prevout labels come straight from it.
                     let ix = notebooks.borrow();
                     let (self_spks, spending_spks) =
-                        confirm_self_spks(&ix, app_seed_get(&app_seed), &st.network, (app.borrow().seed_idx, app.borrow().bip_account));
+                        confirm_self_spks(&ix, app_seed_get(&app.borrow().app_seed), &st.network, (app.borrow().seed_idx, app.borrow().bip_account));
                     let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> =
                         BTreeMap::new();
                     for (acct, ox, _, coins) in &sources_raw {

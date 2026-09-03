@@ -11,12 +11,11 @@ impl App {
 
     /// plus the default selection (first notebook, else a synthetic index 0).
     pub(crate) fn on_reveal_private(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let r = ui.global::<Recovery>();
         let si = self.seed_idx;
         let acct = self.bip_account;
-        let Some(seed) = app_seed_get(&app_seed).as_ref() else {
+        let Some(seed) = app_seed_get(&self.app_seed).as_ref() else {
             ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
             log::warn!("cb: reveal-private seed={si} account={acct} err=locked");
             return;

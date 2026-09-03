@@ -199,7 +199,6 @@ impl App {
         let state = self.state.clone();
         let identity = self.identity.clone();
         let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let id_str = ui.global::<View>().get_id().to_string();
         let mut st = state.borrow_mut();
@@ -233,7 +232,7 @@ impl App {
                     let net_s = self.net.clone();
                     let leaf = (self.active)
                         .and_then(|acc| ix.get(acc))
-                        .and_then(|meta| derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s));
+                        .and_then(|meta| derive_leaf_secret(app_seed_get(&self.app_seed), meta, &net_s));
                     drop(ix);
                     let mut last = notes_core::Error::DecryptFailed;
                     let mut ok: Option<Vec<u8>> = None;

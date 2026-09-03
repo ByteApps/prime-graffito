@@ -22,7 +22,6 @@ impl App {
     /// which already reconstruct every notebook's key.
     pub(crate) fn refresh_quantum_keys(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
         let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let qk = ui.global::<QuantumKeys>();
         let alg = mlkem_alg_from_u8(self.mlkem_level);
@@ -43,7 +42,7 @@ impl App {
         // same shape/derivation as `export_rows`.
         let mut rows: Vec<ExportNbRow> = Vec::new();
         for m in ix.visible(ctx.0, ctx.1) {
-            let addr = derive_identity(app_seed_get(&app_seed), m, &net_s)
+            let addr = derive_identity(app_seed_get(&self.app_seed), m, &net_s)
                 .map(|id| id.address(network))
                 .unwrap_or_default();
             let name = if m.name.trim().is_empty() {
@@ -86,7 +85,7 @@ impl App {
         qk.set_nb_name(nb_name.into());
 
         let leaf =
-            meta.as_ref().and_then(|m| derive_leaf_secret(app_seed_get(&app_seed), m, &net_s));
+            meta.as_ref().and_then(|m| derive_leaf_secret(app_seed_get(&self.app_seed), m, &net_s));
         match leaf {
             Some(leaf) => {
                 let kp = pq::mlkem_keypair_from_leaf(&leaf, alg);

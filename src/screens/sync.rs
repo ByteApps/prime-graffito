@@ -16,7 +16,6 @@ impl App {
         let state = self.state.clone();
         let identity = self.identity.clone();
         let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let id_guard = identity.borrow();
         let id = id_guard.as_ref().ok_or("identity unavailable")?;
         {
@@ -48,7 +47,7 @@ impl App {
             // Archived notebooks are excluded by `visible()`, so an
             // archived notebook's input can never suppress a note in an
             // active one.
-            let notebook_spks = wallet_notebook_spks(&ix, app_seed_get(&app_seed), &net_s, ctx);
+            let notebook_spks = wallet_notebook_spks(&ix, app_seed_get(&self.app_seed), &net_s, ctx);
             // Post-quantum auto-unlock candidates: the ACTIVE notebook's
             // three derived ML-KEM receive secrets (512/768/1024) — the
             // only notebook whose received notes this scan could ever
@@ -59,7 +58,7 @@ impl App {
             // just leaving every pq note `locked`.
             let mlkem_secrets: Vec<pq::MlKemSecret> =
                 (self.active).and_then(|acc| ix.get(acc)).and_then(|meta| {
-                    derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s)
+                    derive_leaf_secret(app_seed_get(&self.app_seed), meta, &net_s)
                 }).map(|leaf| {
                     derive_mlkem_keypairs(&leaf).into_iter().map(|kp| kp.secret()).collect()
                 }).unwrap_or_default();
@@ -207,7 +206,7 @@ impl App {
                 }
                 // `app_seed_get` hands back a concrete `&Option<[u8; 32]>`,
                 // so `.as_ref()` is unambiguously `Option::as_ref` here.
-                let Some(seed) = app_seed_get(&app_seed).as_ref() else { return None };
+                let Some(seed) = app_seed_get(&self.app_seed).as_ref() else { return None };
                 let mut found_addr: Option<spending::SpendingAddress> = None;
                 'gap: for chain in [0u32, 1u32] {
                     let base = if chain == 0 { next_recv } else { next_chg };
