@@ -9,10 +9,8 @@ use crate::*;
 
 impl App {
     pub(crate) fn on_open_note(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, id: SharedString) {
-        let state = self.state.clone();
-        let identity = self.identity.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
-        let st = state.borrow();
+        let st = &self.state;
         let Some(n) = st.notes.iter().find(|n| n.id == id.as_str()) else { return };
         let view = ui.global::<View>();
         view.set_id(n.id.clone().into());
@@ -80,12 +78,12 @@ impl App {
         if self_kem_locked {
             // Bound first: an `if let` scrutinee's RefMut would live
             // through the whole block.
-            let device_kp = self.device_quantum_key(fs);
+            let device_kp = device_quantum_key_in(&mut self.device_pq_key, fs);
             if let Some(kp) = device_kp {
                 kem_key_present = true;
                 if !self_kem_also_pw {
                     if let (Some(locked_body), Some(ident)) =
-                        (n.locked.as_ref(), identity.borrow().as_ref())
+                        (n.locked.as_ref(), self.identity.as_ref())
                     {
                         match pq::unlock_self(
                             locked_body,
@@ -144,7 +142,7 @@ impl App {
         // deliberately not routed through notes-core, which only has
         // the heavier `RecoveredNote` shape). `full_set` = {from} ∪
         // recipients minus my own address, deduped, sender-first.
-        let my_address = identity.borrow().as_ref().map(|id| id.address(st.network()));
+        let my_address = self.identity.as_ref().map(|id| id.address(st.network()));
         let mut full_set: Vec<String> = Vec::new();
         let mut push_addr = |addr: &str, out: &mut Vec<String>| {
             if Some(addr) != my_address.as_deref() && !out.iter().any(|a| a == addr) {
@@ -196,16 +194,19 @@ impl App {
     /// `needs_password` gate, so `unlock_sent`'s `SenderCannotReopen` is
     /// never actually reachable from here.
     pub(crate) fn on_unlock_note(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, password: SharedString) {
-        let state = self.state.clone();
-        let identity = self.identity.clone();
-        let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let id_str = ui.global::<View>().get_id().to_string();
-        let mut st = state.borrow_mut();
+        let st = &mut self.state;
         let Some(n) = st.notes.iter_mut().find(|n| n.id == id_str) else { return };
         let Some(locked) = n.locked.clone() else { return };
-        let id_guard = identity.borrow();
+        // The caching key lookup needs `&mut self`; take it BEFORE borrowing
+        // the identity for the rest of the unlock.
+        let device_kp = if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
+            device_quantum_key_in(&mut self.device_pq_key, fs)
+        } else {
+            None
+        };
+        let id_guard = &self.identity;
         let Some(ident) = id_guard.as_ref() else {
             log::warn!("cb: unlock-note err=identity-unavailable");
             return;
@@ -219,22 +220,17 @@ impl App {
             // `on_open_note`) when it ALSO carries FLAG_PW and the
             // device key is present — KEM-only self bodies are tried
             // automatically on open and never show the Unlock button.
-            let mlkem_secret = if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
-                self.device_quantum_key(fs).map(|kp| kp.secret())
-            } else {
-                None
-            };
+            let mlkem_secret = device_kp.as_ref().map(|kp| kp.secret());
             pq::unlock_self(&locked, &ident.enc_key, mlkem_secret.as_ref(), pw_opt)
         } else {
             let received = n.from.is_some();
             if received {
                 if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
-                    let ix = notebooks.borrow();
+                    let ix = &self.notebooks;
                     let net_s = self.net.clone();
                     let leaf = (self.active)
                         .and_then(|acc| ix.get(acc))
-                        .and_then(|meta| derive_leaf_secret(app_seed_get(&app_seed), meta, &net_s));
-                    drop(ix);
+                        .and_then(|meta| derive_leaf_secret(app_seed_get(&self.app_seed), meta, &net_s));
                     let mut last = notes_core::Error::DecryptFailed;
                     let mut ok: Option<Vec<u8>> = None;
                     if let Some(leaf) = leaf {
@@ -258,7 +254,6 @@ impl App {
                 pq::unlock_sent(&locked, &ident.tweaked_seckey, &ident.output_x, pw_opt)
             }
         };
-        drop(id_guard);
         match result {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes).to_string();
@@ -274,7 +269,6 @@ impl App {
                     save_state(&fs, &st);
                 }
                 log::info!("cb: unlock-note ok");
-                drop(st);
                 let view = ui.global::<View>();
                 view.set_text(text.into());
                 view.set_locked(false);
@@ -312,18 +306,16 @@ impl App {
     /// re-run through `pick_contact` (that would re-reset funding/change
     /// and re-navigate on every entry).
     pub(crate) fn on_reply_all_to_note(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let set: Vec<String> =
             ui.global::<View>().get_reply_set().iter().map(|s| s.to_string()).collect();
         let Some((first, rest)) = set.split_first() else { return };
         self.pick_contact(&ui_weak, &fs, first);
-        let st = state.borrow();
+        let st = &self.state;
         let extra: Vec<ToRow> = rest
             .iter()
             .map(|a| ToRow { address: a.as_str().into(), label: to_label_for(&st, a).into() })
             .collect();
-        drop(st);
         ui.global::<Compose>().set_to_extra(Rc::new(VecModel::from(extra)).into());
     }
 }

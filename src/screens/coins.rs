@@ -13,18 +13,15 @@ impl App {
     /// Coins screen (9): the UTXO ledger as of the last sync bundle, biggest
     /// first. Viewer-first — consolidate is the screen's single action.
     pub(crate) fn refresh_coins(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         // Wallet-wide: every ACTIVE notebook's coins, each tagged with
         // its notebook. Flush the active notebook first so its file is
         // current, then read all from disk.
-        save_state(&fs, &state.borrow());
-        let ix = notebooks.borrow();
+        save_state(&fs, &self.state);
+        let ix = &self.notebooks;
         let active_net = self.net.clone();
         let ctx = (self.seed_idx, self.bip_account);
-        let btc_usd = state.borrow().btc_usd;
+        let btc_usd = self.state.btc_usd;
         // (value, notebook name, txid, vout) across the wallet.
         let mut all: Vec<(u64, String, String, u32)> = Vec::new();
         let mut nb_with_coins = 0usize;
@@ -34,7 +31,7 @@ impl App {
                 continue;
             }
             nb_with_coins += 1;
-            let short = derive_identity(app_seed_get(&app_seed), m, &active_net)
+            let short = derive_identity(app_seed_get(&self.app_seed), m, &active_net)
                 .map(|id| short_addr(&id.address(st2.network())))
                 .unwrap_or_default();
             let name = notebook_name(&ix, m.account, &short);

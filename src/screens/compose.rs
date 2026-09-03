@@ -20,11 +20,9 @@ impl App {
     /// Keystroke cost estimator — pure arithmetic, no crypto runs (see
     /// notes-core crypt::SEAL_OVERHEAD), so per-keystroke recompute is free.
     pub(crate) fn compose_changed(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let compose = ui.global::<Compose>();
-        let st = state.borrow();
+        let st = &self.state;
         let to_address = compose.get_to_address().trim().to_string();
         let directed = !to_address.is_empty();
         let private = compose.get_private_note();
@@ -51,7 +49,7 @@ impl App {
         // to before this feature.
         let base_pq_eligible = private && compose.get_to_extra().row_count() == 0;
         let device_kp = if base_pq_eligible && !directed {
-            self.device_quantum_key(fs)
+            device_quantum_key_in(&mut self.device_pq_key, fs)
         } else {
             None
         };
@@ -169,12 +167,11 @@ impl App {
             self.compose_oversize = false; // clearing the draft re-arms the dialog
             return;
         }
-        let ix = notebooks.borrow();
+        let ix = &self.notebooks;
         let ctx = notebook_ctx(&ix, self.active)
             .unwrap_or((self.seed_idx, self.bip_account));
         let net_s = self.net.clone();
         let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
-        drop(ix);
         if st.utxos.is_empty() && section.as_ref().map(|s| s.balance()).unwrap_or(0) == 0 {
             compose
                 .set_cost_line("No funds — fund the address and import a sync bundle.".into());
@@ -541,10 +538,9 @@ impl App {
     /// Compose "too large" dialog → raise the chunk size to Standard (auto) and
     /// reprice the draft in place. Only offered when the note fits at Standard.
     pub(crate) fn on_oversize_bump(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         {
-            let mut st = state.borrow_mut();
+            let st = &mut self.state;
             st.chunk_override = None; // Standard / auto = DEFAULT_CHUNK
             save_state(&fs, &st);
         }
@@ -569,10 +565,6 @@ impl App {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         Timer::single_shot(Duration::from_millis(150), move || {
-            let state = app.borrow().state.clone();
-            let identity = app.borrow().identity.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let compose = ui.global::<Compose>();
             let text = compose.get_text().to_string();
@@ -591,16 +583,18 @@ impl App {
             let pq_passphrase_active = compose.get_pq_passphrase_active();
             let pq_mlkem_active = compose.get_pq_mlkem_active();
             let pq_passphrase_text = compose.get_pq_passphrase_text().to_string();
-            let st = state.borrow();
-            let id_guard = identity.borrow();
-            let pick = app.borrow().funding_pick.clone();
+            // `a` is held for the whole identity + state span (Identity is not
+            // Clone): nothing below may `app.borrow_mut()` until `drop(a)`.
+            let a = app.borrow();
+            let st = &a.state;
+            let id_guard = &a.identity;
+            let pick = a.funding_pick.clone();
             let change_choice = app.borrow().change_pick.clone();
-            let ix = notebooks.borrow();
+            let ix = &a.notebooks;
             let ctx = notebook_ctx(&ix, app.borrow().active)
                 .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
             let net_s = app.borrow().net.clone();
             let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
-            drop(ix);
 
             // (note, spending inputs spent, spending change addr to mark
             // used, change went to notebook?, mandatory notebook dust
@@ -691,7 +685,8 @@ impl App {
                                 .ok_or("recipient has no quantum key — add one in Contacts")?;
                             Some(pq::import_public(&armor).map_err(|e| e.to_string())?)
                         } else {
-                            let kp = app.borrow_mut().device_quantum_key(&fs).ok_or(
+                            // peek, not the caching lookup: `a` (a shared App borrow) is live here
+                            let kp = a.device_quantum_key_peek(&fs).ok_or(
                                 "no quantum key on this device — create one in Settings",
                             )?;
                             Some((kp.alg(), kp.ek().to_vec()))
@@ -710,6 +705,7 @@ impl App {
                     }
 
                     if mode_auto {
+                            let app_seed_copy = *app_seed_get(&app.borrow().app_seed);
                         // Byte-identical input selection to before this
                         // feature — change destination is still
                         // independently resolvable (the picker screen).
@@ -719,7 +715,7 @@ impl App {
                             st.network(),
                             &id.output_x,
                             false,
-                            &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?,
+                            &*app_seed_copy.as_ref().ok_or("identity unavailable")?,
                             ctx.0,
                             ctx.1,
                             0,
@@ -805,13 +801,14 @@ impl App {
                         if inputs.is_empty() {
                             return Err("Select at least one coin to pay from.".into());
                         }
+                            let app_seed_copy = *app_seed_get(&app.borrow().app_seed);
                         let (change_spk, _) = resolve_change(
                             &change_choice.choice,
                             &change_choice.custom_address,
                             st.network(),
                             &id.output_x,
                             false,
-                            &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?,
+                            &*app_seed_copy.as_ref().ok_or("identity unavailable")?,
                             ctx.0,
                             ctx.1,
                             0,
@@ -877,6 +874,7 @@ impl App {
                         .map_err(|e| e.to_string())?;
                         Ok((note, Vec::new(), None, change_is_notebook, false, pq_flags_out))
                     } else {
+                            let app_seed_copy = *app_seed_get(&app.borrow().app_seed);
                         // Spending-wallet participates (pure spending or
                         // mixed with notebook coins) — mixed builder. The
                         // notebook dust-to-self anchor is emitted ONLY
@@ -886,7 +884,7 @@ impl App {
                         // 2026-07-18) — a notebook input already anchors
                         // the tx to the notebook's address history.
                         let seed: &[u8; 32] =
-                            &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?;
+                            &*app_seed_copy.as_ref().ok_or("identity unavailable")?;
                         let notebook_dust_spk = p2tr_script_pubkey(&id.output_x);
                         let mut mixed_inputs: Vec<MixedInput> = Vec::new();
                         let mut has_notebook_input = false;
@@ -1085,7 +1083,7 @@ impl App {
                     // decoding `note.raw_hex` itself; this only gathers
                     // the LOOKUPS (source labels, self/change spks).
                     let active_acct = app.borrow().active.unwrap_or(0);
-                    let ix = notebooks.borrow();
+                    let ix = &a.notebooks;
                     let active_name = {
                         let short = id_guard
                             .as_ref()
@@ -1094,8 +1092,7 @@ impl App {
                         notebook_name(&ix, active_acct, &short)
                     };
                     let (mut self_spks, mut spending_spks) =
-                        confirm_self_spks(&ix, app_seed_get(&app_seed), &net_s, ctx);
-                    drop(ix);
+                        confirm_self_spks(&ix, app_seed_get(&app.borrow().app_seed), &net_s, ctx);
                     // A fresh spending-wallet change address this very
                     // tx pays isn't in `used` yet (marked only after a
                     // successful sign) — add it so the change output
@@ -1126,7 +1123,8 @@ impl App {
                                     spending_spent.iter().any(|(t, v)| *t == u.txid && *v == u.vout)
                                 })
                                 .filter_map(|u| {
-                                    let seed_bytes = app_seed_get(&app_seed).as_ref()?;
+                                    let app_seed_copy = *app_seed_get(&app.borrow().app_seed);
+                                    let seed_bytes = app_seed_copy.as_ref()?;
                                     notes_core::seeds::derive_spending_key(
                                         seed_bytes,
                                         ctx.0,
@@ -1222,6 +1220,7 @@ impl App {
                                     log::info!("cb: confirm fold amount={fold_amount}");
                                 }
                             }
+                            drop(a);
                             app.borrow_mut().plan = Some(Plan {
                                 note,
                                 text,

@@ -46,7 +46,6 @@ impl App {
     /// its `Rc` handle because the work runs in a deferred `Timer` body;
     /// every `app.borrow()` inside is byte-identical to the callback it was.
     pub(crate) fn on_confirm_sign(app: &Rc<RefCell<App>>, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let identity = app.borrow().identity.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let kind = ui.global::<ConfirmSign>().get_kind().to_string();
         let txid = ui.global::<ConfirmSign>().get_txid().to_string();
@@ -59,10 +58,12 @@ impl App {
                 let fs = fs.clone();
                 let app = app.clone();
                 Timer::single_shot(Duration::from_millis(150), move || {
-                    let state = app.borrow().state.clone();
-                    let Some(ui) = ui_weak.upgrade() else { return };
-                    let mut st = state.borrow_mut();
-                    let active_acct = app.borrow().active.unwrap_or(p.dest_account);
+                    // One RefMut for the whole body, reborrowed as `&mut App` so the ledger
+                    // (`st`) and the other fields borrow disjointly; no second App borrow below.
+                    let mut a = app.borrow_mut();
+                    let this: &mut App = &mut *a;
+                    let st = &mut this.state;
+                    let active_acct = this.active.unwrap_or(p.dest_account);
 
                     // Wallet-level ledger: remove each notebook's spent
                     // inputs from its own state file (the active one via
@@ -75,7 +76,7 @@ impl App {
                         if *acct == active_acct {
                             st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
                         } else {
-                            let mut other = load_state(&fs, &app.borrow().net, *acct);
+                            let mut other = load_state(&fs, &this.net, *acct);
                             other.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
                             save_state(&fs, &other);
                         }
@@ -85,7 +86,7 @@ impl App {
                         if p.dest_account == active_acct {
                             st.utxos.push(coin);
                         } else {
-                            let mut dest = load_state(&fs, &app.borrow().net, p.dest_account);
+                            let mut dest = load_state(&fs, &this.net, p.dest_account);
                             dest.utxos.push(coin);
                             save_state(&fs, &dest);
                         }
@@ -111,7 +112,6 @@ impl App {
                         if internal.is_ok() { "ok" } else { "err" },
                         if airlock.is_ok() { "ok" } else { "err" },
                     );
-                    drop(st);
 
                     let sp = ui.global::<SignPsbt>();
                     sp.set_summary(
@@ -148,22 +148,23 @@ impl App {
                     ui.global::<Contacts>().set_pick_mode("compose".into());
 
                     ui.global::<Ui>().set_busy(false);
-                    app.borrow().refresh_home(&ui_weak);
+                    this.refresh_home(&ui_weak);
                     ui.global::<Ui>().set_screen(Screen::Signed);
                 });
             }
             "psbt" => {
                 let Some(psbt) = app.borrow_mut().psbt_pending.take() else { return };
-                let id_guard = identity.borrow();
+                let a = app.borrow();
+                let id_guard = &a.identity;
                 let Some(id) = id_guard.as_ref() else {
-                    drop(id_guard);
+                    drop(a);
                     ui.global::<Sync>().set_result("Device locked — no signing key.".into());
                     ui.global::<Ui>().set_screen(Screen::Sync);
                     return;
                 };
                 let output_x = id.output_x;
                 let tweaked_seckey = id.tweaked_seckey;
-                drop(id_guard);
+                drop(a);
                 ui.global::<Ui>().set_busy(true);
                 let ui_weak = ui_weak.clone();
                 let fs = fs.clone();
@@ -214,10 +215,10 @@ impl App {
                 let fs = fs.clone();
                 let app = app.clone();
                 Timer::single_shot(Duration::from_millis(150), move || {
-                    let state = app.borrow().state.clone();
-                    let notebooks = app.borrow().notebooks.clone();
-                    let Some(ui) = ui_weak.upgrade() else { return };
-                    let mut st = state.borrow_mut();
+                    // One RefMut for the whole body (see the sweep arm above).
+                    let mut a = app.borrow_mut();
+                    let this: &mut App = &mut *a;
+                    let st = &mut this.state;
 
                     // Notebook ledger: drop spent notebook inputs. Spending-wallet
                     // inputs (if any) are dropped from the SEPARATE spending
@@ -272,11 +273,13 @@ impl App {
                     // went to a fresh spending address) in one pass — mirrors
                     // the notebook ledger's unconfirmed-chaining update above.
                     if !p.spending_spent.is_empty() || p.spending_change_addr.is_some() {
-                        let mut ix = notebooks.borrow_mut();
-                        let ctx = notebook_ctx(&ix, app.borrow().active)
-                            .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
-                        let net_s = app.borrow().net.clone();
-                        let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
+                        // One RefMut for this block: every App read below goes
+                        // Through `this` — the body's one RefMut.
+
+                        let ctx = notebook_ctx(&this.notebooks, this.active)
+                            .unwrap_or((this.seed_idx, this.bip_account));
+                        let net_s = this.net.clone();
+                        let sec = this.notebooks.spending_mut(&net_s, ctx.0, ctx.1);
                         let change_coin =
                             if p.note.change > 0 { p.spending_change_addr.as_ref() } else { None };
                         if let Some(addr) = change_coin {
@@ -292,7 +295,8 @@ impl App {
                                 index: addr.index,
                             }),
                         );
-                        save_notebooks(&fs, &ix);
+                        save_notebooks(&fs, &this.notebooks);
+                        // (no drop: `this` lives to the end of the body)
                     }
 
                     // Self-pw note (PLAN-graffito-self-pw.md): a
@@ -363,12 +367,11 @@ impl App {
                     // Auto-save every recipient as a recent contact (usually a
                     // no-op re-front after the pick, but covers every path).
                     for to in &p.recipients {
-                        upsert_contact(&mut st, to);
+                        upsert_contact(st, to);
                     }
                     st.notes.push(rec.clone());
                     save_state(&fs, &st);
-                    drop(st);
-                    app.borrow().refresh_funding(&ui_weak);
+                    this.refresh_funding(&ui_weak);
 
                     let view = ui.global::<View>();
                     view.set_id(rec.id.clone().into());
@@ -396,12 +399,12 @@ impl App {
                     ui.global::<Compose>().set_gift_expanded(false);
                     // Funding/change picks reset too — a stale coin selection or
                     // custom change address must never leak into the next note.
-                    app.borrow_mut().funding_pick = FundingPick::default();
-                    app.borrow_mut().change_pick = ChangePickState::default();
+                    this.funding_pick = FundingPick::default();
+                    this.change_pick = ChangePickState::default();
                     ui.global::<ChangePick>().set_choice("auto".into());
                     ui.global::<ChangePick>().set_custom_address("".into());
                     ui.global::<Ui>().set_busy(false);
-                    app.borrow().refresh_notes(&ui_weak);
+                    this.refresh_notes(&ui_weak);
                     ui.global::<Ui>().set_screen(Screen::Note);
                 });
             }

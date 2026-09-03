@@ -13,17 +13,13 @@ impl App {
     /// label, AND Settings' spending card (same underlying section) from
     /// `state` + the active notebook's spending section + `funding_pick`.
     pub(crate) fn refresh_funding(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
-        let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
-        let st = state.borrow();
+        let st = &self.state;
         let active_net = self.net.clone();
-        let ix = notebooks.borrow();
+        let ix = &self.notebooks;
         let ctx = notebook_ctx(&ix, self.active)
             .unwrap_or((self.seed_idx, self.bip_account));
         let section = ix.spending(&active_net, ctx.0, ctx.1).cloned();
-        drop(ix);
         let pick = self.funding_pick.clone();
 
         let nb_rows: Vec<FundingCoinRow> = st
@@ -130,7 +126,7 @@ impl App {
             settings.set_spending_balance_line(
                 format!("{} coin(s) · {} sats", s.utxos.len(), s.balance()).into(),
             );
-            if let Some(seed) = app_seed_get(&app_seed).as_ref() {
+            if let Some(seed) = app_seed_get(&self.app_seed).as_ref() {
                 let net_v = Network::from_str_opt(&active_net).unwrap_or(Network::Mainnet);
                 if let Ok(key) = notes_core::seeds::derive_spending_key(
                     seed, ctx.0, net_v, ctx.1, 0, s.next_receive,

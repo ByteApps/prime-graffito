@@ -16,11 +16,8 @@ impl App {
     /// confirm-sign dispatcher below — nothing about a scanned PSBT touches
     /// disk until the user taps Sign.
     pub(crate) fn on_sign_psbt(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
-        let identity = self.identity.clone();
-        let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
-        let id_guard = identity.borrow();
+        let id_guard = &self.identity;
         let Some(id) = id_guard.as_ref() else {
             ui.global::<Sync>().set_result("Device locked — no signing key.".into());
             return;
@@ -68,9 +65,8 @@ impl App {
         let net_dev = self.net.clone();
         let mut network = Network::from_str_opt(&net_dev).unwrap_or(Network::Mainnet);
         let wallet_ctx = (self.seed_idx, self.bip_account);
-        let ix = notebooks.borrow();
-        let (self_spks, spending_spks) = confirm_self_spks(&ix, app_seed_get(&app_seed), &net_dev, wallet_ctx);
-        drop(ix);
+        let ix = &self.notebooks;
+        let (self_spks, spending_spks) = confirm_self_spks(&ix, app_seed_get(&self.app_seed), &net_dev, wallet_ctx);
 
         // Port B (network-display fix, 2026-07-19): a PSBT's
         // scriptPubKeys carry NO network/HRP information at all — HRP
@@ -153,7 +149,6 @@ impl App {
             note_preview,
         };
         let raw_hex = hex::encode(psbt.unsigned_tx.serialize_legacy());
-        drop(id_guard);
 
         match show_confirm_screen(&ui, "psbt", &raw_hex, &cctx, "External funding tx".to_string(), "Sign & export") {
             Ok(()) => {

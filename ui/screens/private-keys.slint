@@ -8,7 +8,7 @@
 
 import { Theme, UISize } from "@ui/theme.slint";
 import { Screen, Callbacks, Ui, Recovery } from "../callbacks.slint";
-import { SecondaryAction, ScreenHeader, PillOption, NotebookPickRow, MonoCard } from "../components.slint";
+import { SecondaryAction, ScreenHeader, PillOption, NotebookPickRow, MonoCard, WordsOrSeedQr } from "../components.slint";
 
 export component PrivateKeysScreen inherits VerticalLayout {
     padding-left: 24px;
@@ -81,31 +81,13 @@ export component PrivateKeysScreen inherits VerticalLayout {
             font-family: "Montserrat";
             font-size: 13px;
         }
-        if !Recovery.show-qr: HorizontalLayout {
-            spacing: 16px;
-            Text {
-                text: Recovery.words-col1;
-                color: Theme.palette-foreground;
-                font-family: "SourceCodePro";
-                font-size: 15px;
-                horizontal-stretch: 1;
-            }
-            Text {
-                text: Recovery.words-col2;
-                color: Theme.palette-foreground;
-                font-family: "SourceCodePro";
-                font-size: 15px;
-                horizontal-stretch: 1;
-            }
-        }
-        if Recovery.show-qr: HorizontalLayout {
-            alignment: center;
-            Image {
-                source: Recovery.qr;
-                width: 200px;
-                height: 200px;
-                image-rendering: pixelated;
-            }
+        WordsOrSeedQr {
+            show-qr: Recovery.show-qr;
+            col1: Recovery.words-col1;
+            col2: Recovery.words-col2;
+            qr: Recovery.qr;
+            font-size: 15px;
+            qr-size: 200px;
         }
         SecondaryAction {
             width: 100%;

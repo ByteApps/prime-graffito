@@ -48,12 +48,10 @@ impl App {
     /// The active account's notebooks as picker rows (index/name/short addr)
     /// plus the default selection (first notebook, else a synthetic index 0).
     pub(crate) fn export_rows(&self, si: u32, acct: u32, net_s: &str, network: Network) -> (Vec<ExportNbRow>, i32, String) {
-        let app_seed = self.app_seed.clone();
-        let notebooks = self.notebooks.clone();
         let mut rows: Vec<ExportNbRow> = Vec::new();
-        let ixb = notebooks.borrow();
+        let ixb = &self.notebooks;
         for m in ixb.visible(si, acct) {
-            let addr = derive_identity(app_seed_get(&app_seed), m, net_s)
+            let addr = derive_identity(app_seed_get(&self.app_seed), m, net_s)
                 .map(|id| id.address(network))
                 .unwrap_or_default();
             let short = short_addr(&addr);
@@ -86,12 +84,11 @@ impl App {
     /// The active account's notebooks as picker rows (index/name/short addr)
     /// plus the default selection (first notebook, else a synthetic index 0).
     pub(crate) fn on_reveal_public(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let r = ui.global::<Recovery>();
         let si = self.seed_idx;
         let acct = self.bip_account;
-        let Some(seed) = app_seed_get(&app_seed).as_ref() else {
+        let Some(seed) = app_seed_get(&self.app_seed).as_ref() else {
             ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
             log::warn!("cb: reveal-public seed={si} account={acct} err=locked");
             return;
@@ -143,17 +140,15 @@ impl App {
 
     /// Pick which notebook's private key hex/WIF export (hex/WIF only).
     pub(crate) fn on_export_pick_notebook(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, index: i32) {
-        let app_seed = self.app_seed.clone();
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let r = ui.global::<Recovery>();
         let si = self.seed_idx;
         let acct = self.bip_account;
-        let Some(seed) = app_seed_get(&app_seed).as_ref() else { return };
+        let Some(seed) = app_seed_get(&self.app_seed).as_ref() else { return };
         let net_s = self.net.clone();
         let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
         let name = {
-            let ixb = notebooks.borrow();
+            let ixb = &self.notebooks;
             let n = ixb
                 .visible(si, acct)
                 .find(|m| m.index as i32 == index)

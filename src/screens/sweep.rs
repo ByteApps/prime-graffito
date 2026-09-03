@@ -15,11 +15,9 @@ impl App {
     /// Sweep screen (10) repricing — every tier tap / rate keystroke. Pure
     /// arithmetic (estimate_sweep_vsize is byte-exact vs build_sweep_tx).
     pub(crate) fn update_sweep(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let sweep = ui.global::<Sweep>();
-        let st = state.borrow();
+        let st = &self.state;
         let tier = sweep.get_tier();
         if tier != 3 {
             sweep.set_rate_text(format!("{}", st.fee_rate(tier)).into());
@@ -29,7 +27,7 @@ impl App {
         save_state(&fs, &st);
         let (n, total) = wallet_balance(
             &fs,
-            &notebooks.borrow(),
+            &self.notebooks,
             &st.network,
             (self.seed_idx, self.bip_account),
         );
@@ -105,10 +103,6 @@ impl App {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         Timer::single_shot(Duration::from_millis(150), move || {
-            let state = app.borrow().state.clone();
-            let identity = app.borrow().identity.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let app_seed = app.borrow().app_seed.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let sweep = ui.global::<Sweep>();
             let consolidate = sweep.get_kind() == "consolidate";
@@ -116,19 +110,20 @@ impl App {
             let dest = sweep.get_dest().trim().to_string();
             let tier = sweep.get_tier();
             let rate_text = sweep.get_rate_text().to_string();
-            let st = state.borrow();
+            let a = app.borrow();
+            let st = &a.state;
             // Flush the active notebook, then gather EVERY notebook's
             // coins — a wallet-level sweep/consolidate, one multi-key tx.
             save_state(&fs, &st);
             let sources_raw = wallet_sources(
                 &fs,
-                &notebooks.borrow(),
-                app_seed_get(&app_seed),
+                &app.borrow().notebooks,
+                app_seed_get(&app.borrow().app_seed),
                 &st.network,
                 (app.borrow().seed_idx, app.borrow().bip_account),
             );
             let dest_account = app.borrow().active.unwrap_or(0);
-            let id_guard = identity.borrow();
+            let id_guard = &a.identity;
             let result = id_guard
                 .as_ref()
                 .ok_or_else(|| "identity unavailable".to_string())
@@ -191,9 +186,9 @@ impl App {
                     // `sources_raw` already carries each contributing
                     // notebook's (account, output_x, coins), so the
                     // prevout labels come straight from it.
-                    let ix = notebooks.borrow();
+                    let ix = &a.notebooks;
                     let (self_spks, spending_spks) =
-                        confirm_self_spks(&ix, app_seed_get(&app_seed), &st.network, (app.borrow().seed_idx, app.borrow().bip_account));
+                        confirm_self_spks(&ix, app_seed_get(&app.borrow().app_seed), &st.network, (app.borrow().seed_idx, app.borrow().bip_account));
                     let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> =
                         BTreeMap::new();
                     for (acct, ox, _, coins) in &sources_raw {
@@ -212,7 +207,6 @@ impl App {
                             );
                         }
                     }
-                    drop(ix);
 
                     let cctx = notes_core::confirm::ConfirmCtx {
                         network: st.network(),
@@ -245,6 +239,7 @@ impl App {
                         "Sign & export",
                     ) {
                         Ok(()) => {
+                            drop(a);
                             app.borrow_mut().sweep_plan = Some(SweepPlan {
                                 tx,
                                 kind: if consolidate { "consolidate" } else { "sweep" },

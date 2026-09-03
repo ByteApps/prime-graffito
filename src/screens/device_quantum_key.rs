@@ -8,13 +8,18 @@
 use crate::*;
 
 impl App {
-    pub(crate) fn device_quantum_key(&mut self, fs: &Fs) -> Option<pq::MlKemKeypair> {
-        if let Some(cached) = self.device_pq_key.as_ref() {
-            return cached.clone();
+    /// The cached key if the cache is filled, else a fresh disk read that
+    /// does NOT fill the cache — for callers holding a shared `App` borrow
+    /// (the compose money path keeps the identity borrowed across it).
+    pub(crate) fn device_quantum_key_peek(&self, fs: &Fs) -> Option<pq::MlKemKeypair> {
+        match self.device_pq_key.as_ref() {
+            Some(cached) => cached.clone(),
+            None => load_device_quantum_key(fs),
         }
-        let kp = load_device_quantum_key(fs);
-        self.device_pq_key = Some(kp.clone());
-        kp
+    }
+
+    pub(crate) fn device_quantum_key(&mut self, fs: &Fs) -> Option<pq::MlKemKeypair> {
+        device_quantum_key_in(&mut self.device_pq_key, fs)
     }
 
 

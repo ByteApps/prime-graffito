@@ -14,16 +14,14 @@ impl App {
     /// notebook's state file. Device has no live balance — the row meta is
     /// address-short · note count.
     pub(crate) fn refresh_notebooks(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
-        let ix = notebooks.borrow();
+        let ix = &self.notebooks;
         let active_acct = self.active;
         let dev_net = self.net.clone();
         let ctx = (self.seed_idx, self.bip_account);
         let build = |m: &notebooks::NotebookMeta| -> NotebookRow {
             let st = load_state(&fs, &dev_net, m.account);
-            let addr = derive_identity(app_seed_get(&app_seed), m, &dev_net)
+            let addr = derive_identity(app_seed_get(&self.app_seed), m, &dev_net)
                 .map(|id| id.address(Network::from_str_opt(&dev_net).unwrap_or(Network::Mainnet)))
                 .unwrap_or_default();
             let short = short_addr(&addr);
@@ -76,28 +74,23 @@ impl App {
     /// Open a notebook: save the current one, swap identity + state to the
     /// target account, refresh every per-notebook view, and show its home.
     pub(crate) fn switch_notebook(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, account: u32) {
-        let state = self.state.clone();
-        let identity = self.identity.clone();
-        let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         if self.active.is_some() {
-            save_state(&fs, &state.borrow());
+            save_state(&fs, &self.state);
         }
         self.active = Some(account);
-        *identity.borrow_mut() = notebooks
-            .borrow()
+        self.identity = self.notebooks
             .get(account)
-            .and_then(|m| derive_identity(app_seed_get(&app_seed), m, &self.net));
+            .and_then(|m| derive_identity(app_seed_get(&self.app_seed), m, &self.net));
         let mut loaded = load_state(&fs, &self.net, account);
         loaded.chunk_override = self.device_chunk; // chunk is device-level
-        *state.borrow_mut() = loaded;
-        let short = identity
-            .borrow()
+        self.state = loaded;
+        let short = self
+            .identity
             .as_ref()
-            .map(|id| short_addr(&id.address(state.borrow().network())))
+            .map(|id| short_addr(&id.address(self.state.network())))
             .unwrap_or_default();
-        let title = notebook_name(&notebooks.borrow(), account, &short);
+        let title = notebook_name(&self.notebooks, account, &short);
         ui.global::<NotebooksUi>().set_title(title.into());
         log::info!("cb: open-notebook account={account}");
         self.refresh_home(&ui_weak);
@@ -116,12 +109,11 @@ impl App {
     /// — and the timer below primes the seed once the loop is live, then
     /// repaints the list with them.
     pub(crate) fn boot_seed(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         // First read of the seed in the app's life: this is what raises
         // the one-time "App-scoped seed" consent prompt, and the running
         // loop is what lets the user answer it.
-        let available = app_seed_get(&app_seed).is_some();
+        let available = app_seed_get(&self.app_seed).is_some();
         ui.global::<Recovery>().set_seed_available(available);
         if !available {
             ui.global::<Ui>().set_error("Device locked or seed unavailable".into());
@@ -131,13 +123,11 @@ impl App {
     }
 
     pub(crate) fn on_rename(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, account: i32) {
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let nb = ui.global::<NotebooksUi>();
         // Prefill the RAW local name (the display name may be an addr
         // short form, which must not become a name by accident).
-        let raw = notebooks
-            .borrow()
+        let raw = self.notebooks
             .get(account.max(0) as u32)
             .map(|m| m.name.clone())
             .unwrap_or_default();
@@ -152,8 +142,6 @@ impl App {
     }
 
     pub(crate) fn on_name_save(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let notebooks = self.notebooks.clone();
-        let app_seed = self.app_seed.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let nb = ui.global::<NotebooksUi>();
         let sel = nb.get_name_account();
@@ -168,18 +156,18 @@ impl App {
             // index of the active (seed, account) context — the
             // recovery-seeds scheme, words-recoverable anywhere.
             // (Legacy notebooks are never created anymore.)
-            if app_seed_get(&app_seed).is_none() {
+            if app_seed_get(&self.app_seed).is_none() {
                 ui.global::<Ui>().set_error("Device locked — can't create a notebook.".into());
                 return;
             }
             let (seed, bacct) = (self.seed_idx, self.bip_account);
             let account = {
-                let mut ix = notebooks.borrow_mut();
+                let ix = &mut self.notebooks;
                 let account = ix.create_bip86(seed, bacct, &name);
                 save_notebooks(&fs, &ix);
                 account
             };
-            let index = notebooks.borrow().get(account).map(|m| m.index).unwrap_or(0);
+            let index = self.notebooks.get(account).map(|m| m.index).unwrap_or(0);
             log::info!(
                 "cb: create-notebook account={account} scheme=bip86 seed={seed} bip-account={bacct} index={index}"
             );
@@ -188,7 +176,7 @@ impl App {
         } else {
             let account = sel as u32;
             {
-                let mut ix = notebooks.borrow_mut();
+                let ix = &mut self.notebooks;
                 ix.rename(account, &name);
                 save_notebooks(&fs, &ix);
             }
@@ -196,8 +184,7 @@ impl App {
             self.refresh_notebooks(&ui_weak, &fs);
             // If it's the open notebook, update its home title.
             if self.active == Some(account) {
-                let title = notebooks
-                    .borrow()
+                let title = self.notebooks
                     .get(account)
                     .map(|m| m.name.clone())
                     .filter(|n| !n.trim().is_empty());
@@ -208,8 +195,7 @@ impl App {
         }
     }
 
-    pub(crate) fn on_archive(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, account: i32, archived: bool) {
-        let notebooks = self.notebooks.clone();
+    pub(crate) fn on_archive(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, account: i32, archived: bool) {
         let Some(ui) = ui_weak.upgrade() else { return };
         let account = account.max(0) as u32;
         if archived {
@@ -223,7 +209,7 @@ impl App {
             }
         }
         {
-            let mut ix = notebooks.borrow_mut();
+            let ix = &mut self.notebooks;
             ix.set_archived(account, archived);
             save_notebooks(&fs, &ix);
         }
@@ -232,10 +218,9 @@ impl App {
     }
 
     pub(crate) fn on_back_to_list(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         if self.active.is_some() {
-            save_state(&fs, &state.borrow());
+            save_state(&fs, &self.state);
         }
         self.refresh_notebooks(&ui_weak, &fs);
         ui.global::<Ui>().set_screen(Screen::Notebooks);
