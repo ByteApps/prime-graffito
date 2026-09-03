@@ -4841,6 +4841,1349 @@ impl App {
     }
 }
 
+// ---- money path (cluster d): associated fns over the Rc handle — see each doc.
+impl App {
+    /// Pure motion from app_main (phase 4b cluster d): the money path keeps
+    /// its `Rc` handle because the work runs in a deferred `Timer` body;
+    /// every `app.borrow()` inside is byte-identical to the callback it was.
+    fn on_compose_continue(app: &Rc<RefCell<App>>, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        ui.global::<Ui>().set_busy(true);
+        let ui_weak = ui_weak.clone();
+        let app = app.clone();
+        let fs = fs.clone();
+        // Let the busy overlay paint one frame before the blocking work.
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        Timer::single_shot(Duration::from_millis(150), move || {
+            let state = app.borrow().state.clone();
+            let identity = app.borrow().identity.clone();
+            let notebooks = app.borrow().notebooks.clone();
+            let app_seed = app.borrow().app_seed.clone();
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let compose = ui.global::<Compose>();
+            let text = compose.get_text().to_string();
+            let private = compose.get_private_note();
+            let to_address = compose.get_to_address().trim().to_string();
+            let directed = !to_address.is_empty();
+            let extra_addrs: Vec<String> =
+                compose.get_to_extra().iter().map(|r| r.address.to_string()).collect();
+            let tier = compose.get_tier();
+            let rate_text = compose.get_rate_text().to_string();
+            let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
+            // Post-quantum Security section (pq.rs) — read once here;
+            // `compose-changed` already clamps these false whenever
+            // the section isn't eligible (not directed/private, an
+            // extra recipient present, or no usable recipient key).
+            let pq_passphrase_active = compose.get_pq_passphrase_active();
+            let pq_mlkem_active = compose.get_pq_mlkem_active();
+            let pq_passphrase_text = compose.get_pq_passphrase_text().to_string();
+            let st = state.borrow();
+            let id_guard = identity.borrow();
+            let pick = app.borrow().funding_pick.clone();
+            let change_choice = app.borrow().change_pick.clone();
+            let ix = notebooks.borrow();
+            let ctx = notebook_ctx(&ix, app.borrow().active)
+                .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
+            let net_s = app.borrow().net.clone();
+            let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
+            drop(ix);
+
+            // (note, spending inputs spent, spending change addr to mark
+            // used, change went to notebook?, mandatory notebook dust
+            // output present?) — the note's id IS its txid
+            // (`note.txid_hex`), known only once the tx is fully built
+            // below (PLAN-pnte-redesign.md: one note = one tx).
+            type ComposeOut = (
+                NoteTx,
+                Vec<(String, u32)>,
+                Option<spending::SpendingAddress>,
+                bool,
+                bool,
+                u8, // pq_flags: 0 = ordinary note, else FLAG_PW|FLAG_MLKEM
+            );
+            let result: Result<ComposeOut, String> = id_guard
+                .as_ref()
+                .ok_or_else(|| "identity unavailable".to_string())
+                .and_then(|id| {
+                    let rate = resolve_rate(tier, &rate_text, &st)?;
+                    // Full recipient list (primary + every "+ Add
+                    // recipient" row), each carrying the same gift
+                    // amount — order matches notes-core's own output
+                    // wrap order (OP_RETURN(s), then recipients in list
+                    // order), which the ledger vout math below depends
+                    // on matching exactly. Empty for a self-note; the
+                    // `_multi` notes-core functions error on an empty
+                    // slice, so callers below only invoke them when
+                    // `directed` is true (recipients_vec has >= 1
+                    // entry in that case, always).
+                    let recipients_vec: Vec<(Recipient, u64)> = if directed {
+                        let mut v = Vec::with_capacity(1 + extra_addrs.len());
+                        v.push((
+                            Recipient::parse(st.network(), &to_address)
+                                .map_err(|e| e.to_string())?,
+                            gift,
+                        ));
+                        for a in &extra_addrs {
+                            v.push((
+                                Recipient::parse(st.network(), a).map_err(|e| e.to_string())?,
+                                gift,
+                            ));
+                        }
+                        v
+                    } else {
+                        Vec::new()
+                    };
+                    // Fresh TRNG content key for a multi-recipient
+                    // private body — one-shot, never persisted/logged.
+                    // Drawn unconditionally (cheap) so every branch
+                    // below can pass it to the `_multi` calls without
+                    // re-deriving.
+                    let content_key = generate_content_key()?;
+                    let sp_participates = !pick.spending.is_empty();
+                    let mode_auto = !pick.touched && !sp_participates;
+
+                    // Post-quantum layers (pq.rs) — single-recipient
+                    // directed-private notes AND private self-notes,
+                    // notebook-funded only either way: the pq compose
+                    // primitives seal against
+                    // `id.tweaked_seckey`/`id.enc_key` directly and
+                    // have no mixed/spending-wallet variant (unlike the
+                    // ordinary/`_multi` builders). A self-note's
+                    // ML-KEM layer (PLAN-graffito-quantum-key.md)
+                    // encapsulates to THIS device's own personal
+                    // quantum key instead of a contact's — compose-
+                    // changed only lets the pill activate off
+                    // `directed` when that device key exists, so the
+                    // lookup below can only fail if the key was
+                    // deleted between the pill lighting up and Sign.
+                    let pq_wanted = pq_passphrase_active || pq_mlkem_active;
+                    if pq_wanted && sp_participates {
+                        return Err(
+                            "Quantum-safe layers need notebook-only funding — clear the \
+                             spending-wallet coins from \"Pay from\"."
+                                .to_string(),
+                        );
+                    }
+                    let pq_active = pq_wanted && private && extra_addrs.is_empty();
+                    let pq_mlkem_pair: Option<(pq::MlKemAlg, Vec<u8>)> = if pq_active
+                        && pq_mlkem_active
+                    {
+                        if directed {
+                            let armor = st
+                                .contacts
+                                .iter()
+                                .find(|c| c.address == to_address)
+                                .and_then(|c| c.mlkem_ek.clone())
+                                .ok_or("recipient has no quantum key — add one in Contacts")?;
+                            Some(pq::import_public(&armor).map_err(|e| e.to_string())?)
+                        } else {
+                            let kp = app.borrow_mut().device_quantum_key(&fs).ok_or(
+                                "no quantum key on this device — create one in Settings",
+                            )?;
+                            Some((kp.alg(), kp.ek().to_vec()))
+                        }
+                    } else {
+                        None
+                    };
+                    let pq_layers = pq::SealLayers {
+                        mlkem_ek: pq_mlkem_pair.as_ref().map(|(alg, ek)| (*alg, ek.as_slice())),
+                        password: (pq_active && pq_passphrase_active)
+                            .then_some(pq_passphrase_text.as_str()),
+                    };
+                    let pq_flags_out = if pq_active { pq_layers.flags() } else { 0 };
+                    if pq_flags_out != 0 {
+                        log::info!("cb: pq-compose flags={pq_flags_out}");
+                    }
+
+                    if mode_auto {
+                        // Byte-identical input selection to before this
+                        // feature — change destination is still
+                        // independently resolvable (the picker screen).
+                        let (change_spk, _) = resolve_change(
+                            &change_choice.choice,
+                            &change_choice.custom_address,
+                            st.network(),
+                            &id.output_x,
+                            false,
+                            &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?,
+                            ctx.0,
+                            ctx.1,
+                            0,
+                        )?;
+                        let change_is_notebook = change_choice.choice != "custom";
+                        let note = if pq_active && directed {
+                            let recipient = Recipient::parse(st.network(), &to_address)
+                                .map_err(|e| e.to_string())?;
+                            compose_directed_note_pq_with_change_amount(
+                                id,
+                                &st.core_utxos(),
+                                &text,
+                                &recipient,
+                                gift,
+                                pq_layers,
+                                Some(change_spk.as_slice()),
+                                st.effective_chunk(),
+                                rate,
+                                resolve_locktime(app.borrow().lock_policy, st.tip_height),
+                                || generate_aux_rand(),
+                            )
+                        } else if pq_active {
+                            // Self-pw note (PLAN-graffito-self-pw.md):
+                            // sealed under the notebook's enc key, not
+                            // a directed ECDH — `directed` is false
+                            // here (no recipient), so `pq_layers` can
+                            // only carry the password (ML-KEM is
+                            // never active off a self-note).
+                            compose_note_pq_with_change(
+                                id,
+                                &st.core_utxos(),
+                                &text,
+                                pq_layers,
+                                Some(change_spk.as_slice()),
+                                st.effective_chunk(),
+                                rate,
+                                resolve_locktime(app.borrow().lock_policy, st.tip_height),
+                                || generate_aux_rand(),
+                            )
+                        } else if !recipients_vec.is_empty() {
+                            compose_directed_note_multi_with_change(
+                                id,
+                                &st.core_utxos(),
+                                &text,
+                                private,
+                                &recipients_vec,
+                                content_key,
+                                Some(change_spk.as_slice()),
+                                st.effective_chunk(),
+                                rate,
+                                resolve_locktime(app.borrow().lock_policy, st.tip_height),
+                                || generate_aux_rand(),
+                            )
+                        } else {
+                            notes_core::bundle::compose_note_with_change(
+                                id,
+                                &st.core_utxos(),
+                                &text,
+                                private,
+                                Some(change_spk.as_slice()),
+                                st.effective_chunk(),
+                                rate,
+                                resolve_locktime(app.borrow().lock_policy, st.tip_height),
+                                || generate_aux_rand(),
+                            )
+                        }
+                        .map_err(|e| e.to_string())?;
+                        Ok((note, Vec::new(), None, change_is_notebook, false, pq_flags_out))
+                    } else if !sp_participates {
+                        // Notebook-only coin control (a subset was
+                        // explicitly picked, or explicitly re-confirmed).
+                        let inputs: Vec<Utxo> = st
+                            .utxos
+                            .iter()
+                            .filter(|u| pick.is_selected(false, &u.txid, u.vout))
+                            .filter_map(|u| {
+                                let mut txid = [0u8; 32];
+                                hex::decode_to_slice(&u.txid, &mut txid).ok()?;
+                                txid.reverse();
+                                Some(Utxo { txid, vout: u.vout, value: u.value })
+                            })
+                            .collect();
+                        if inputs.is_empty() {
+                            return Err("Select at least one coin to pay from.".into());
+                        }
+                        let (change_spk, _) = resolve_change(
+                            &change_choice.choice,
+                            &change_choice.custom_address,
+                            st.network(),
+                            &id.output_x,
+                            false,
+                            &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?,
+                            ctx.0,
+                            ctx.1,
+                            0,
+                        )?;
+                        let change_is_notebook = change_choice.choice != "custom";
+                        let note = if pq_active && directed {
+                            let recipient = Recipient::parse(st.network(), &to_address)
+                                .map_err(|e| e.to_string())?;
+                            compose_directed_note_pq_exact_amount(
+                                id,
+                                &inputs,
+                                &text,
+                                &recipient,
+                                gift,
+                                pq_layers,
+                                Some(change_spk.as_slice()),
+                                st.effective_chunk(),
+                                rate,
+                                resolve_locktime(app.borrow().lock_policy, st.tip_height),
+                                || generate_aux_rand(),
+                            )
+                        } else if pq_active {
+                            // Self-pw note, coin-control funding — see
+                            // the mode_auto branch's comment above.
+                            compose_note_pq_exact(
+                                id,
+                                &inputs,
+                                &text,
+                                pq_layers,
+                                Some(change_spk.as_slice()),
+                                st.effective_chunk(),
+                                rate,
+                                resolve_locktime(app.borrow().lock_policy, st.tip_height),
+                                || generate_aux_rand(),
+                            )
+                        } else if !recipients_vec.is_empty() {
+                            compose_directed_note_multi_exact(
+                                id,
+                                &inputs,
+                                &text,
+                                private,
+                                &recipients_vec,
+                                content_key,
+                                Some(change_spk.as_slice()),
+                                st.effective_chunk(),
+                                rate,
+                                resolve_locktime(app.borrow().lock_policy, st.tip_height),
+                                || generate_aux_rand(),
+                            )
+                        } else {
+                            compose_note_exact(
+                                id,
+                                &inputs,
+                                &text,
+                                private,
+                                Some(change_spk.as_slice()),
+                                st.effective_chunk(),
+                                rate,
+                                resolve_locktime(app.borrow().lock_policy, st.tip_height),
+                                || generate_aux_rand(),
+                            )
+                        }
+                        .map_err(|e| e.to_string())?;
+                        Ok((note, Vec::new(), None, change_is_notebook, false, pq_flags_out))
+                    } else {
+                        // Spending-wallet participates (pure spending or
+                        // mixed with notebook coins) — mixed builder. The
+                        // notebook dust-to-self anchor is emitted ONLY
+                        // when no notebook coin is among the selected
+                        // inputs (`build_note_tx_mixed_exact_anchored`'s
+                        // skip condition, funding-unification
+                        // 2026-07-18) — a notebook input already anchors
+                        // the tx to the notebook's address history.
+                        let seed: &[u8; 32] =
+                            &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?;
+                        let notebook_dust_spk = p2tr_script_pubkey(&id.output_x);
+                        let mut mixed_inputs: Vec<MixedInput> = Vec::new();
+                        let mut has_notebook_input = false;
+                        for u in
+                            st.utxos.iter().filter(|u| pick.is_selected(false, &u.txid, u.vout))
+                        {
+                            let mut txid = [0u8; 32];
+                            hex::decode_to_slice(&u.txid, &mut txid)
+                                .map_err(|_| "bad notebook txid".to_string())?;
+                            txid.reverse();
+                            mixed_inputs.push(MixedInput {
+                                utxo: Utxo { txid, vout: u.vout, value: u.value },
+                                prevout_spk: notebook_dust_spk.clone(),
+                                kind: InputKind::Taproot,
+                                seckey: id.tweaked_seckey,
+                            });
+                            has_notebook_input = true;
+                        }
+                        let sec =
+                            section.as_ref().ok_or("spending wallet not set up".to_string())?;
+                        let mut spent_spending: Vec<(String, u32)> = Vec::new();
+                        for su in
+                            sec.utxos.iter().filter(|u| pick.is_selected(true, &u.txid, u.vout))
+                        {
+                            let key = notes_core::seeds::derive_spending_key(
+                                seed,
+                                ctx.0,
+                                st.network(),
+                                ctx.1,
+                                su.chain,
+                                su.index,
+                            )
+                            .map_err(|e| e.to_string())?;
+                            let mut txid = [0u8; 32];
+                            hex::decode_to_slice(&su.txid, &mut txid)
+                                .map_err(|_| "bad spending txid".to_string())?;
+                            txid.reverse();
+                            mixed_inputs.push(MixedInput {
+                                utxo: Utxo { txid, vout: su.vout, value: su.value },
+                                prevout_spk: key.script_pubkey.clone(),
+                                kind: InputKind::P2wpkh,
+                                seckey: key.seckey,
+                            });
+                            spent_spending.push((su.txid.clone(), su.vout));
+                        }
+                        if mixed_inputs.is_empty() {
+                            return Err("Select at least one coin to pay from.".into());
+                        }
+                        // The tx's FIRST input's outpoint — the mixed
+                        // builder below keeps `mixed_inputs` order
+                        // verbatim (notebook inputs first, then
+                        // spending), so `mixed_inputs[0]` IS the tx's
+                        // first input; every sealed body's AAD binds to
+                        // it (crypt.rs/dm.rs's uniform outpoint rule,
+                        // PLAN-pnte-redesign.md).
+                        let outpoint = notes_core::tx::outpoint_bytes(&mixed_inputs[0].utxo);
+                        // `sealed_note_payloads_multi` has no self-note
+                        // case (errors on an empty recipients slice —
+                        // notes-core bundle.rs:876), so a self-note
+                        // (recipients_vec empty) keeps calling the old
+                        // singular `sealed_note_payloads` with `None`;
+                        // only a directed note switches to the `_multi`
+                        // primitive.
+                        let (payloads, recipients_amounts): (Vec<Vec<u8>>, Vec<(Vec<u8>, u64)>) =
+                            if !recipients_vec.is_empty() {
+                                // `Recipient` isn't `Clone`; re-parsing
+                                // from the address string (already
+                                // validated once above) is cheap and
+                                // avoids touching notes-core for this.
+                                let recips: Vec<Recipient> = recipients_vec
+                                    .iter()
+                                    .map(|(r, _)| {
+                                        Recipient::parse(st.network(), &r.address)
+                                            .map_err(|e| e.to_string())
+                                    })
+                                    .collect::<Result<_, _>>()?;
+                                let (payloads, spks) = sealed_note_payloads_multi(
+                                    id,
+                                    &text,
+                                    private,
+                                    &recips,
+                                    outpoint,
+                                    content_key,
+                                    st.effective_chunk(),
+                                )
+                                .map_err(|e| e.to_string())?;
+                                let amounts =
+                                    spks.into_iter().map(|spk| (spk, gift)).collect();
+                                (payloads, amounts)
+                            } else {
+                                let (payloads, _) = sealed_note_payloads(
+                                    id,
+                                    &text,
+                                    private,
+                                    None,
+                                    outpoint,
+                                    st.effective_chunk(),
+                                )
+                                .map_err(|e| e.to_string())?;
+                                (payloads, Vec::new())
+                            };
+                        let (change_spk, change_addr) = resolve_change(
+                            &change_choice.choice,
+                            &change_choice.custom_address,
+                            st.network(),
+                            &id.output_x,
+                            true,
+                            seed,
+                            ctx.0,
+                            ctx.1,
+                            sec.next_change,
+                        )?;
+                        let change_is_notebook = change_choice.choice == "notebook";
+                        // `build_note_tx_mixed_exact_anchored_multi` with
+                        // <=1 recipient entries delegates byte-identically
+                        // to `build_note_tx_mixed_exact_anchored` (tx.rs),
+                        // so this single call covers self/single/multi
+                        // recipient shapes without branching.
+                        let note = build_note_tx_mixed_exact_anchored_multi(
+                            &mixed_inputs,
+                            &payloads,
+                            &recipients_amounts,
+                            &notebook_dust_spk,
+                            &change_spk,
+                            rate,
+                            resolve_locktime(app.borrow().lock_policy, st.tip_height),
+                            || generate_aux_rand(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        // Dust is emitted iff no notebook input anchored
+                        // the tx — mirrors the builder's own condition
+                        // exactly (`inputs.iter().any(prevout_spk ==
+                        // notebook_dust_spk)`), computed from the SAME
+                        // `has_notebook_input` used to build `mixed_inputs`
+                        // above, so this can never drift from the actual
+                        // wire shape.
+                        let notebook_dust = !has_notebook_input;
+                        Ok((
+                            note,
+                            spent_spending,
+                            change_addr,
+                            change_is_notebook,
+                            notebook_dust,
+                            0, // pq layers require notebook-only funding — guarded above
+                        ))
+                    }
+                });
+            ui.global::<Ui>().set_busy(false);
+            match result {
+                Ok((note, spending_spent, spending_change_addr, change_is_notebook, notebook_dust, pq_flags_note)) => {
+                    let chunks = note
+                        .tx
+                        .outputs
+                        .iter()
+                        .filter(|o| o.script_pubkey.first() == Some(&0x6a))
+                        .count() as u64;
+                    let funded_by = pick.mode_label();
+                    // Full recipient list for THIS note (empty for a
+                    // self-note; primary + every "+ Add recipient" row
+                    // otherwise), in the same order as `recipients_vec`
+                    // fed the builder above — matches notes-core's own
+                    // output wrap order (OP_RETURN(s), recipients in
+                    // list order), which the ledger vout math further
+                    // below depends on matching exactly.
+                    let recipients_display: Vec<String> = if directed {
+                        let mut v = vec![to_address.clone()];
+                        v.extend(extra_addrs.iter().cloned());
+                        v
+                    } else {
+                        Vec::new()
+                    };
+                    log::info!(
+                        "cb: compose len={} private={} to={} chunks={} fee={} vsize={} gift={} funded={funded_by} recipients={} txid={} ok",
+                        text.len(),
+                        private,
+                        if directed { to_address.as_str() } else { "self" },
+                        chunks,
+                        note.fee,
+                        note.vsize,
+                        note.sent,
+                        recipients_display.len(),
+                        note.txid_hex
+                    );
+                    let recipient = if directed { Some(to_address.clone()) } else { None };
+                    let recipient_name = if directed {
+                        st.contacts
+                            .iter()
+                            .find(|c| c.address == to_address && !c.name.is_empty())
+                            .map(|c| c.name.clone())
+                    } else {
+                        None
+                    };
+
+                    // ConfirmCtx: the universal byte-truth decode gate
+                    // (screen 4) — every fact it shows comes from
+                    // decoding `note.raw_hex` itself; this only gathers
+                    // the LOOKUPS (source labels, self/change spks).
+                    let active_acct = app.borrow().active.unwrap_or(0);
+                    let ix = notebooks.borrow();
+                    let active_name = {
+                        let short = id_guard
+                            .as_ref()
+                            .map(|id| short_addr(&id.address(st.network())))
+                            .unwrap_or_default();
+                        notebook_name(&ix, active_acct, &short)
+                    };
+                    let (mut self_spks, mut spending_spks) =
+                        confirm_self_spks(&ix, app_seed_get(&app_seed), &net_s, ctx);
+                    drop(ix);
+                    // A fresh spending-wallet change address this very
+                    // tx pays isn't in `used` yet (marked only after a
+                    // successful sign) — add it so the change output
+                    // classifies as ours, not "other".
+                    if let Some(addr) = &spending_change_addr {
+                        if let Ok(spk) = hex::decode(&addr.spk_hex) {
+                            if !spending_spks.iter().any(|s| s == &spk) {
+                                spending_spks.push(spk.clone());
+                            }
+                            if !self_spks.iter().any(|s| s == &spk) {
+                                self_spks.push(spk);
+                            }
+                        }
+                    }
+
+                    // Addresses of any spending-wallet coins this tx
+                    // spent, for the input rows' title (best-effort —
+                    // display only, never affects classification).
+                    let spending_addrs: std::collections::HashMap<(String, u32), String> =
+                        if spending_spent.is_empty() {
+                            Default::default()
+                        } else {
+                            section
+                                .as_ref()
+                                .into_iter()
+                                .flat_map(|s| s.utxos.iter())
+                                .filter(|u| {
+                                    spending_spent.iter().any(|(t, v)| *t == u.txid && *v == u.vout)
+                                })
+                                .filter_map(|u| {
+                                    let seed_bytes = app_seed_get(&app_seed).as_ref()?;
+                                    notes_core::seeds::derive_spending_key(
+                                        seed_bytes,
+                                        ctx.0,
+                                        st.network(),
+                                        ctx.1,
+                                        u.chain,
+                                        u.index,
+                                    )
+                                    .ok()
+                                    .map(|k| ((u.txid.clone(), u.vout), k.address))
+                                })
+                                .collect()
+                        };
+
+                    let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> =
+                        BTreeMap::new();
+                    for u in &note.tx.inputs {
+                        let mut t = u.txid;
+                        t.reverse();
+                        let txid_hex = hex::encode(t);
+                        let is_spending =
+                            spending_spent.iter().any(|(t2, v2)| *t2 == txid_hex && *v2 == u.vout);
+                        let (source, address) = if is_spending {
+                            (
+                                "Spending wallet".to_string(),
+                                spending_addrs.get(&(txid_hex.clone(), u.vout)).cloned(),
+                            )
+                        } else {
+                            (
+                                format!("Notebook · {active_name}"),
+                                id_guard.as_ref().map(|id| id.address(st.network())),
+                            )
+                        };
+                        prevouts.insert(
+                            format!("{txid_hex}:{}", u.vout),
+                            notes_core::confirm::PrevoutInfo { value: u.value, address, source },
+                        );
+                    }
+
+                    let note_preview = Some(if private {
+                        "Private note (encrypted)".to_string()
+                    } else {
+                        text.clone()
+                    });
+                    let cctx = notes_core::confirm::ConfirmCtx {
+                        network: st.network(),
+                        prevouts,
+                        self_spks,
+                        spending_spks,
+                        expected_change: (change_choice.choice == "custom"
+                            && !change_choice.custom_address.trim().is_empty())
+                        .then(|| change_choice.custom_address.trim().to_string()),
+                        recipient: recipient.clone(),
+                        recipient_name,
+                        recipients: recipients_display.clone(),
+                        note_preview,
+                    };
+                    let context_line = format!(
+                        "{} note · {}",
+                        if directed {
+                            "Directed"
+                        } else if private {
+                            "Private"
+                        } else {
+                            "Public"
+                        },
+                        st.network
+                    );
+
+                    match show_confirm_screen(
+                        &ui,
+                        "compose",
+                        &note.raw_hex,
+                        &cctx,
+                        context_line,
+                        "Sign & export",
+                    ) {
+                        Ok(()) => {
+                            // Honest-fee-label: `note` is the REAL
+                            // signed tx, so this is a decomposition of
+                            // its own numbers (see `note_fold_amount`'s
+                            // doc), not a prediction — `rate` resolves
+                            // deterministically from the same
+                            // `tier`/`rate_text`/`st` that already
+                            // built `note` successfully, so this can't
+                            // fail here.
+                            if let Ok(rate) = resolve_rate(tier, &rate_text, &st) {
+                                let fold_amount =
+                                    note_fold_amount(note.fee, note.vsize, note.change, rate);
+                                if fold_amount > 0 {
+                                    ui.global::<ConfirmSign>()
+                                        .set_fold(format!("{fold_amount} sats").into());
+                                    log::info!("cb: confirm fold amount={fold_amount}");
+                                }
+                            }
+                            app.borrow_mut().plan = Some(Plan {
+                                note,
+                                text,
+                                private,
+                                chunks,
+                                recipients: recipients_display.clone(),
+                                spending_spent,
+                                spending_change_addr,
+                                change_is_notebook,
+                                notebook_dust,
+                                pq_flags: pq_flags_note,
+                            });
+                        }
+                        Err(e) => {
+                            log::warn!("cb: confirm summarize err={e}");
+                            compose.set_cost_line(format!("Cannot show confirm: {e}").into());
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("cb: compose len={} private={} err={e}", text.len(), private);
+                    compose.set_cost_line(format!("Cannot build: {e}").into());
+                }
+            }
+        });
+    }
+
+    /// Universal Confirm & sign gate (screen 4) — dispatches on
+    /// ConfirmSign.kind to the three sign bodies (each was its own
+    /// dedicated callback before the confirm-gate refactor; merged here so
+    /// Sign always fires through one place, no callback-from-callback
+    /// re-entrancy). Ledger/outbox mutations happen ONLY past this point.
+    /// Pure motion from app_main (phase 4b cluster d): the money path keeps
+    /// its `Rc` handle because the work runs in a deferred `Timer` body;
+    /// every `app.borrow()` inside is byte-identical to the callback it was.
+    fn on_confirm_sign(app: &Rc<RefCell<App>>, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let identity = app.borrow().identity.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let kind = ui.global::<ConfirmSign>().get_kind().to_string();
+        let txid = ui.global::<ConfirmSign>().get_txid().to_string();
+        log::info!("cb: confirm sign kind={kind} txid={txid}");
+        match kind.as_str() {
+            "sweep" | "consolidate" => {
+                let Some(p) = app.borrow_mut().sweep_plan.take() else { return };
+                ui.global::<Ui>().set_busy(true);
+                let ui_weak = ui_weak.clone();
+                let fs = fs.clone();
+                let app = app.clone();
+                Timer::single_shot(Duration::from_millis(150), move || {
+                    let state = app.borrow().state.clone();
+                    let Some(ui) = ui_weak.upgrade() else { return };
+                    let mut st = state.borrow_mut();
+                    let active_acct = app.borrow().active.unwrap_or(p.dest_account);
+
+                    // Wallet-level ledger: remove each notebook's spent
+                    // inputs from its own state file (the active one via
+                    // the live `st`); a consolidate's single output lands
+                    // in the destination notebook as its new
+                    // (unconfirmed) coin.
+                    let inputs: usize = p.spent_by_account.iter().map(|(_, o)| o.len()).sum();
+                    let recv = p.tx.tx.outputs[0].value;
+                    for (acct, spent) in &p.spent_by_account {
+                        if *acct == active_acct {
+                            st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+                        } else {
+                            let mut other = load_state(&fs, &app.borrow().net, *acct);
+                            other.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+                            save_state(&fs, &other);
+                        }
+                    }
+                    if p.kind == "consolidate" {
+                        let coin = UtxoRec { txid: p.tx.txid_hex.clone(), vout: 0, value: recv };
+                        if p.dest_account == active_acct {
+                            st.utxos.push(coin);
+                        } else {
+                            let mut dest = load_state(&fs, &app.borrow().net, p.dest_account);
+                            dest.utxos.push(coin);
+                            save_state(&fs, &dest);
+                        }
+                    }
+
+                    let file = format!("{OUTBOX_DIR}/{}.hex", p.tx.txid_hex);
+                    let internal = ensure_dir(&fs, OUTBOX_DIR, Location::User).and_then(|_| {
+                        write_file(&fs, &file, Location::User, p.tx.raw_hex.as_bytes())
+                    });
+                    let airlock = ensure_airlock_mounted(&fs).and_then(|_| {
+                        let r = ensure_dir(&fs, OUTBOX_DIR, Location::Airlock).and_then(|_| {
+                            write_file(&fs, &file, Location::Airlock, p.tx.raw_hex.as_bytes())
+                        });
+                        unmount_airlock(&fs);
+                        r
+                    });
+                    save_state(&fs, &st);
+                    log::info!(
+                        "cb: sign-sweep kind={} txid={} fee={} internal={} airlock={}",
+                        p.kind,
+                        p.tx.txid_hex,
+                        p.tx.fee,
+                        if internal.is_ok() { "ok" } else { "err" },
+                        if airlock.is_ok() { "ok" } else { "err" },
+                    );
+                    drop(st);
+
+                    let sp = ui.global::<SignPsbt>();
+                    sp.set_summary(
+                        format!(
+                            "{}\nfee {} sats · {} vB\ntxid: {}",
+                            match (p.kind, &p.dest) {
+                                ("consolidate", _) =>
+                                    format!("Consolidated {inputs} coin(s) into one · {recv} sats"),
+                                (_, Some(d)) =>
+                                    format!("Swept {inputs} coin(s) · {recv} sats to {}", short_addr(d)),
+                                _ => format!("Swept {inputs} coin(s) · {recv} sats"),
+                            },
+                            p.tx.fee,
+                            p.tx.vsize,
+                            p.tx.txid_hex
+                        )
+                        .into(),
+                    );
+                    if p.tx.raw_hex.len() <= MAX_QR_HEX_CHARS {
+                        sp.set_qr(qr_image(&p.tx.raw_hex.to_uppercase()));
+                        sp.set_has_qr(true);
+                    } else {
+                        sp.set_has_qr(false);
+                    }
+                    sp.set_back_screen(Screen::Home);
+
+                    // Reset the sweep flow so nothing leaks into the next run.
+                    let sweep = ui.global::<Sweep>();
+                    sweep.set_dest("".into());
+                    sweep.set_dest_label("".into());
+                    sweep.set_tier(1);
+                    sweep.set_cost_line("".into());
+                    sweep.set_can_continue(false);
+                    ui.global::<Contacts>().set_pick_mode("compose".into());
+
+                    ui.global::<Ui>().set_busy(false);
+                    app.borrow().refresh_home(&ui_weak);
+                    ui.global::<Ui>().set_screen(Screen::Signed);
+                });
+            }
+            "psbt" => {
+                let Some(psbt) = app.borrow_mut().psbt_pending.take() else { return };
+                let id_guard = identity.borrow();
+                let Some(id) = id_guard.as_ref() else {
+                    drop(id_guard);
+                    ui.global::<Sync>().set_result("Device locked — no signing key.".into());
+                    ui.global::<Ui>().set_screen(Screen::Sync);
+                    return;
+                };
+                let output_x = id.output_x;
+                let tweaked_seckey = id.tweaked_seckey;
+                drop(id_guard);
+                ui.global::<Ui>().set_busy(true);
+                let ui_weak = ui_weak.clone();
+                let fs = fs.clone();
+                let mut psbt = psbt;
+                let ui_weak = ui_weak.clone();
+                let fs = fs.clone();
+                Timer::single_shot(Duration::from_millis(150), move || {
+                    let Some(ui) = ui_weak.upgrade() else { return };
+                    let (ours, signed) =
+                        match psbt.sign_own_taproot(&output_x, &tweaked_seckey, generate_aux_rand) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                ui.global::<Ui>().set_busy(false);
+                                ui.global::<Sync>().set_result(format!("Sign failed: {e}").into());
+                                ui.global::<Ui>().set_screen(Screen::Sync);
+                                return;
+                            }
+                        };
+                    log::info!("cb: sign-psbt inputs={ours} signed={signed} ok");
+                    let hex_str = hex::encode_upper(psbt.serialize());
+                    let out_txid = psbt.unsigned_tx.txid_hex();
+                    let file = format!("{OUTBOX_DIR}/{out_txid}.psbt.hex");
+                    let _ = ensure_dir(&fs, OUTBOX_DIR, Location::User)
+                        .and_then(|_| write_file(&fs, &file, Location::User, hex_str.as_bytes()));
+                    let fee = psbt_fee(&psbt);
+                    let note = psbt_note_summary(&psbt);
+                    let sp = ui.global::<SignPsbt>();
+                    sp.set_summary(
+                        format!("Signed {signed} of {ours} input(s) · fee {fee} sats\n{note}")
+                            .into(),
+                    );
+                    if hex_str.len() <= MAX_QR_HEX_CHARS {
+                        sp.set_qr(qr_image(&hex_str));
+                        sp.set_has_qr(true);
+                    } else {
+                        sp.set_has_qr(false);
+                    }
+                    ui.global::<Ui>().set_error("".into());
+                    ui.global::<Ui>().set_busy(false);
+                    ui.global::<Ui>().set_screen(Screen::Signed);
+                });
+            }
+            _ => {
+                // "compose" — the default arm.
+                let Some(p) = app.borrow_mut().plan.take() else { return };
+                ui.global::<Ui>().set_busy(true);
+                let ui_weak = ui_weak.clone();
+                let fs = fs.clone();
+                let app = app.clone();
+                Timer::single_shot(Duration::from_millis(150), move || {
+                    let state = app.borrow().state.clone();
+                    let notebooks = app.borrow().notebooks.clone();
+                    let Some(ui) = ui_weak.upgrade() else { return };
+                    let mut st = state.borrow_mut();
+
+                    // Notebook ledger: drop spent notebook inputs. Spending-wallet
+                    // inputs (if any) are dropped from the SEPARATE spending
+                    // ledger below via `p.spending_spent` — `p.note.spent_outpoints`
+                    // covers both kinds, but only notebook outpoints ever match
+                    // an entry in `st.utxos`, so this retain is safe either way.
+                    let spent: Vec<(String, u32)> = p
+                        .note
+                        .spent_outpoints
+                        .iter()
+                        .map(|(txid, vout)| {
+                            let mut t = *txid;
+                            t.reverse();
+                            (hex::encode(t), *vout)
+                        })
+                        .collect();
+                    st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+
+                    // Output order: OP_RETURN(s), EVERY directed recipient (in
+                    // list order — matches notes-core's own builders, and the
+                    // order `recipients_vec` was fed to them in
+                    // `on_compose_continue`), [notebook dust — present unless a
+                    // notebook coin already anchors the tx, see
+                    // `Plan.notebook_dust`'s doc], [change]. `p.chunks` +
+                    // `p.recipients.len()` (0, 1, or N recipient outputs) place
+                    // the dust slot; +1 more ONLY when `p.notebook_dust` is true
+                    // places change — when dust is skipped, change lands in that
+                    // same slot instead (computed from the flag, never a
+                    // hardcoded position). Getting `p.recipients.len()` right
+                    // here is safety-critical: a wrong offset would make the app
+                    // track the WRONG utxo as its own dust/change coin.
+                    let dust_vout = p.chunks as u32 + p.recipients.len() as u32;
+                    if p.notebook_dust {
+                        st.utxos.push(UtxoRec {
+                            txid: p.note.txid_hex.clone(),
+                            vout: dust_vout,
+                            value: notes_core::DUST_LIMIT,
+                        });
+                    }
+                    let change_vout = dust_vout + u32::from(p.notebook_dust);
+                    if p.note.change > 0 && p.change_is_notebook {
+                        st.utxos.push(UtxoRec {
+                            txid: p.note.txid_hex.clone(),
+                            vout: change_vout,
+                            value: p.note.change,
+                        });
+                    }
+                    // Custom/external change: not our coin, nothing to track
+                    // (matches how a directed recipient's dust isn't tracked).
+
+                    // Spending ledger: drop spent inputs + add change (if it
+                    // went to a fresh spending address) in one pass — mirrors
+                    // the notebook ledger's unconfirmed-chaining update above.
+                    if !p.spending_spent.is_empty() || p.spending_change_addr.is_some() {
+                        let mut ix = notebooks.borrow_mut();
+                        let ctx = notebook_ctx(&ix, app.borrow().active)
+                            .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
+                        let net_s = app.borrow().net.clone();
+                        let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
+                        let change_coin =
+                            if p.note.change > 0 { p.spending_change_addr.as_ref() } else { None };
+                        if let Some(addr) = change_coin {
+                            sec.mark_used(addr.clone());
+                        }
+                        sec.apply_spend(
+                            &p.spending_spent,
+                            change_coin.map(|addr| spending::SpendingUtxo {
+                                txid: p.note.txid_hex.clone(),
+                                vout: change_vout,
+                                value: p.note.change,
+                                chain: addr.chain,
+                                index: addr.index,
+                            }),
+                        );
+                        save_notebooks(&fs, &ix);
+                    }
+
+                    // Self-pw note (PLAN-graffito-self-pw.md): a
+                    // self-note (no recipient) carrying a pq layer is
+                    // stored LOCKED from the moment it's signed —
+                    // never a plaintext cache, and re-derived here
+                    // from the tx's own bytes rather than trusted from
+                    // `p.pq_flags`/`p.text`, so a bug in the compose
+                    // path can't accidentally leak plaintext into
+                    // state.json. `None` for every other note (a
+                    // directed note, or a self-note with no pq layer),
+                    // which keeps their existing plaintext-cached
+                    // behavior byte-identical.
+                    let self_locked =
+                        if p.recipients.is_empty() { self_pw_locked_body(&p.note) } else { None };
+                    let rec = NoteRec {
+                        id: p.note.txid_hex.clone(),
+                        text: if self_locked.is_some() {
+                            String::new()
+                        } else {
+                            p.text.clone()
+                        },
+                        private: p.private,
+                        txid: p.note.txid_hex.clone(),
+                        raw_hex: p.note.raw_hex.clone(),
+                        fee: p.note.fee,
+                        vsize: p.note.vsize as u64,
+                        chunks: p.chunks,
+                        height: None,
+                        blocktime: None,
+                        status: "pending".into(),
+                        directed: !p.recipients.is_empty(),
+                        to: p.recipients.first().cloned(),
+                        from: None,
+                        recipients: p.recipients.clone(),
+                        pq_flags: p.pq_flags,
+                        // A directed own composed note (or an ordinary
+                        // self-note): plaintext is already known
+                        // (`p.text` above) — never locked. A self-pw
+                        // note: `self_locked` above, view-only unlock.
+                        locked: self_locked,
+                    };
+
+                    // Export the signed tx for the companion to broadcast:
+                    // always to internal outbox; Airlock too when available.
+                    let file = format!("{OUTBOX_DIR}/{}.hex", p.note.txid_hex);
+                    let internal = ensure_dir(&fs, OUTBOX_DIR, Location::User).and_then(|_| {
+                        write_file(&fs, &file, Location::User, p.note.raw_hex.as_bytes())
+                    });
+                    let airlock = ensure_airlock_mounted(&fs).and_then(|_| {
+                        let r = ensure_dir(&fs, OUTBOX_DIR, Location::Airlock).and_then(|_| {
+                            write_file(&fs, &file, Location::Airlock, p.note.raw_hex.as_bytes())
+                        });
+                        // Full flush so the file survives unplug (paper-wallet
+                        // pattern).
+                        unmount_airlock(&fs);
+                        r
+                    });
+                    log::info!(
+                        "cb: sign-note id={} fee={} vsize={} internal={} airlock={}",
+                        rec.id,
+                        rec.fee,
+                        rec.vsize,
+                        if internal.is_ok() { "ok" } else { "err" },
+                        if airlock.is_ok() { "ok" } else { "err" },
+                    );
+
+                    // Auto-save every recipient as a recent contact (usually a
+                    // no-op re-front after the pick, but covers every path).
+                    for to in &p.recipients {
+                        upsert_contact(&mut st, to);
+                    }
+                    st.notes.push(rec.clone());
+                    save_state(&fs, &st);
+                    drop(st);
+                    app.borrow().refresh_funding(&ui_weak);
+
+                    let view = ui.global::<View>();
+                    view.set_id(rec.id.clone().into());
+                    view.set_text(rec.text.clone().into());
+                    view.set_badge(if rec.private { "PRIVATE" } else { "PUBLIC" }.into());
+                    view.set_meta(
+                        format!(
+                            "pending — scan the QR with the companion, or broadcast {}.hex\nfee {} sats · {} vB",
+                            rec.txid, rec.fee, rec.vsize
+                        )
+                        .into(),
+                    );
+                    // Straight to the QR after signing — that's the broadcast path.
+                    set_view_qr(&view, &rec);
+                    view.set_show_qr(view.get_has_qr());
+                    ui.global::<Compose>().set_text("".into());
+                    // A stale recipient must never silently direct the next note.
+                    ui.global::<Compose>().set_to_address("".into());
+                    ui.global::<Compose>().set_to_label("".into());
+                    ui.global::<Compose>()
+                        .set_to_extra(Rc::new(VecModel::from(Vec::<ToRow>::new())).into());
+                    // Gift resets with the recipient so a large gift can't leak
+                    // into the next note.
+                    ui.global::<Compose>().set_gift_sats("330".into());
+                    ui.global::<Compose>().set_gift_expanded(false);
+                    // Funding/change picks reset too — a stale coin selection or
+                    // custom change address must never leak into the next note.
+                    app.borrow_mut().funding_pick = FundingPick::default();
+                    app.borrow_mut().change_pick = ChangePickState::default();
+                    ui.global::<ChangePick>().set_choice("auto".into());
+                    ui.global::<ChangePick>().set_custom_address("".into());
+                    ui.global::<Ui>().set_busy(false);
+                    app.borrow().refresh_notes(&ui_weak);
+                    ui.global::<Ui>().set_screen(Screen::Note);
+                });
+            }
+        }
+    }
+
+    /// Build + sign the sweep (ALL coins, key-path), then the confirm dialog.
+    /// Pure motion from app_main (phase 4b cluster d): the money path keeps
+    /// its `Rc` handle because the work runs in a deferred `Timer` body;
+    /// every `app.borrow()` inside is byte-identical to the callback it was.
+    fn on_sweep_continue(app: &Rc<RefCell<App>>, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        ui.global::<Ui>().set_busy(true);
+        let ui_weak = ui_weak.clone();
+        let app = app.clone();
+        let fs = fs.clone();
+        // Let the busy overlay paint one frame before the blocking work.
+        let app = app.clone();
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        Timer::single_shot(Duration::from_millis(150), move || {
+            let state = app.borrow().state.clone();
+            let identity = app.borrow().identity.clone();
+            let notebooks = app.borrow().notebooks.clone();
+            let app_seed = app.borrow().app_seed.clone();
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let sweep = ui.global::<Sweep>();
+            let consolidate = sweep.get_kind() == "consolidate";
+            let kind = if consolidate { "consolidate" } else { "sweep" };
+            let dest = sweep.get_dest().trim().to_string();
+            let tier = sweep.get_tier();
+            let rate_text = sweep.get_rate_text().to_string();
+            let st = state.borrow();
+            // Flush the active notebook, then gather EVERY notebook's
+            // coins — a wallet-level sweep/consolidate, one multi-key tx.
+            save_state(&fs, &st);
+            let sources_raw = wallet_sources(
+                &fs,
+                &notebooks.borrow(),
+                app_seed_get(&app_seed),
+                &st.network,
+                (app.borrow().seed_idx, app.borrow().bip_account),
+            );
+            let dest_account = app.borrow().active.unwrap_or(0);
+            let id_guard = identity.borrow();
+            let result = id_guard
+                .as_ref()
+                .ok_or_else(|| "identity unavailable".to_string())
+                .and_then(|id| {
+                    let rate = resolve_rate(tier, &rate_text, &st)?;
+                    if sources_raw.is_empty() {
+                        return Err("No spendable coins in the wallet.".to_string());
+                    }
+                    let dest_spk = if consolidate {
+                        p2tr_script_pubkey(&id.output_x)
+                    } else {
+                        Recipient::parse(st.network(), &dest).map_err(|e| e.to_string())?.spk
+                    };
+                    let sources: Vec<SweepSource> = sources_raw
+                        .iter()
+                        .map(|(_, ox, sk, coins)| SweepSource {
+                            utxos: coins,
+                            output_x: *ox,
+                            tweaked_seckey: sk,
+                        })
+                        .collect();
+                    build_sweep_tx_multi(
+                        &sources,
+                        dest_spk,
+                        rate,
+                        resolve_locktime(app.borrow().lock_policy, st.tip_height),
+                        generate_aux_rand,
+                    )
+                        .map_err(|e| e.to_string())
+                });
+            ui.global::<Ui>().set_busy(false);
+            match result {
+                Ok(tx) => {
+                    let recv = tx.tx.outputs[0].value;
+                    let n_notebooks = sources_raw.len();
+                    // Spent outpoints per source notebook (display txid).
+                    let spent_by_account: Vec<(u32, Vec<(String, u32)>)> = sources_raw
+                        .iter()
+                        .map(|(acct, _, _, coins)| {
+                            let outs = coins
+                                .iter()
+                                .map(|u| {
+                                    let mut t = u.txid;
+                                    t.reverse();
+                                    (hex::encode(t), u.vout)
+                                })
+                                .collect();
+                            (*acct, outs)
+                        })
+                        .collect();
+                    log::info!(
+                        "cb: sweep kind={kind} to={} inputs={} notebooks={n_notebooks} amount={recv} fee={} vsize={} txid={} ok",
+                        if consolidate { "self" } else { dest.as_str() },
+                        tx.tx.inputs.len(),
+                        tx.fee,
+                        tx.vsize,
+                        tx.txid_hex
+                    );
+                    // ConfirmCtx: byte-truth decode gate (screen 4).
+                    // `sources_raw` already carries each contributing
+                    // notebook's (account, output_x, coins), so the
+                    // prevout labels come straight from it.
+                    let ix = notebooks.borrow();
+                    let (self_spks, spending_spks) =
+                        confirm_self_spks(&ix, app_seed_get(&app_seed), &st.network, (app.borrow().seed_idx, app.borrow().bip_account));
+                    let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> =
+                        BTreeMap::new();
+                    for (acct, ox, _, coins) in &sources_raw {
+                        let addr = notes_core::address::taproot_address(st.network(), ox);
+                        let name = notebook_name(&ix, *acct, &short_addr(&addr));
+                        for u in coins.iter() {
+                            let mut t = u.txid;
+                            t.reverse();
+                            prevouts.insert(
+                                format!("{}:{}", hex::encode(t), u.vout),
+                                notes_core::confirm::PrevoutInfo {
+                                    value: u.value,
+                                    address: Some(addr.clone()),
+                                    source: format!("Notebook · {name}"),
+                                },
+                            );
+                        }
+                    }
+                    drop(ix);
+
+                    let cctx = notes_core::confirm::ConfirmCtx {
+                        network: st.network(),
+                        prevouts,
+                        self_spks,
+                        spending_spks,
+                        expected_change: None,
+                        recipient: if consolidate { None } else { Some(dest.clone()) },
+                        recipient_name: None,
+                        recipients: Vec::new(),
+                        note_preview: None,
+                    };
+                    let mut context_line = format!(
+                        "{} · {}",
+                        if consolidate { "Consolidate" } else { "Sweep" },
+                        st.network
+                    );
+                    if n_notebooks > 1 {
+                        context_line.push_str(&format!(
+                            " - spends coins from {n_notebooks} notebooks, publicly linking their addresses on-chain."
+                        ));
+                    }
+
+                    match show_confirm_screen(
+                        &ui,
+                        kind,
+                        &tx.raw_hex,
+                        &cctx,
+                        context_line,
+                        "Sign & export",
+                    ) {
+                        Ok(()) => {
+                            app.borrow_mut().sweep_plan = Some(SweepPlan {
+                                tx,
+                                kind: if consolidate { "consolidate" } else { "sweep" },
+                                dest: (!consolidate).then(|| dest.clone()),
+                                spent_by_account,
+                                dest_account,
+                            });
+                        }
+                        Err(e) => {
+                            log::warn!("cb: confirm summarize err={e}");
+                            sweep.set_cost_line(format!("Cannot show confirm: {e}").into());
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("cb: sweep kind={kind} err={e}");
+                    sweep.set_cost_line(format!("Cannot build: {e}").into());
+                }
+            }
+        });
+    }
+
+    /// Create: open the name dialog in create mode (-2). Nothing is
+    /// derived/persisted until Save — the device create is name-only
+    /// (no address picker: no network on-device to probe used/new).
+    fn on_create(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let nb = ui.global::<NotebooksUi>();
+        nb.set_name_text("".into());
+        nb.set_name_account(-2);
+    }
+
+    /// Pick which notebook's private key hex/WIF export (hex/WIF only).
+    fn on_export_pick_notebook(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, index: i32) {
+        let app_seed = self.app_seed.clone();
+        let notebooks = self.notebooks.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let r = ui.global::<Recovery>();
+        let si = self.seed_idx;
+        let acct = self.bip_account;
+        let Some(seed) = app_seed_get(&app_seed).as_ref() else { return };
+        let net_s = self.net.clone();
+        let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
+        let name = {
+            let ixb = notebooks.borrow();
+            let n = ixb
+                .visible(si, acct)
+                .find(|m| m.index as i32 == index)
+                .map(|m| {
+                    if m.name.trim().is_empty() {
+                        notebooks::default_name(m.index)
+                    } else {
+                        m.name.clone()
+                    }
+                })
+                .unwrap_or_else(|| format!("index {index}"));
+            n
+        };
+        r.set_export_nb_index(index);
+        r.set_export_nb_name(name.into());
+        if let Ok((hex, wif)) = export_leaf_formats(seed, si, network, acct, index as u32) {
+            r.set_export_hex(hex.into());
+            r.set_export_wif(wif.into());
+        }
+        let which = r.get_export_which();
+        if which >= 2 {
+            self.apply_export(&ui_weak, which);
+        }
+    }
+
+    /// Commit the wallet context (seed index + BIP-86 account) from the
+    /// Recovery fields, then STAY on the Recovery screen (Sal 2026-07-12
+    /// — Switch used to jump to the list): persist, flush the open
+    /// notebook, refresh the list underneath so it's ready when the user
+    /// navigates back themselves, re-derive the revealed words/SeedQR for
+    /// the new seed, and show an inline saved confirmation.
+    fn on_set_context(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+        let state = self.state.clone();
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let recovery = ui.global::<Recovery>();
+        let parse = |s: &str| -> Option<u32> {
+            s.trim().parse::<u32>().ok().filter(|n| *n <= 9999)
+        };
+        let (Some(new_seed), Some(new_acct)) = (
+            parse(recovery.get_seed_text().as_str()),
+            parse(recovery.get_account_text().as_str()),
+        ) else {
+            recovery.set_saved_msg("".into());
+            recovery.set_context_error("Seed and account must be 0–9999.".into());
+            return;
+        };
+        recovery.set_context_error("".into());
+        let seed_changed = self.seed_idx != new_seed;
+        let acct_changed = self.bip_account != new_acct;
+        if seed_changed || acct_changed {
+            if self.active.is_some() {
+                save_state(&fs, &state.borrow());
+                self.active = None;
+            }
+            self.seed_idx = new_seed;
+            self.bip_account = new_acct;
+            self.persist_config(&fs);
+            if seed_changed {
+                log::info!("cb: set-seed-index {new_seed}");
+            }
+            if acct_changed {
+                log::info!("cb: set-account {new_acct}");
+            }
+            // Rebuild the (now background) notebook list for the new
+            // context, and refresh the revealed words to the new seed.
+            self.refresh_notebooks(&ui_weak, &fs);
+            if !recovery.get_words_col1().is_empty() {
+                self.reveal_words(&ui_weak);
+            }
+        }
+        recovery.set_saved_msg(
+            format!("Saved · seed {new_seed} · account {new_acct}").into(),
+        );
+    }
+}
+
 fn app_main(cx: AppContext, ui: AppWindow) {
     log_server::init_wait(env!("CARGO_CRATE_NAME")).unwrap();
     log::set_max_level(log::LevelFilter::Info);
@@ -5124,175 +6467,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let app = app.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_sweep_continue(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            ui.global::<Ui>().set_busy(true);
-            let ui_weak = ui_weak.clone();
-            let app = app.clone();
-            let fs = fs.clone();
-            // Let the busy overlay paint one frame before the blocking work.
-            Timer::single_shot(Duration::from_millis(150), move || {
-                let state = app.borrow().state.clone();
-                let identity = app.borrow().identity.clone();
-                let notebooks = app.borrow().notebooks.clone();
-                let app_seed = app.borrow().app_seed.clone();
-                let Some(ui) = ui_weak.upgrade() else { return };
-                let sweep = ui.global::<Sweep>();
-                let consolidate = sweep.get_kind() == "consolidate";
-                let kind = if consolidate { "consolidate" } else { "sweep" };
-                let dest = sweep.get_dest().trim().to_string();
-                let tier = sweep.get_tier();
-                let rate_text = sweep.get_rate_text().to_string();
-                let st = state.borrow();
-                // Flush the active notebook, then gather EVERY notebook's
-                // coins — a wallet-level sweep/consolidate, one multi-key tx.
-                save_state(&fs, &st);
-                let sources_raw = wallet_sources(
-                    &fs,
-                    &notebooks.borrow(),
-                    app_seed_get(&app_seed),
-                    &st.network,
-                    (app.borrow().seed_idx, app.borrow().bip_account),
-                );
-                let dest_account = app.borrow().active.unwrap_or(0);
-                let id_guard = identity.borrow();
-                let result = id_guard
-                    .as_ref()
-                    .ok_or_else(|| "identity unavailable".to_string())
-                    .and_then(|id| {
-                        let rate = resolve_rate(tier, &rate_text, &st)?;
-                        if sources_raw.is_empty() {
-                            return Err("No spendable coins in the wallet.".to_string());
-                        }
-                        let dest_spk = if consolidate {
-                            p2tr_script_pubkey(&id.output_x)
-                        } else {
-                            Recipient::parse(st.network(), &dest).map_err(|e| e.to_string())?.spk
-                        };
-                        let sources: Vec<SweepSource> = sources_raw
-                            .iter()
-                            .map(|(_, ox, sk, coins)| SweepSource {
-                                utxos: coins,
-                                output_x: *ox,
-                                tweaked_seckey: sk,
-                            })
-                            .collect();
-                        build_sweep_tx_multi(
-                            &sources,
-                            dest_spk,
-                            rate,
-                            resolve_locktime(app.borrow().lock_policy, st.tip_height),
-                            generate_aux_rand,
-                        )
-                            .map_err(|e| e.to_string())
-                    });
-                ui.global::<Ui>().set_busy(false);
-                match result {
-                    Ok(tx) => {
-                        let recv = tx.tx.outputs[0].value;
-                        let n_notebooks = sources_raw.len();
-                        // Spent outpoints per source notebook (display txid).
-                        let spent_by_account: Vec<(u32, Vec<(String, u32)>)> = sources_raw
-                            .iter()
-                            .map(|(acct, _, _, coins)| {
-                                let outs = coins
-                                    .iter()
-                                    .map(|u| {
-                                        let mut t = u.txid;
-                                        t.reverse();
-                                        (hex::encode(t), u.vout)
-                                    })
-                                    .collect();
-                                (*acct, outs)
-                            })
-                            .collect();
-                        log::info!(
-                            "cb: sweep kind={kind} to={} inputs={} notebooks={n_notebooks} amount={recv} fee={} vsize={} txid={} ok",
-                            if consolidate { "self" } else { dest.as_str() },
-                            tx.tx.inputs.len(),
-                            tx.fee,
-                            tx.vsize,
-                            tx.txid_hex
-                        );
-                        // ConfirmCtx: byte-truth decode gate (screen 4).
-                        // `sources_raw` already carries each contributing
-                        // notebook's (account, output_x, coins), so the
-                        // prevout labels come straight from it.
-                        let ix = notebooks.borrow();
-                        let (self_spks, spending_spks) =
-                            confirm_self_spks(&ix, app_seed_get(&app_seed), &st.network, (app.borrow().seed_idx, app.borrow().bip_account));
-                        let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> =
-                            BTreeMap::new();
-                        for (acct, ox, _, coins) in &sources_raw {
-                            let addr = notes_core::address::taproot_address(st.network(), ox);
-                            let name = notebook_name(&ix, *acct, &short_addr(&addr));
-                            for u in coins.iter() {
-                                let mut t = u.txid;
-                                t.reverse();
-                                prevouts.insert(
-                                    format!("{}:{}", hex::encode(t), u.vout),
-                                    notes_core::confirm::PrevoutInfo {
-                                        value: u.value,
-                                        address: Some(addr.clone()),
-                                        source: format!("Notebook · {name}"),
-                                    },
-                                );
-                            }
-                        }
-                        drop(ix);
-
-                        let cctx = notes_core::confirm::ConfirmCtx {
-                            network: st.network(),
-                            prevouts,
-                            self_spks,
-                            spending_spks,
-                            expected_change: None,
-                            recipient: if consolidate { None } else { Some(dest.clone()) },
-                            recipient_name: None,
-                            recipients: Vec::new(),
-                            note_preview: None,
-                        };
-                        let mut context_line = format!(
-                            "{} · {}",
-                            if consolidate { "Consolidate" } else { "Sweep" },
-                            st.network
-                        );
-                        if n_notebooks > 1 {
-                            context_line.push_str(&format!(
-                                " - spends coins from {n_notebooks} notebooks, publicly linking their addresses on-chain."
-                            ));
-                        }
-
-                        match show_confirm_screen(
-                            &ui,
-                            kind,
-                            &tx.raw_hex,
-                            &cctx,
-                            context_line,
-                            "Sign & export",
-                        ) {
-                            Ok(()) => {
-                                app.borrow_mut().sweep_plan = Some(SweepPlan {
-                                    tx,
-                                    kind: if consolidate { "consolidate" } else { "sweep" },
-                                    dest: (!consolidate).then(|| dest.clone()),
-                                    spent_by_account,
-                                    dest_account,
-                                });
-                            }
-                            Err(e) => {
-                                log::warn!("cb: confirm summarize err={e}");
-                                sweep.set_cost_line(format!("Cannot show confirm: {e}").into());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("cb: sweep kind={kind} err={e}");
-                        sweep.set_cost_line(format!("Cannot build: {e}").into());
-                    }
-                }
-            });
-        });
+        ui.global::<Callbacks>().on_sweep_continue(move || App::on_sweep_continue(&app, &ui_weak, &fs));
     }
 
     // Spending wallet: Settings toggle.
@@ -5379,693 +6554,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let app = app.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_compose_continue(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            ui.global::<Ui>().set_busy(true);
-            let ui_weak = ui_weak.clone();
-            let app = app.clone();
-            let fs = fs.clone();
-            // Let the busy overlay paint one frame before the blocking work.
-            Timer::single_shot(Duration::from_millis(150), move || {
-                let state = app.borrow().state.clone();
-                let identity = app.borrow().identity.clone();
-                let notebooks = app.borrow().notebooks.clone();
-                let app_seed = app.borrow().app_seed.clone();
-                let Some(ui) = ui_weak.upgrade() else { return };
-                let compose = ui.global::<Compose>();
-                let text = compose.get_text().to_string();
-                let private = compose.get_private_note();
-                let to_address = compose.get_to_address().trim().to_string();
-                let directed = !to_address.is_empty();
-                let extra_addrs: Vec<String> =
-                    compose.get_to_extra().iter().map(|r| r.address.to_string()).collect();
-                let tier = compose.get_tier();
-                let rate_text = compose.get_rate_text().to_string();
-                let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
-                // Post-quantum Security section (pq.rs) — read once here;
-                // `compose-changed` already clamps these false whenever
-                // the section isn't eligible (not directed/private, an
-                // extra recipient present, or no usable recipient key).
-                let pq_passphrase_active = compose.get_pq_passphrase_active();
-                let pq_mlkem_active = compose.get_pq_mlkem_active();
-                let pq_passphrase_text = compose.get_pq_passphrase_text().to_string();
-                let st = state.borrow();
-                let id_guard = identity.borrow();
-                let pick = app.borrow().funding_pick.clone();
-                let change_choice = app.borrow().change_pick.clone();
-                let ix = notebooks.borrow();
-                let ctx = notebook_ctx(&ix, app.borrow().active)
-                    .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
-                let net_s = app.borrow().net.clone();
-                let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
-                drop(ix);
-
-                // (note, spending inputs spent, spending change addr to mark
-                // used, change went to notebook?, mandatory notebook dust
-                // output present?) — the note's id IS its txid
-                // (`note.txid_hex`), known only once the tx is fully built
-                // below (PLAN-pnte-redesign.md: one note = one tx).
-                type ComposeOut = (
-                    NoteTx,
-                    Vec<(String, u32)>,
-                    Option<spending::SpendingAddress>,
-                    bool,
-                    bool,
-                    u8, // pq_flags: 0 = ordinary note, else FLAG_PW|FLAG_MLKEM
-                );
-                let result: Result<ComposeOut, String> = id_guard
-                    .as_ref()
-                    .ok_or_else(|| "identity unavailable".to_string())
-                    .and_then(|id| {
-                        let rate = resolve_rate(tier, &rate_text, &st)?;
-                        // Full recipient list (primary + every "+ Add
-                        // recipient" row), each carrying the same gift
-                        // amount — order matches notes-core's own output
-                        // wrap order (OP_RETURN(s), then recipients in list
-                        // order), which the ledger vout math below depends
-                        // on matching exactly. Empty for a self-note; the
-                        // `_multi` notes-core functions error on an empty
-                        // slice, so callers below only invoke them when
-                        // `directed` is true (recipients_vec has >= 1
-                        // entry in that case, always).
-                        let recipients_vec: Vec<(Recipient, u64)> = if directed {
-                            let mut v = Vec::with_capacity(1 + extra_addrs.len());
-                            v.push((
-                                Recipient::parse(st.network(), &to_address)
-                                    .map_err(|e| e.to_string())?,
-                                gift,
-                            ));
-                            for a in &extra_addrs {
-                                v.push((
-                                    Recipient::parse(st.network(), a).map_err(|e| e.to_string())?,
-                                    gift,
-                                ));
-                            }
-                            v
-                        } else {
-                            Vec::new()
-                        };
-                        // Fresh TRNG content key for a multi-recipient
-                        // private body — one-shot, never persisted/logged.
-                        // Drawn unconditionally (cheap) so every branch
-                        // below can pass it to the `_multi` calls without
-                        // re-deriving.
-                        let content_key = generate_content_key()?;
-                        let sp_participates = !pick.spending.is_empty();
-                        let mode_auto = !pick.touched && !sp_participates;
-
-                        // Post-quantum layers (pq.rs) — single-recipient
-                        // directed-private notes AND private self-notes,
-                        // notebook-funded only either way: the pq compose
-                        // primitives seal against
-                        // `id.tweaked_seckey`/`id.enc_key` directly and
-                        // have no mixed/spending-wallet variant (unlike the
-                        // ordinary/`_multi` builders). A self-note's
-                        // ML-KEM layer (PLAN-graffito-quantum-key.md)
-                        // encapsulates to THIS device's own personal
-                        // quantum key instead of a contact's — compose-
-                        // changed only lets the pill activate off
-                        // `directed` when that device key exists, so the
-                        // lookup below can only fail if the key was
-                        // deleted between the pill lighting up and Sign.
-                        let pq_wanted = pq_passphrase_active || pq_mlkem_active;
-                        if pq_wanted && sp_participates {
-                            return Err(
-                                "Quantum-safe layers need notebook-only funding — clear the \
-                                 spending-wallet coins from \"Pay from\"."
-                                    .to_string(),
-                            );
-                        }
-                        let pq_active = pq_wanted && private && extra_addrs.is_empty();
-                        let pq_mlkem_pair: Option<(pq::MlKemAlg, Vec<u8>)> = if pq_active
-                            && pq_mlkem_active
-                        {
-                            if directed {
-                                let armor = st
-                                    .contacts
-                                    .iter()
-                                    .find(|c| c.address == to_address)
-                                    .and_then(|c| c.mlkem_ek.clone())
-                                    .ok_or("recipient has no quantum key — add one in Contacts")?;
-                                Some(pq::import_public(&armor).map_err(|e| e.to_string())?)
-                            } else {
-                                let kp = app.borrow_mut().device_quantum_key(&fs).ok_or(
-                                    "no quantum key on this device — create one in Settings",
-                                )?;
-                                Some((kp.alg(), kp.ek().to_vec()))
-                            }
-                        } else {
-                            None
-                        };
-                        let pq_layers = pq::SealLayers {
-                            mlkem_ek: pq_mlkem_pair.as_ref().map(|(alg, ek)| (*alg, ek.as_slice())),
-                            password: (pq_active && pq_passphrase_active)
-                                .then_some(pq_passphrase_text.as_str()),
-                        };
-                        let pq_flags_out = if pq_active { pq_layers.flags() } else { 0 };
-                        if pq_flags_out != 0 {
-                            log::info!("cb: pq-compose flags={pq_flags_out}");
-                        }
-
-                        if mode_auto {
-                            // Byte-identical input selection to before this
-                            // feature — change destination is still
-                            // independently resolvable (the picker screen).
-                            let (change_spk, _) = resolve_change(
-                                &change_choice.choice,
-                                &change_choice.custom_address,
-                                st.network(),
-                                &id.output_x,
-                                false,
-                                &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?,
-                                ctx.0,
-                                ctx.1,
-                                0,
-                            )?;
-                            let change_is_notebook = change_choice.choice != "custom";
-                            let note = if pq_active && directed {
-                                let recipient = Recipient::parse(st.network(), &to_address)
-                                    .map_err(|e| e.to_string())?;
-                                compose_directed_note_pq_with_change_amount(
-                                    id,
-                                    &st.core_utxos(),
-                                    &text,
-                                    &recipient,
-                                    gift,
-                                    pq_layers,
-                                    Some(change_spk.as_slice()),
-                                    st.effective_chunk(),
-                                    rate,
-                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
-                                    || generate_aux_rand(),
-                                )
-                            } else if pq_active {
-                                // Self-pw note (PLAN-graffito-self-pw.md):
-                                // sealed under the notebook's enc key, not
-                                // a directed ECDH — `directed` is false
-                                // here (no recipient), so `pq_layers` can
-                                // only carry the password (ML-KEM is
-                                // never active off a self-note).
-                                compose_note_pq_with_change(
-                                    id,
-                                    &st.core_utxos(),
-                                    &text,
-                                    pq_layers,
-                                    Some(change_spk.as_slice()),
-                                    st.effective_chunk(),
-                                    rate,
-                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
-                                    || generate_aux_rand(),
-                                )
-                            } else if !recipients_vec.is_empty() {
-                                compose_directed_note_multi_with_change(
-                                    id,
-                                    &st.core_utxos(),
-                                    &text,
-                                    private,
-                                    &recipients_vec,
-                                    content_key,
-                                    Some(change_spk.as_slice()),
-                                    st.effective_chunk(),
-                                    rate,
-                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
-                                    || generate_aux_rand(),
-                                )
-                            } else {
-                                notes_core::bundle::compose_note_with_change(
-                                    id,
-                                    &st.core_utxos(),
-                                    &text,
-                                    private,
-                                    Some(change_spk.as_slice()),
-                                    st.effective_chunk(),
-                                    rate,
-                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
-                                    || generate_aux_rand(),
-                                )
-                            }
-                            .map_err(|e| e.to_string())?;
-                            Ok((note, Vec::new(), None, change_is_notebook, false, pq_flags_out))
-                        } else if !sp_participates {
-                            // Notebook-only coin control (a subset was
-                            // explicitly picked, or explicitly re-confirmed).
-                            let inputs: Vec<Utxo> = st
-                                .utxos
-                                .iter()
-                                .filter(|u| pick.is_selected(false, &u.txid, u.vout))
-                                .filter_map(|u| {
-                                    let mut txid = [0u8; 32];
-                                    hex::decode_to_slice(&u.txid, &mut txid).ok()?;
-                                    txid.reverse();
-                                    Some(Utxo { txid, vout: u.vout, value: u.value })
-                                })
-                                .collect();
-                            if inputs.is_empty() {
-                                return Err("Select at least one coin to pay from.".into());
-                            }
-                            let (change_spk, _) = resolve_change(
-                                &change_choice.choice,
-                                &change_choice.custom_address,
-                                st.network(),
-                                &id.output_x,
-                                false,
-                                &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?,
-                                ctx.0,
-                                ctx.1,
-                                0,
-                            )?;
-                            let change_is_notebook = change_choice.choice != "custom";
-                            let note = if pq_active && directed {
-                                let recipient = Recipient::parse(st.network(), &to_address)
-                                    .map_err(|e| e.to_string())?;
-                                compose_directed_note_pq_exact_amount(
-                                    id,
-                                    &inputs,
-                                    &text,
-                                    &recipient,
-                                    gift,
-                                    pq_layers,
-                                    Some(change_spk.as_slice()),
-                                    st.effective_chunk(),
-                                    rate,
-                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
-                                    || generate_aux_rand(),
-                                )
-                            } else if pq_active {
-                                // Self-pw note, coin-control funding — see
-                                // the mode_auto branch's comment above.
-                                compose_note_pq_exact(
-                                    id,
-                                    &inputs,
-                                    &text,
-                                    pq_layers,
-                                    Some(change_spk.as_slice()),
-                                    st.effective_chunk(),
-                                    rate,
-                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
-                                    || generate_aux_rand(),
-                                )
-                            } else if !recipients_vec.is_empty() {
-                                compose_directed_note_multi_exact(
-                                    id,
-                                    &inputs,
-                                    &text,
-                                    private,
-                                    &recipients_vec,
-                                    content_key,
-                                    Some(change_spk.as_slice()),
-                                    st.effective_chunk(),
-                                    rate,
-                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
-                                    || generate_aux_rand(),
-                                )
-                            } else {
-                                compose_note_exact(
-                                    id,
-                                    &inputs,
-                                    &text,
-                                    private,
-                                    Some(change_spk.as_slice()),
-                                    st.effective_chunk(),
-                                    rate,
-                                    resolve_locktime(app.borrow().lock_policy, st.tip_height),
-                                    || generate_aux_rand(),
-                                )
-                            }
-                            .map_err(|e| e.to_string())?;
-                            Ok((note, Vec::new(), None, change_is_notebook, false, pq_flags_out))
-                        } else {
-                            // Spending-wallet participates (pure spending or
-                            // mixed with notebook coins) — mixed builder. The
-                            // notebook dust-to-self anchor is emitted ONLY
-                            // when no notebook coin is among the selected
-                            // inputs (`build_note_tx_mixed_exact_anchored`'s
-                            // skip condition, funding-unification
-                            // 2026-07-18) — a notebook input already anchors
-                            // the tx to the notebook's address history.
-                            let seed: &[u8; 32] =
-                                &*app_seed_get(&app_seed).as_ref().ok_or("identity unavailable")?;
-                            let notebook_dust_spk = p2tr_script_pubkey(&id.output_x);
-                            let mut mixed_inputs: Vec<MixedInput> = Vec::new();
-                            let mut has_notebook_input = false;
-                            for u in
-                                st.utxos.iter().filter(|u| pick.is_selected(false, &u.txid, u.vout))
-                            {
-                                let mut txid = [0u8; 32];
-                                hex::decode_to_slice(&u.txid, &mut txid)
-                                    .map_err(|_| "bad notebook txid".to_string())?;
-                                txid.reverse();
-                                mixed_inputs.push(MixedInput {
-                                    utxo: Utxo { txid, vout: u.vout, value: u.value },
-                                    prevout_spk: notebook_dust_spk.clone(),
-                                    kind: InputKind::Taproot,
-                                    seckey: id.tweaked_seckey,
-                                });
-                                has_notebook_input = true;
-                            }
-                            let sec =
-                                section.as_ref().ok_or("spending wallet not set up".to_string())?;
-                            let mut spent_spending: Vec<(String, u32)> = Vec::new();
-                            for su in
-                                sec.utxos.iter().filter(|u| pick.is_selected(true, &u.txid, u.vout))
-                            {
-                                let key = notes_core::seeds::derive_spending_key(
-                                    seed,
-                                    ctx.0,
-                                    st.network(),
-                                    ctx.1,
-                                    su.chain,
-                                    su.index,
-                                )
-                                .map_err(|e| e.to_string())?;
-                                let mut txid = [0u8; 32];
-                                hex::decode_to_slice(&su.txid, &mut txid)
-                                    .map_err(|_| "bad spending txid".to_string())?;
-                                txid.reverse();
-                                mixed_inputs.push(MixedInput {
-                                    utxo: Utxo { txid, vout: su.vout, value: su.value },
-                                    prevout_spk: key.script_pubkey.clone(),
-                                    kind: InputKind::P2wpkh,
-                                    seckey: key.seckey,
-                                });
-                                spent_spending.push((su.txid.clone(), su.vout));
-                            }
-                            if mixed_inputs.is_empty() {
-                                return Err("Select at least one coin to pay from.".into());
-                            }
-                            // The tx's FIRST input's outpoint — the mixed
-                            // builder below keeps `mixed_inputs` order
-                            // verbatim (notebook inputs first, then
-                            // spending), so `mixed_inputs[0]` IS the tx's
-                            // first input; every sealed body's AAD binds to
-                            // it (crypt.rs/dm.rs's uniform outpoint rule,
-                            // PLAN-pnte-redesign.md).
-                            let outpoint = notes_core::tx::outpoint_bytes(&mixed_inputs[0].utxo);
-                            // `sealed_note_payloads_multi` has no self-note
-                            // case (errors on an empty recipients slice —
-                            // notes-core bundle.rs:876), so a self-note
-                            // (recipients_vec empty) keeps calling the old
-                            // singular `sealed_note_payloads` with `None`;
-                            // only a directed note switches to the `_multi`
-                            // primitive.
-                            let (payloads, recipients_amounts): (Vec<Vec<u8>>, Vec<(Vec<u8>, u64)>) =
-                                if !recipients_vec.is_empty() {
-                                    // `Recipient` isn't `Clone`; re-parsing
-                                    // from the address string (already
-                                    // validated once above) is cheap and
-                                    // avoids touching notes-core for this.
-                                    let recips: Vec<Recipient> = recipients_vec
-                                        .iter()
-                                        .map(|(r, _)| {
-                                            Recipient::parse(st.network(), &r.address)
-                                                .map_err(|e| e.to_string())
-                                        })
-                                        .collect::<Result<_, _>>()?;
-                                    let (payloads, spks) = sealed_note_payloads_multi(
-                                        id,
-                                        &text,
-                                        private,
-                                        &recips,
-                                        outpoint,
-                                        content_key,
-                                        st.effective_chunk(),
-                                    )
-                                    .map_err(|e| e.to_string())?;
-                                    let amounts =
-                                        spks.into_iter().map(|spk| (spk, gift)).collect();
-                                    (payloads, amounts)
-                                } else {
-                                    let (payloads, _) = sealed_note_payloads(
-                                        id,
-                                        &text,
-                                        private,
-                                        None,
-                                        outpoint,
-                                        st.effective_chunk(),
-                                    )
-                                    .map_err(|e| e.to_string())?;
-                                    (payloads, Vec::new())
-                                };
-                            let (change_spk, change_addr) = resolve_change(
-                                &change_choice.choice,
-                                &change_choice.custom_address,
-                                st.network(),
-                                &id.output_x,
-                                true,
-                                seed,
-                                ctx.0,
-                                ctx.1,
-                                sec.next_change,
-                            )?;
-                            let change_is_notebook = change_choice.choice == "notebook";
-                            // `build_note_tx_mixed_exact_anchored_multi` with
-                            // <=1 recipient entries delegates byte-identically
-                            // to `build_note_tx_mixed_exact_anchored` (tx.rs),
-                            // so this single call covers self/single/multi
-                            // recipient shapes without branching.
-                            let note = build_note_tx_mixed_exact_anchored_multi(
-                                &mixed_inputs,
-                                &payloads,
-                                &recipients_amounts,
-                                &notebook_dust_spk,
-                                &change_spk,
-                                rate,
-                                resolve_locktime(app.borrow().lock_policy, st.tip_height),
-                                || generate_aux_rand(),
-                            )
-                            .map_err(|e| e.to_string())?;
-                            // Dust is emitted iff no notebook input anchored
-                            // the tx — mirrors the builder's own condition
-                            // exactly (`inputs.iter().any(prevout_spk ==
-                            // notebook_dust_spk)`), computed from the SAME
-                            // `has_notebook_input` used to build `mixed_inputs`
-                            // above, so this can never drift from the actual
-                            // wire shape.
-                            let notebook_dust = !has_notebook_input;
-                            Ok((
-                                note,
-                                spent_spending,
-                                change_addr,
-                                change_is_notebook,
-                                notebook_dust,
-                                0, // pq layers require notebook-only funding — guarded above
-                            ))
-                        }
-                    });
-                ui.global::<Ui>().set_busy(false);
-                match result {
-                    Ok((note, spending_spent, spending_change_addr, change_is_notebook, notebook_dust, pq_flags_note)) => {
-                        let chunks = note
-                            .tx
-                            .outputs
-                            .iter()
-                            .filter(|o| o.script_pubkey.first() == Some(&0x6a))
-                            .count() as u64;
-                        let funded_by = pick.mode_label();
-                        // Full recipient list for THIS note (empty for a
-                        // self-note; primary + every "+ Add recipient" row
-                        // otherwise), in the same order as `recipients_vec`
-                        // fed the builder above — matches notes-core's own
-                        // output wrap order (OP_RETURN(s), recipients in
-                        // list order), which the ledger vout math further
-                        // below depends on matching exactly.
-                        let recipients_display: Vec<String> = if directed {
-                            let mut v = vec![to_address.clone()];
-                            v.extend(extra_addrs.iter().cloned());
-                            v
-                        } else {
-                            Vec::new()
-                        };
-                        log::info!(
-                            "cb: compose len={} private={} to={} chunks={} fee={} vsize={} gift={} funded={funded_by} recipients={} txid={} ok",
-                            text.len(),
-                            private,
-                            if directed { to_address.as_str() } else { "self" },
-                            chunks,
-                            note.fee,
-                            note.vsize,
-                            note.sent,
-                            recipients_display.len(),
-                            note.txid_hex
-                        );
-                        let recipient = if directed { Some(to_address.clone()) } else { None };
-                        let recipient_name = if directed {
-                            st.contacts
-                                .iter()
-                                .find(|c| c.address == to_address && !c.name.is_empty())
-                                .map(|c| c.name.clone())
-                        } else {
-                            None
-                        };
-
-                        // ConfirmCtx: the universal byte-truth decode gate
-                        // (screen 4) — every fact it shows comes from
-                        // decoding `note.raw_hex` itself; this only gathers
-                        // the LOOKUPS (source labels, self/change spks).
-                        let active_acct = app.borrow().active.unwrap_or(0);
-                        let ix = notebooks.borrow();
-                        let active_name = {
-                            let short = id_guard
-                                .as_ref()
-                                .map(|id| short_addr(&id.address(st.network())))
-                                .unwrap_or_default();
-                            notebook_name(&ix, active_acct, &short)
-                        };
-                        let (mut self_spks, mut spending_spks) =
-                            confirm_self_spks(&ix, app_seed_get(&app_seed), &net_s, ctx);
-                        drop(ix);
-                        // A fresh spending-wallet change address this very
-                        // tx pays isn't in `used` yet (marked only after a
-                        // successful sign) — add it so the change output
-                        // classifies as ours, not "other".
-                        if let Some(addr) = &spending_change_addr {
-                            if let Ok(spk) = hex::decode(&addr.spk_hex) {
-                                if !spending_spks.iter().any(|s| s == &spk) {
-                                    spending_spks.push(spk.clone());
-                                }
-                                if !self_spks.iter().any(|s| s == &spk) {
-                                    self_spks.push(spk);
-                                }
-                            }
-                        }
-
-                        // Addresses of any spending-wallet coins this tx
-                        // spent, for the input rows' title (best-effort —
-                        // display only, never affects classification).
-                        let spending_addrs: std::collections::HashMap<(String, u32), String> =
-                            if spending_spent.is_empty() {
-                                Default::default()
-                            } else {
-                                section
-                                    .as_ref()
-                                    .into_iter()
-                                    .flat_map(|s| s.utxos.iter())
-                                    .filter(|u| {
-                                        spending_spent.iter().any(|(t, v)| *t == u.txid && *v == u.vout)
-                                    })
-                                    .filter_map(|u| {
-                                        let seed_bytes = app_seed_get(&app_seed).as_ref()?;
-                                        notes_core::seeds::derive_spending_key(
-                                            seed_bytes,
-                                            ctx.0,
-                                            st.network(),
-                                            ctx.1,
-                                            u.chain,
-                                            u.index,
-                                        )
-                                        .ok()
-                                        .map(|k| ((u.txid.clone(), u.vout), k.address))
-                                    })
-                                    .collect()
-                            };
-
-                        let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> =
-                            BTreeMap::new();
-                        for u in &note.tx.inputs {
-                            let mut t = u.txid;
-                            t.reverse();
-                            let txid_hex = hex::encode(t);
-                            let is_spending =
-                                spending_spent.iter().any(|(t2, v2)| *t2 == txid_hex && *v2 == u.vout);
-                            let (source, address) = if is_spending {
-                                (
-                                    "Spending wallet".to_string(),
-                                    spending_addrs.get(&(txid_hex.clone(), u.vout)).cloned(),
-                                )
-                            } else {
-                                (
-                                    format!("Notebook · {active_name}"),
-                                    id_guard.as_ref().map(|id| id.address(st.network())),
-                                )
-                            };
-                            prevouts.insert(
-                                format!("{txid_hex}:{}", u.vout),
-                                notes_core::confirm::PrevoutInfo { value: u.value, address, source },
-                            );
-                        }
-
-                        let note_preview = Some(if private {
-                            "Private note (encrypted)".to_string()
-                        } else {
-                            text.clone()
-                        });
-                        let cctx = notes_core::confirm::ConfirmCtx {
-                            network: st.network(),
-                            prevouts,
-                            self_spks,
-                            spending_spks,
-                            expected_change: (change_choice.choice == "custom"
-                                && !change_choice.custom_address.trim().is_empty())
-                            .then(|| change_choice.custom_address.trim().to_string()),
-                            recipient: recipient.clone(),
-                            recipient_name,
-                            recipients: recipients_display.clone(),
-                            note_preview,
-                        };
-                        let context_line = format!(
-                            "{} note · {}",
-                            if directed {
-                                "Directed"
-                            } else if private {
-                                "Private"
-                            } else {
-                                "Public"
-                            },
-                            st.network
-                        );
-
-                        match show_confirm_screen(
-                            &ui,
-                            "compose",
-                            &note.raw_hex,
-                            &cctx,
-                            context_line,
-                            "Sign & export",
-                        ) {
-                            Ok(()) => {
-                                // Honest-fee-label: `note` is the REAL
-                                // signed tx, so this is a decomposition of
-                                // its own numbers (see `note_fold_amount`'s
-                                // doc), not a prediction — `rate` resolves
-                                // deterministically from the same
-                                // `tier`/`rate_text`/`st` that already
-                                // built `note` successfully, so this can't
-                                // fail here.
-                                if let Ok(rate) = resolve_rate(tier, &rate_text, &st) {
-                                    let fold_amount =
-                                        note_fold_amount(note.fee, note.vsize, note.change, rate);
-                                    if fold_amount > 0 {
-                                        ui.global::<ConfirmSign>()
-                                            .set_fold(format!("{fold_amount} sats").into());
-                                        log::info!("cb: confirm fold amount={fold_amount}");
-                                    }
-                                }
-                                app.borrow_mut().plan = Some(Plan {
-                                    note,
-                                    text,
-                                    private,
-                                    chunks,
-                                    recipients: recipients_display.clone(),
-                                    spending_spent,
-                                    spending_change_addr,
-                                    change_is_notebook,
-                                    notebook_dust,
-                                    pq_flags: pq_flags_note,
-                                });
-                            }
-                            Err(e) => {
-                                log::warn!("cb: confirm summarize err={e}");
-                                compose.set_cost_line(format!("Cannot show confirm: {e}").into());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("cb: compose len={} private={} err={e}", text.len(), private);
-                        compose.set_cost_line(format!("Cannot build: {e}").into());
-                    }
-                }
-            });
-        });
+        ui.global::<Callbacks>().on_compose_continue(move || App::on_compose_continue(&app, &ui_weak, &fs));
     }
 
     // Universal Confirm & sign gate (screen 4) — dispatches on
@@ -6077,366 +6566,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let app = app.clone();
         let fs = fs.clone();
-        ui.global::<Callbacks>().on_confirm_sign(move || {
-            let identity = app.borrow().identity.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let kind = ui.global::<ConfirmSign>().get_kind().to_string();
-            let txid = ui.global::<ConfirmSign>().get_txid().to_string();
-            log::info!("cb: confirm sign kind={kind} txid={txid}");
-            match kind.as_str() {
-                "sweep" | "consolidate" => {
-                    let Some(p) = app.borrow_mut().sweep_plan.take() else { return };
-                    ui.global::<Ui>().set_busy(true);
-                    let ui_weak = ui_weak.clone();
-                    let fs = fs.clone();
-                    let app = app.clone();
-                    Timer::single_shot(Duration::from_millis(150), move || {
-                        let state = app.borrow().state.clone();
-                        let Some(ui) = ui_weak.upgrade() else { return };
-                        let mut st = state.borrow_mut();
-                        let active_acct = app.borrow().active.unwrap_or(p.dest_account);
-
-                        // Wallet-level ledger: remove each notebook's spent
-                        // inputs from its own state file (the active one via
-                        // the live `st`); a consolidate's single output lands
-                        // in the destination notebook as its new
-                        // (unconfirmed) coin.
-                        let inputs: usize = p.spent_by_account.iter().map(|(_, o)| o.len()).sum();
-                        let recv = p.tx.tx.outputs[0].value;
-                        for (acct, spent) in &p.spent_by_account {
-                            if *acct == active_acct {
-                                st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
-                            } else {
-                                let mut other = load_state(&fs, &app.borrow().net, *acct);
-                                other.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
-                                save_state(&fs, &other);
-                            }
-                        }
-                        if p.kind == "consolidate" {
-                            let coin = UtxoRec { txid: p.tx.txid_hex.clone(), vout: 0, value: recv };
-                            if p.dest_account == active_acct {
-                                st.utxos.push(coin);
-                            } else {
-                                let mut dest = load_state(&fs, &app.borrow().net, p.dest_account);
-                                dest.utxos.push(coin);
-                                save_state(&fs, &dest);
-                            }
-                        }
-
-                        let file = format!("{OUTBOX_DIR}/{}.hex", p.tx.txid_hex);
-                        let internal = ensure_dir(&fs, OUTBOX_DIR, Location::User).and_then(|_| {
-                            write_file(&fs, &file, Location::User, p.tx.raw_hex.as_bytes())
-                        });
-                        let airlock = ensure_airlock_mounted(&fs).and_then(|_| {
-                            let r = ensure_dir(&fs, OUTBOX_DIR, Location::Airlock).and_then(|_| {
-                                write_file(&fs, &file, Location::Airlock, p.tx.raw_hex.as_bytes())
-                            });
-                            unmount_airlock(&fs);
-                            r
-                        });
-                        save_state(&fs, &st);
-                        log::info!(
-                            "cb: sign-sweep kind={} txid={} fee={} internal={} airlock={}",
-                            p.kind,
-                            p.tx.txid_hex,
-                            p.tx.fee,
-                            if internal.is_ok() { "ok" } else { "err" },
-                            if airlock.is_ok() { "ok" } else { "err" },
-                        );
-                        drop(st);
-
-                        let sp = ui.global::<SignPsbt>();
-                        sp.set_summary(
-                            format!(
-                                "{}\nfee {} sats · {} vB\ntxid: {}",
-                                match (p.kind, &p.dest) {
-                                    ("consolidate", _) =>
-                                        format!("Consolidated {inputs} coin(s) into one · {recv} sats"),
-                                    (_, Some(d)) =>
-                                        format!("Swept {inputs} coin(s) · {recv} sats to {}", short_addr(d)),
-                                    _ => format!("Swept {inputs} coin(s) · {recv} sats"),
-                                },
-                                p.tx.fee,
-                                p.tx.vsize,
-                                p.tx.txid_hex
-                            )
-                            .into(),
-                        );
-                        if p.tx.raw_hex.len() <= MAX_QR_HEX_CHARS {
-                            sp.set_qr(qr_image(&p.tx.raw_hex.to_uppercase()));
-                            sp.set_has_qr(true);
-                        } else {
-                            sp.set_has_qr(false);
-                        }
-                        sp.set_back_screen(Screen::Home);
-
-                        // Reset the sweep flow so nothing leaks into the next run.
-                        let sweep = ui.global::<Sweep>();
-                        sweep.set_dest("".into());
-                        sweep.set_dest_label("".into());
-                        sweep.set_tier(1);
-                        sweep.set_cost_line("".into());
-                        sweep.set_can_continue(false);
-                        ui.global::<Contacts>().set_pick_mode("compose".into());
-
-                        ui.global::<Ui>().set_busy(false);
-                        app.borrow().refresh_home(&ui_weak);
-                        ui.global::<Ui>().set_screen(Screen::Signed);
-                    });
-                }
-                "psbt" => {
-                    let Some(psbt) = app.borrow_mut().psbt_pending.take() else { return };
-                    let id_guard = identity.borrow();
-                    let Some(id) = id_guard.as_ref() else {
-                        drop(id_guard);
-                        ui.global::<Sync>().set_result("Device locked — no signing key.".into());
-                        ui.global::<Ui>().set_screen(Screen::Sync);
-                        return;
-                    };
-                    let output_x = id.output_x;
-                    let tweaked_seckey = id.tweaked_seckey;
-                    drop(id_guard);
-                    ui.global::<Ui>().set_busy(true);
-                    let ui_weak = ui_weak.clone();
-                    let fs = fs.clone();
-                    let mut psbt = psbt;
-                    Timer::single_shot(Duration::from_millis(150), move || {
-                        let Some(ui) = ui_weak.upgrade() else { return };
-                        let (ours, signed) =
-                            match psbt.sign_own_taproot(&output_x, &tweaked_seckey, generate_aux_rand) {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    ui.global::<Ui>().set_busy(false);
-                                    ui.global::<Sync>().set_result(format!("Sign failed: {e}").into());
-                                    ui.global::<Ui>().set_screen(Screen::Sync);
-                                    return;
-                                }
-                            };
-                        log::info!("cb: sign-psbt inputs={ours} signed={signed} ok");
-                        let hex_str = hex::encode_upper(psbt.serialize());
-                        let out_txid = psbt.unsigned_tx.txid_hex();
-                        let file = format!("{OUTBOX_DIR}/{out_txid}.psbt.hex");
-                        let _ = ensure_dir(&fs, OUTBOX_DIR, Location::User)
-                            .and_then(|_| write_file(&fs, &file, Location::User, hex_str.as_bytes()));
-                        let fee = psbt_fee(&psbt);
-                        let note = psbt_note_summary(&psbt);
-                        let sp = ui.global::<SignPsbt>();
-                        sp.set_summary(
-                            format!("Signed {signed} of {ours} input(s) · fee {fee} sats\n{note}")
-                                .into(),
-                        );
-                        if hex_str.len() <= MAX_QR_HEX_CHARS {
-                            sp.set_qr(qr_image(&hex_str));
-                            sp.set_has_qr(true);
-                        } else {
-                            sp.set_has_qr(false);
-                        }
-                        ui.global::<Ui>().set_error("".into());
-                        ui.global::<Ui>().set_busy(false);
-                        ui.global::<Ui>().set_screen(Screen::Signed);
-                    });
-                }
-                _ => {
-                    // "compose" — the default arm.
-                    let Some(p) = app.borrow_mut().plan.take() else { return };
-                    ui.global::<Ui>().set_busy(true);
-                    let ui_weak = ui_weak.clone();
-                    let fs = fs.clone();
-                    let app = app.clone();
-                    Timer::single_shot(Duration::from_millis(150), move || {
-                        let state = app.borrow().state.clone();
-                        let notebooks = app.borrow().notebooks.clone();
-                        let Some(ui) = ui_weak.upgrade() else { return };
-                        let mut st = state.borrow_mut();
-
-                        // Notebook ledger: drop spent notebook inputs. Spending-wallet
-                        // inputs (if any) are dropped from the SEPARATE spending
-                        // ledger below via `p.spending_spent` — `p.note.spent_outpoints`
-                        // covers both kinds, but only notebook outpoints ever match
-                        // an entry in `st.utxos`, so this retain is safe either way.
-                        let spent: Vec<(String, u32)> = p
-                            .note
-                            .spent_outpoints
-                            .iter()
-                            .map(|(txid, vout)| {
-                                let mut t = *txid;
-                                t.reverse();
-                                (hex::encode(t), *vout)
-                            })
-                            .collect();
-                        st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
-
-                        // Output order: OP_RETURN(s), EVERY directed recipient (in
-                        // list order — matches notes-core's own builders, and the
-                        // order `recipients_vec` was fed to them in
-                        // `on_compose_continue`), [notebook dust — present unless a
-                        // notebook coin already anchors the tx, see
-                        // `Plan.notebook_dust`'s doc], [change]. `p.chunks` +
-                        // `p.recipients.len()` (0, 1, or N recipient outputs) place
-                        // the dust slot; +1 more ONLY when `p.notebook_dust` is true
-                        // places change — when dust is skipped, change lands in that
-                        // same slot instead (computed from the flag, never a
-                        // hardcoded position). Getting `p.recipients.len()` right
-                        // here is safety-critical: a wrong offset would make the app
-                        // track the WRONG utxo as its own dust/change coin.
-                        let dust_vout = p.chunks as u32 + p.recipients.len() as u32;
-                        if p.notebook_dust {
-                            st.utxos.push(UtxoRec {
-                                txid: p.note.txid_hex.clone(),
-                                vout: dust_vout,
-                                value: notes_core::DUST_LIMIT,
-                            });
-                        }
-                        let change_vout = dust_vout + u32::from(p.notebook_dust);
-                        if p.note.change > 0 && p.change_is_notebook {
-                            st.utxos.push(UtxoRec {
-                                txid: p.note.txid_hex.clone(),
-                                vout: change_vout,
-                                value: p.note.change,
-                            });
-                        }
-                        // Custom/external change: not our coin, nothing to track
-                        // (matches how a directed recipient's dust isn't tracked).
-
-                        // Spending ledger: drop spent inputs + add change (if it
-                        // went to a fresh spending address) in one pass — mirrors
-                        // the notebook ledger's unconfirmed-chaining update above.
-                        if !p.spending_spent.is_empty() || p.spending_change_addr.is_some() {
-                            let mut ix = notebooks.borrow_mut();
-                            let ctx = notebook_ctx(&ix, app.borrow().active)
-                                .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
-                            let net_s = app.borrow().net.clone();
-                            let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
-                            let change_coin =
-                                if p.note.change > 0 { p.spending_change_addr.as_ref() } else { None };
-                            if let Some(addr) = change_coin {
-                                sec.mark_used(addr.clone());
-                            }
-                            sec.apply_spend(
-                                &p.spending_spent,
-                                change_coin.map(|addr| spending::SpendingUtxo {
-                                    txid: p.note.txid_hex.clone(),
-                                    vout: change_vout,
-                                    value: p.note.change,
-                                    chain: addr.chain,
-                                    index: addr.index,
-                                }),
-                            );
-                            save_notebooks(&fs, &ix);
-                        }
-
-                        // Self-pw note (PLAN-graffito-self-pw.md): a
-                        // self-note (no recipient) carrying a pq layer is
-                        // stored LOCKED from the moment it's signed —
-                        // never a plaintext cache, and re-derived here
-                        // from the tx's own bytes rather than trusted from
-                        // `p.pq_flags`/`p.text`, so a bug in the compose
-                        // path can't accidentally leak plaintext into
-                        // state.json. `None` for every other note (a
-                        // directed note, or a self-note with no pq layer),
-                        // which keeps their existing plaintext-cached
-                        // behavior byte-identical.
-                        let self_locked =
-                            if p.recipients.is_empty() { self_pw_locked_body(&p.note) } else { None };
-                        let rec = NoteRec {
-                            id: p.note.txid_hex.clone(),
-                            text: if self_locked.is_some() {
-                                String::new()
-                            } else {
-                                p.text.clone()
-                            },
-                            private: p.private,
-                            txid: p.note.txid_hex.clone(),
-                            raw_hex: p.note.raw_hex.clone(),
-                            fee: p.note.fee,
-                            vsize: p.note.vsize as u64,
-                            chunks: p.chunks,
-                            height: None,
-                            blocktime: None,
-                            status: "pending".into(),
-                            directed: !p.recipients.is_empty(),
-                            to: p.recipients.first().cloned(),
-                            from: None,
-                            recipients: p.recipients.clone(),
-                            pq_flags: p.pq_flags,
-                            // A directed own composed note (or an ordinary
-                            // self-note): plaintext is already known
-                            // (`p.text` above) — never locked. A self-pw
-                            // note: `self_locked` above, view-only unlock.
-                            locked: self_locked,
-                        };
-
-                        // Export the signed tx for the companion to broadcast:
-                        // always to internal outbox; Airlock too when available.
-                        let file = format!("{OUTBOX_DIR}/{}.hex", p.note.txid_hex);
-                        let internal = ensure_dir(&fs, OUTBOX_DIR, Location::User).and_then(|_| {
-                            write_file(&fs, &file, Location::User, p.note.raw_hex.as_bytes())
-                        });
-                        let airlock = ensure_airlock_mounted(&fs).and_then(|_| {
-                            let r = ensure_dir(&fs, OUTBOX_DIR, Location::Airlock).and_then(|_| {
-                                write_file(&fs, &file, Location::Airlock, p.note.raw_hex.as_bytes())
-                            });
-                            // Full flush so the file survives unplug (paper-wallet
-                            // pattern).
-                            unmount_airlock(&fs);
-                            r
-                        });
-                        log::info!(
-                            "cb: sign-note id={} fee={} vsize={} internal={} airlock={}",
-                            rec.id,
-                            rec.fee,
-                            rec.vsize,
-                            if internal.is_ok() { "ok" } else { "err" },
-                            if airlock.is_ok() { "ok" } else { "err" },
-                        );
-
-                        // Auto-save every recipient as a recent contact (usually a
-                        // no-op re-front after the pick, but covers every path).
-                        for to in &p.recipients {
-                            upsert_contact(&mut st, to);
-                        }
-                        st.notes.push(rec.clone());
-                        save_state(&fs, &st);
-                        drop(st);
-                        app.borrow().refresh_funding(&ui_weak);
-
-                        let view = ui.global::<View>();
-                        view.set_id(rec.id.clone().into());
-                        view.set_text(rec.text.clone().into());
-                        view.set_badge(if rec.private { "PRIVATE" } else { "PUBLIC" }.into());
-                        view.set_meta(
-                            format!(
-                                "pending — scan the QR with the companion, or broadcast {}.hex\nfee {} sats · {} vB",
-                                rec.txid, rec.fee, rec.vsize
-                            )
-                            .into(),
-                        );
-                        // Straight to the QR after signing — that's the broadcast path.
-                        set_view_qr(&view, &rec);
-                        view.set_show_qr(view.get_has_qr());
-                        ui.global::<Compose>().set_text("".into());
-                        // A stale recipient must never silently direct the next note.
-                        ui.global::<Compose>().set_to_address("".into());
-                        ui.global::<Compose>().set_to_label("".into());
-                        ui.global::<Compose>()
-                            .set_to_extra(Rc::new(VecModel::from(Vec::<ToRow>::new())).into());
-                        // Gift resets with the recipient so a large gift can't leak
-                        // into the next note.
-                        ui.global::<Compose>().set_gift_sats("330".into());
-                        ui.global::<Compose>().set_gift_expanded(false);
-                        // Funding/change picks reset too — a stale coin selection or
-                        // custom change address must never leak into the next note.
-                        app.borrow_mut().funding_pick = FundingPick::default();
-                        app.borrow_mut().change_pick = ChangePickState::default();
-                        ui.global::<ChangePick>().set_choice("auto".into());
-                        ui.global::<ChangePick>().set_custom_address("".into());
-                        ui.global::<Ui>().set_busy(false);
-                        app.borrow().refresh_notes(&ui_weak);
-                        ui.global::<Ui>().set_screen(Screen::Note);
-                    });
-                }
-            }
-        });
+        ui.global::<Callbacks>().on_confirm_sign(move || App::on_confirm_sign(&app, &ui_weak, &fs));
     }
 
     // Back from the universal Confirm & sign screen (4): discard whatever
@@ -6612,16 +6742,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         ui.global::<NotebookCb>().on_open(move |account| app.borrow_mut().switch_notebook(&ui_weak, &fs, account.max(0) as u32));
     }
     {
-        // Create: open the name dialog in create mode (-2). Nothing is
-        // derived/persisted until Save — the device create is name-only
-        // (no address picker: no network on-device to probe used/new).
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
-        ui.global::<NotebookCb>().on_create(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let nb = ui.global::<NotebooksUi>();
-            nb.set_name_text("".into());
-            nb.set_name_account(-2);
-        });
+        ui.global::<NotebookCb>().on_create(move || app.borrow().on_create(&ui_weak));
     }
     {
         let app = app.clone();
@@ -6694,45 +6817,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         ui.global::<Callbacks>().on_export_select(move |which| app.borrow().apply_export(&ui_weak, which));
     }
     {
-        // Pick which notebook's private key hex/WIF export (hex/WIF only).
-        let ui_weak = ui_weak.clone();
         let app = app.clone();
-        ui.global::<Callbacks>().on_export_pick_notebook(move |index| {
-            let app_seed = app.borrow().app_seed.clone();
-            let notebooks = app.borrow().notebooks.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let r = ui.global::<Recovery>();
-            let si = app.borrow().seed_idx;
-            let acct = app.borrow().bip_account;
-            let Some(seed) = app_seed_get(&app_seed).as_ref() else { return };
-            let net_s = app.borrow().net.clone();
-            let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
-            let name = {
-                let ixb = notebooks.borrow();
-                let n = ixb
-                    .visible(si, acct)
-                    .find(|m| m.index as i32 == index)
-                    .map(|m| {
-                        if m.name.trim().is_empty() {
-                            notebooks::default_name(m.index)
-                        } else {
-                            m.name.clone()
-                        }
-                    })
-                    .unwrap_or_else(|| format!("index {index}"));
-                n
-            };
-            r.set_export_nb_index(index);
-            r.set_export_nb_name(name.into());
-            if let Ok((hex, wif)) = export_leaf_formats(seed, si, network, acct, index as u32) {
-                r.set_export_hex(hex.into());
-                r.set_export_wif(wif.into());
-            }
-            let which = r.get_export_which();
-            if which >= 2 {
-                app.borrow().apply_export(&ui_weak, which);
-            }
-        });
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_export_pick_notebook(move |index| app.borrow().on_export_pick_notebook(&ui_weak, index));
     }
     {
         let app = app.clone();
@@ -6740,58 +6827,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         ui.global::<Callbacks>().on_export_close(move || app.borrow().on_export_close(&ui_weak));
     }
     {
-        // Commit the wallet context (seed index + BIP-86 account) from the
-        // Recovery fields, then STAY on the Recovery screen (Sal 2026-07-12
-        // — Switch used to jump to the list): persist, flush the open
-        // notebook, refresh the list underneath so it's ready when the user
-        // navigates back themselves, re-derive the revealed words/SeedQR for
-        // the new seed, and show an inline saved confirmation.
+        let app = app.clone();
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let app = app.clone();
-        ui.global::<Callbacks>().on_set_context(move || {
-            let state = app.borrow().state.clone();
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let recovery = ui.global::<Recovery>();
-            let parse = |s: &str| -> Option<u32> {
-                s.trim().parse::<u32>().ok().filter(|n| *n <= 9999)
-            };
-            let (Some(new_seed), Some(new_acct)) = (
-                parse(recovery.get_seed_text().as_str()),
-                parse(recovery.get_account_text().as_str()),
-            ) else {
-                recovery.set_saved_msg("".into());
-                recovery.set_context_error("Seed and account must be 0–9999.".into());
-                return;
-            };
-            recovery.set_context_error("".into());
-            let seed_changed = app.borrow().seed_idx != new_seed;
-            let acct_changed = app.borrow().bip_account != new_acct;
-            if seed_changed || acct_changed {
-                if app.borrow().active.is_some() {
-                    save_state(&fs, &state.borrow());
-                    app.borrow_mut().active = None;
-                }
-                app.borrow_mut().seed_idx = new_seed;
-                app.borrow_mut().bip_account = new_acct;
-                app.borrow().persist_config(&fs);
-                if seed_changed {
-                    log::info!("cb: set-seed-index {new_seed}");
-                }
-                if acct_changed {
-                    log::info!("cb: set-account {new_acct}");
-                }
-                // Rebuild the (now background) notebook list for the new
-                // context, and refresh the revealed words to the new seed.
-                app.borrow().refresh_notebooks(&ui_weak, &fs);
-                if !recovery.get_words_col1().is_empty() {
-                    app.borrow().reveal_words(&ui_weak);
-                }
-            }
-            recovery.set_saved_msg(
-                format!("Saved · seed {new_seed} · account {new_acct}").into(),
-            );
-        });
+        ui.global::<Callbacks>().on_set_context(move || app.borrow_mut().on_set_context(&ui_weak, &fs));
     }
 
     // Boot: the notebook list is the main screen. Migrate/seed the index,
