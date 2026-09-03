@@ -9,7 +9,7 @@
 
 import { Theme, UISize } from "@ui/theme.slint";
 import { Screen, Callbacks, Ui, Recovery } from "../callbacks.slint";
-import { SecondaryAction, ScreenHeader } from "../components.slint";
+import { SecondaryAction, ScreenHeader, WordsOrSeedQr } from "../components.slint";
 
 export component RecoveryWordsScreen inherits VerticalLayout {
     padding-left: 24px;
@@ -34,31 +34,11 @@ export component RecoveryWordsScreen inherits VerticalLayout {
         font-weight: 600;
     }
 
-    if !Recovery.show-qr: HorizontalLayout {
-        spacing: 16px;
-        Text {
-            text: Recovery.words-col1;
-            color: Theme.palette-foreground;
-            font-family: "SourceCodePro";
-            font-size: 16px;
-            horizontal-stretch: 1;
-        }
-        Text {
-            text: Recovery.words-col2;
-            color: Theme.palette-foreground;
-            font-family: "SourceCodePro";
-            font-size: 16px;
-            horizontal-stretch: 1;
-        }
-    }
-    if Recovery.show-qr: HorizontalLayout {
-        alignment: center;
-        Image {
-            source: Recovery.qr;
-            width: 220px;
-            height: 220px;
-            image-rendering: pixelated;
-        }
+    WordsOrSeedQr {
+        show-qr: Recovery.show-qr;
+        col1: Recovery.words-col1;
+        col2: Recovery.words-col2;
+        qr: Recovery.qr;
     }
 
     SecondaryAction {

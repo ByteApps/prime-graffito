@@ -554,3 +554,43 @@ export component MonoCard inherits Rectangle {
         }
     }
 }
+
+/// The recovery-words reveal body: two word columns, or the SeedQR image,
+/// switched by `show-qr` (recovery-words + private-keys). Root is a
+/// VerticalLayout with no padding/spacing so the parent layout sees the one
+/// visible child exactly as it did inline.
+export component WordsOrSeedQr inherits VerticalLayout {
+    in property <bool> show-qr;
+    in property <string> col1;
+    in property <string> col2;
+    in property <image> qr;
+    in property <length> font-size: 16px;
+    in property <length> qr-size: 220px;
+    if !root.show-qr: HorizontalLayout {
+        spacing: 16px;
+        Text {
+            text: root.col1;
+            color: Theme.palette-foreground;
+            font-family: "SourceCodePro";
+            font-size: root.font-size;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.col2;
+            color: Theme.palette-foreground;
+            font-family: "SourceCodePro";
+            font-size: root.font-size;
+            horizontal-stretch: 1;
+        }
+    }
+    if root.show-qr: HorizontalLayout {
+        alignment: center;
+        Image {
+            source: root.qr;
+            width: root.qr-size;
+            height: root.qr-size;
+            image-rendering: pixelated;
+        }
+    }
+}
+
