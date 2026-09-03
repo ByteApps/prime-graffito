@@ -1,31 +1,17 @@
 # Third-party libraries
 
-Direct dependencies of this app, its `notes-core` and `graffito-core` libraries, and the companion web pages. The complete transitive list (with exact versions) is pinned in [`Cargo.lock`](Cargo.lock).
+Direct dependencies of this app and the companion web pages (`notes-core` and `graffito-core` are git dependencies on [ByteApps/graffito](https://github.com/ByteApps/graffito), where their own THIRD-PARTY.md lists theirs). The complete transitive list (with exact versions) is pinned in [`Cargo.lock`](Cargo.lock).
 
 ## Rust crates
 
 | Library | Version | License | Used for |
 |---|---|---|---|
-| [k256](https://crates.io/crates/k256) | 0.13 | Apache-2.0 OR MIT | secp256k1 math: BIP341 taproot tweak, BIP340 Schnorr signing, ECDH, and (`ecdsa` feature) RFC6979 deterministic ECDSA for BIP143 P2WPKH spending-wallet signing |
-| [sha2](https://crates.io/crates/sha2) | 0.10 | MIT OR Apache-2.0 | SHA-256 (sighashes, tagged hashes) |
-| [hkdf](https://crates.io/crates/hkdf) | 0.12 | MIT OR Apache-2.0 | Key derivation (identity, encryption, directed-note keys) |
-| [hmac](https://crates.io/crates/hmac) | 0.12 | MIT OR Apache-2.0 | HMAC for derivation |
-| [pbkdf2](https://crates.io/crates/pbkdf2) | 0.12 | MIT OR Apache-2.0 | BIP-39 mnemonic → seed (recovery seeds) |
-| [ripemd](https://crates.io/crates/ripemd) | 0.1 | MIT OR Apache-2.0 | BIP-32 key fingerprints (recovery seeds) |
-| [chacha20poly1305](https://crates.io/crates/chacha20poly1305) | 0.10 | Apache-2.0 OR MIT | XChaCha20-Poly1305 sealing of private notes |
-| [ml-kem](https://crates.io/crates/ml-kem) | 0.2 | Apache-2.0 OR MIT | FIPS 203 ML-KEM (512/768/1024) — the optional post-quantum hybrid layer on directed private notes (`pq.rs`; deterministic APIs only, entropy via `getrandom`) |
-| [argon2](https://crates.io/crates/argon2) | 0.5 | MIT OR Apache-2.0 | Argon2id passphrase stretching for the optional password layer on directed private notes |
-| [base64](https://crates.io/crates/base64) | 0.22 | MIT OR Apache-2.0 | Armored ML-KEM key import/export |
-| [bech32](https://crates.io/crates/bech32) | 0.11 | MIT | Taproot addresses (BIP350) |
+| [notes-core](https://github.com/ByteApps/graffito/tree/main/notes-core) | pinned git rev | MIT OR Apache-2.0 | The PNTE protocol: key derivation, envelope, sealing, ECDH, taproot tx build/sign, sync bundles — one crate shared with the graffito Mac/mobile app (its direct dependencies are listed there) |
+| [graffito-core](https://github.com/ByteApps/graffito/tree/main/graffito-core) | same pinned git rev | MIT OR Apache-2.0 | Shared UI-free policy (compose Security copy, `seclabel`) rendered identically by both apps |
 | [getrandom](https://crates.io/crates/getrandom) | 0.2 | MIT OR Apache-2.0 | Entropy source (see vendored override below) |
-| [miniz_oxide](https://crates.io/crates/miniz_oxide) | 0.8 | MIT OR Zlib OR Apache-2.0 | Deflate decompression of scanned bundle payloads |
-| [serde](https://crates.io/crates/serde) / [serde_json](https://crates.io/crates/serde_json) | 1 | MIT OR Apache-2.0 | Sync-bundle JSON and state persistence |
-| [zeroize](https://crates.io/crates/zeroize) | 1 | Apache-2.0 OR MIT | Wiping secrets from memory |
+| [serde](https://crates.io/crates/serde) / [serde_json](https://crates.io/crates/serde_json) | 1 | MIT OR Apache-2.0 | State persistence |
 | [hex](https://crates.io/crates/hex) | 0.4 | MIT OR Apache-2.0 | Hex encoding (txids, exports) |
 | [log](https://crates.io/crates/log) | 0.4 | MIT OR Apache-2.0 | Logging facade |
-| [bitcoin](https://crates.io/crates/bitcoin) (dev) | 0.32 | CC0-1.0 | Host-test cross-check of tx serialization/sighashes/signatures against libsecp256k1 — never a device dependency |
-| [foundation-ur](https://crates.io/crates/foundation-ur) (dev) | 0.4 | MIT | Verifies the companion's UR encoder against the exact decoder the KeyOS scanner runs |
-| [bip39](https://crates.io/crates/bip39) (dev) | 2 | CC0-1.0 | Host-test cross-check of our ported BIP-39 against an independent implementation |
 
 ## Vendored code
 

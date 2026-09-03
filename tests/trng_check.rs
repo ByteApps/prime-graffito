@@ -9,5 +9,5 @@
 //! the build as a `[patch.crates-io]` path dependency, not a workspace
 //! member, so cargo refuses to test it ("requires dev-dependencies and
 //! is not a member of the workspace"). The `#[path]` include is the way.
-#[path = "../../vendor/getrandom/src/trng_check.rs"]
+#[path = "../vendor/getrandom/src/trng_check.rs"]
 mod trng_check;

@@ -296,8 +296,10 @@ cleanup() { kill "${SRV_PID:-}" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 echo "== build notes_cli (host) =="
-( cd "$REPO" && cargo build -q -p notes-core --example notes_cli )
-cp "$REPO/target/debug/examples/notes_cli" "$NOTES"
+# notes-core lives in ../graffito since 2026-09-02 (a git dependency here
+# cannot have its examples built); the crate is the same one this app pins.
+( cd "$REPO/../graffito" && cargo build -q -p notes-core --example notes_cli )
+cp "$REPO/../graffito/target/debug/examples/notes_cli" "$NOTES"
 
 echo "== preflight: reach the shared $CN_NETWORK node at $CN_NODE_HOST:$CN_NODE_PORT =="
 if ! CLI getblockchaininfo >/dev/null 2>"$WORK/preflight.err"; then

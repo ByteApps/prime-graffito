@@ -411,15 +411,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
 
 [[package]]
-name = "base58ck"
-version = "0.1.101"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "365c0acd5b2e8dd0111a46c4faea83fb3cfb6e39a49a7c73a06e090db7b2eff0"
-dependencies = [
- "bitcoin_hashes 0.14.101",
-]
-
-[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -485,64 +476,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e4b40c7323adcfc0a41c4b88143ed58346ff65a288fc144329c5c45e05d70c6"
 
 [[package]]
-name = "bitcoin"
-version = "0.32.101"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ed8ccb78a9ff7a6fbb90e2fb9b8588b4a9928d49d8af3cb789108a84ea6b0ce"
-dependencies = [
- "base58ck",
- "bech32",
- "bitcoin-io",
- "bitcoin-units",
- "bitcoin_hashes 0.14.101",
- "hex-conservative 0.2.2",
- "hex_lit",
- "secp256k1",
-]
-
-[[package]]
-name = "bitcoin-consensus-encoding"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2d6094e2a1ba3c93b5a596fe5a10d1a10c3c6e06785cde89f693a044c01aa40"
-dependencies = [
- "bitcoin-internals",
-]
-
-[[package]]
-name = "bitcoin-internals"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a30a22d1f112dde8e16be7b45c63645dc165cef254f835b3e1e9553e485cfa64"
-dependencies = [
- "hex-conservative 0.3.2",
-]
-
-[[package]]
-name = "bitcoin-io"
-version = "0.1.101"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb5de036369d1ac59d3c1819ebc4d850f89466f5401c571a285b6ed564a4cb78"
-dependencies = [
- "bitcoin-consensus-encoding",
-]
-
-[[package]]
-name = "bitcoin-units"
-version = "0.1.101"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cb95693f371d089a4b5b6fc41c6f3ea6e01ee8c15388335dfac8ea685173b51"
-dependencies = [
- "bitcoin-consensus-encoding",
-]
-
-[[package]]
 name = "bitcoin_hashes"
 version = "0.14.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bca4c7abb40c8817d77403c880988cfd484f23ab2365726afb2f798363e2c4a2"
 dependencies = [
- "bitcoin-io",
  "hex-conservative 0.2.2",
 ]
 
@@ -2079,10 +2017,10 @@ dependencies = [
 [[package]]
 name = "graffito-core"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ByteApps/graffito.git?rev=44a0d5914b4aae5a69ef61e57887a0664a6ff4b7#44a0d5914b4aae5a69ef61e57887a0664a6ff4b7"
 dependencies = [
  "notes-core",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2246,12 +2184,6 @@ name = "hex-literal"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6fe2267d4ed49bc07b63801559be28c718ea06c4738b7a03c94df7386d2cde46"
-
-[[package]]
-name = "hex_lit"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3011d1213f159867b13cfd6ac92d2cd5f1345762c63be3554e84092d85a50bbd"
 
 [[package]]
 name = "hkdf"
@@ -3990,15 +3922,13 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 [[package]]
 name = "notes-core"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ByteApps/graffito.git?rev=44a0d5914b4aae5a69ef61e57887a0664a6ff4b7#44a0d5914b4aae5a69ef61e57887a0664a6ff4b7"
 dependencies = [
  "argon2",
  "base64",
  "bech32",
- "bip39",
- "bitcoin",
  "bs58",
  "chacha20poly1305",
- "foundation-ur",
  "getrandom 0.2.10",
  "hex",
  "hkdf",
@@ -5562,26 +5492,6 @@ dependencies = [
  "pkcs8",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "secp256k1"
-version = "0.29.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9465315bc9d4566e1724f0fffcbcc446268cb522e60f9a27bcded6b19c108113"
-dependencies = [
- "bitcoin_hashes 0.14.101",
- "rand 0.8.6",
- "secp256k1-sys",
-]
-
-[[package]]
-name = "secp256k1-sys"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4387882333d3aa8cb20530a17c69a3752e97837832f34f6dccc760e715001d9"
-dependencies = [
- "cc",
 ]
 
 [[package]]
