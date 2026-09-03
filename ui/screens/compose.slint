@@ -8,7 +8,7 @@
 
 import { Theme, UISize } from "@ui/theme.slint";
 import { Screen, Callbacks, Ui, Compose } from "../callbacks.slint";
-import { PrimaryAction, SecondaryAction, ScreenHeader, PillOption, EditorField, ToRowEntry } from "../components.slint";
+import { PrimaryAction, SecondaryAction, ScreenHeader, PillOption, EditorField, ToRowEntry, TierPills } from "../components.slint";
 
 export component ComposeScreen inherits VerticalLayout {
     padding-left: 24px;
@@ -140,33 +140,9 @@ export component ComposeScreen inherits VerticalLayout {
         }
     }
 
-    HorizontalLayout {
-        vertical-stretch: 0;
-        spacing: 6px;
-        PillOption {
-            label: "Economy";
-            selected: Compose.tier == 0;
-            horizontal-stretch: 1;
-            tapped => { Compose.tier = 0; Callbacks.compose-changed(); }
-        }
-        PillOption {
-            label: "Normal";
-            selected: Compose.tier == 1;
-            horizontal-stretch: 1;
-            tapped => { Compose.tier = 1; Callbacks.compose-changed(); }
-        }
-        PillOption {
-            label: "Fast";
-            selected: Compose.tier == 2;
-            horizontal-stretch: 1;
-            tapped => { Compose.tier = 2; Callbacks.compose-changed(); }
-        }
-        PillOption {
-            label: "Custom";
-            selected: Compose.tier == 3;
-            horizontal-stretch: 1;
-            tapped => { Compose.tier = 3; Callbacks.compose-changed(); }
-        }
+    TierPills {
+        tier: Compose.tier;
+        pick(t) => { Compose.tier = t; Callbacks.compose-changed(); }
     }
 
     // Custom fee-rate field — revealed ONLY when the Custom tier is

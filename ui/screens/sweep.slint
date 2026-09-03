@@ -9,7 +9,7 @@
 
 import { Theme, UISize } from "@ui/theme.slint";
 import { Screen, Callbacks, Ui, Sweep } from "../callbacks.slint";
-import { PrimaryAction, ScreenHeader, PillOption } from "../components.slint";
+import { PrimaryAction, ScreenHeader, PillOption, TierPills } from "../components.slint";
 
 export component SweepScreen inherits VerticalLayout {
     padding-left: 24px;
@@ -43,33 +43,9 @@ export component SweepScreen inherits VerticalLayout {
         overflow: elide;
     }
 
-    HorizontalLayout {
-        vertical-stretch: 0;
-        spacing: 6px;
-        PillOption {
-            label: "Economy";
-            selected: Sweep.tier == 0;
-            horizontal-stretch: 1;
-            tapped => { Sweep.tier = 0; Callbacks.sweep-changed(); }
-        }
-        PillOption {
-            label: "Normal";
-            selected: Sweep.tier == 1;
-            horizontal-stretch: 1;
-            tapped => { Sweep.tier = 1; Callbacks.sweep-changed(); }
-        }
-        PillOption {
-            label: "Fast";
-            selected: Sweep.tier == 2;
-            horizontal-stretch: 1;
-            tapped => { Sweep.tier = 2; Callbacks.sweep-changed(); }
-        }
-        PillOption {
-            label: "Custom";
-            selected: Sweep.tier == 3;
-            horizontal-stretch: 1;
-            tapped => { Sweep.tier = 3; Callbacks.sweep-changed(); }
-        }
+    TierPills {
+        tier: Sweep.tier;
+        pick(t) => { Sweep.tier = t; Callbacks.sweep-changed(); }
     }
 
     if Sweep.tier == 3: HorizontalLayout {

@@ -8,7 +8,7 @@
 
 import { Theme, UISize } from "@ui/theme.slint";
 import { Screen, Callbacks, Ui, Recovery } from "../callbacks.slint";
-import { SecondaryAction, ScreenHeader, PillOption } from "../components.slint";
+import { SecondaryAction, ScreenHeader, PillOption, NotebookPickRow, MonoCard } from "../components.slint";
 
 export component PrivateKeysScreen inherits VerticalLayout {
     padding-left: 24px;
@@ -130,34 +130,11 @@ export component PrivateKeysScreen inherits VerticalLayout {
             font-family: "Montserrat";
             font-size: 13px;
         }
-        for nb in Recovery.export-notebooks: Rectangle {
-            height: 40px;
-            background: nb.index == Recovery.export-nb-index ? Theme.palette-primary : Theme.palette-surface;
-            border-radius: 10px;
-            border-width: 1px;
-            border-color: nb.index == Recovery.export-nb-index ? Theme.palette-primary : Theme.palette-border;
-            HorizontalLayout {
-                padding-left: 12px;
-                padding-right: 12px;
-                spacing: 8px;
-                Text {
-                    text: nb.name;
-                    color: nb.index == Recovery.export-nb-index ? #ffffff : Theme.palette-foreground;
-                    font-family: "Montserrat";
-                    font-size: 14px;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                    overflow: elide;
-                }
-                Text {
-                    text: nb.addr;
-                    color: nb.index == Recovery.export-nb-index ? #ffffff : Theme.palette-muted;
-                    font-family: "SourceCodePro";
-                    font-size: 12px;
-                    vertical-alignment: center;
-                }
-            }
-            TouchArea { clicked => { Callbacks.export-pick-notebook(nb.index); } }
+        for nb in Recovery.export-notebooks: NotebookPickRow {
+            name: nb.name;
+            addr: nb.addr;
+            selected: nb.index == Recovery.export-nb-index;
+            picked => { Callbacks.export-pick-notebook(nb.index); }
         }
         Text {
             text: Recovery.export-label;
@@ -166,21 +143,8 @@ export component PrivateKeysScreen inherits VerticalLayout {
             font-size: 13px;
             font-weight: 600;
         }
-        Rectangle {
-            background: Theme.palette-surface;
-            border-radius: 12px;
-            border-width: 1px;
-            border-color: Theme.palette-danger;
-            VerticalLayout {
-                padding: 12px;
-                Text {
-                    text: Recovery.export-value;
-                    color: Theme.palette-foreground;
-                    font-family: "SourceCodePro";
-                    font-size: 13px;
-                    wrap: char-wrap;
-                }
-            }
+        MonoCard {
+            text: Recovery.export-value;
         }
         HorizontalLayout {
             alignment: center;
