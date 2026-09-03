@@ -16,7 +16,6 @@ impl App {
     /// arithmetic (estimate_sweep_vsize is byte-exact vs build_sweep_tx).
     pub(crate) fn update_sweep(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
         let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let sweep = ui.global::<Sweep>();
         let st = state.borrow();
@@ -29,7 +28,7 @@ impl App {
         save_state(&fs, &st);
         let (n, total) = wallet_balance(
             &fs,
-            &notebooks.borrow(),
+            &self.notebooks,
             &st.network,
             (self.seed_idx, self.bip_account),
         );
@@ -106,7 +105,6 @@ impl App {
         let fs = fs.clone();
         Timer::single_shot(Duration::from_millis(150), move || {
             let state = app.borrow().state.clone();
-            let notebooks = app.borrow().notebooks.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let sweep = ui.global::<Sweep>();
             let consolidate = sweep.get_kind() == "consolidate";
@@ -120,7 +118,7 @@ impl App {
             save_state(&fs, &st);
             let sources_raw = wallet_sources(
                 &fs,
-                &notebooks.borrow(),
+                &app.borrow().notebooks,
                 app_seed_get(&app.borrow().app_seed),
                 &st.network,
                 (app.borrow().seed_idx, app.borrow().bip_account),
@@ -190,7 +188,7 @@ impl App {
                     // `sources_raw` already carries each contributing
                     // notebook's (account, output_x, coins), so the
                     // prevout labels come straight from it.
-                    let ix = notebooks.borrow();
+                    let ix = &a.notebooks;
                     let (self_spks, spending_spks) =
                         confirm_self_spks(&ix, app_seed_get(&app.borrow().app_seed), &st.network, (app.borrow().seed_idx, app.borrow().bip_account));
                     let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> =
@@ -211,7 +209,6 @@ impl App {
                             );
                         }
                     }
-                    drop(ix);
 
                     let cctx = notes_core::confirm::ConfirmCtx {
                         network: st.network(),

@@ -14,13 +14,12 @@ impl App {
     /// first. Viewer-first — consolidate is the screen's single action.
     pub(crate) fn refresh_coins(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
         let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         // Wallet-wide: every ACTIVE notebook's coins, each tagged with
         // its notebook. Flush the active notebook first so its file is
         // current, then read all from disk.
         save_state(&fs, &state.borrow());
-        let ix = notebooks.borrow();
+        let ix = &self.notebooks;
         let active_net = self.net.clone();
         let ctx = (self.seed_idx, self.bip_account);
         let btc_usd = state.borrow().btc_usd;

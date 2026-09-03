@@ -1368,7 +1368,7 @@ struct App {
     /// Notebooks: the index (account -> name/archived) persisted in
     /// `/.graffito/notebooks.json`. A notebook = an indexed identity; boot
     /// lands on the notebook LIST (empty on a fresh install — no onboarding).
-    notebooks: Rc<RefCell<notebooks::NotebookIndex>>,
+    notebooks: notebooks::NotebookIndex,
     /// The ACTIVE notebook's persisted state (notes, UTXO ledger, fee
     /// tiers, contacts — `state-<net>-<account>.json`); an empty placeholder
     /// until a notebook is opened, swapped on notebook switch.
@@ -1514,7 +1514,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // and panics at runtime.
     let app: Rc<RefCell<App>> = Rc::new(RefCell::new(App {
         app_seed: OnceCell::new(),
-        notebooks: Rc::new(RefCell::new(notebooks)),
+        notebooks,
         state: Rc::new(RefCell::new(State::default())),
         identity: None,
         net: device_cfg.network.clone(),
@@ -1659,7 +1659,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     wire!(ui, app, ui_weak, fs; Callbacks.on_sweep_continue() => App::on_sweep_continue(&app, &ui_weak, &fs));
 
     // Spending wallet: Settings toggle.
-    wire!(ui, app, ui_weak, fs; Callbacks.on_set_spending_enabled(on) => app.borrow().on_set_spending_enabled(&ui_weak, &fs, on));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_set_spending_enabled(on) => app.borrow_mut().on_set_spending_enabled(&ui_weak, &fs, on));
 
     // Pay-from screen (25): notebook / spending-wallet per-coin selection.
     wire!(ui, app, ui_weak, fs; Callbacks.on_funding_open() => app.borrow().on_funding_open(&ui_weak));
@@ -1733,14 +1733,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // logging `cb: import-bundle {src} … ok` (src keeps the file=/loc=
     // shape the UI tests grep).
 
-    wire!(ui, app, ui_weak, fs; Callbacks.on_import_bundle() => app.borrow().on_import_bundle(&ui_weak, &fs));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_import_bundle() => app.borrow_mut().on_import_bundle(&ui_weak, &fs));
 
     // Import picker: list the bundle files actually present in the inboxes
     // so the user chooses one, instead of silently auto-picking the first.
     wire!(ui, app, ui_weak, fs; Callbacks.on_list_bundles() => app.borrow().on_list_bundles(&ui_weak, &fs));
-    wire!(ui, app, ui_weak, fs; Callbacks.on_pick_bundle(name, loc_idx) => app.borrow().on_pick_bundle(&ui_weak, &fs, name, loc_idx));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_pick_bundle(name, loc_idx) => app.borrow_mut().on_pick_bundle(&ui_weak, &fs, name, loc_idx));
 
-    wire!(ui, app, ui_weak, fs; Callbacks.on_scan_bundle() => app.borrow().on_scan_bundle(&ui_weak, &fs));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_scan_bundle() => app.borrow_mut().on_scan_bundle(&ui_weak, &fs));
 
     wire!(ui, app, ui_weak, fs; Callbacks.on_export_pending() => app.borrow().on_export_pending(&ui_weak, &fs));
 
@@ -1775,7 +1775,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     wire!(ui, app, ui_weak, fs; NotebookCb.on_rename(account) => app.borrow().on_rename(&ui_weak, account));
     wire!(ui, app, ui_weak, fs; NotebookCb.on_name_cancel() => app.borrow().on_name_cancel(&ui_weak));
     wire!(ui, app, ui_weak, fs; NotebookCb.on_name_save() => app.borrow_mut().on_name_save(&ui_weak, &fs));
-    wire!(ui, app, ui_weak, fs; NotebookCb.on_archive(account, archived) => app.borrow().on_archive(&ui_weak, &fs, account, archived));
+    wire!(ui, app, ui_weak, fs; NotebookCb.on_archive(account, archived) => app.borrow_mut().on_archive(&ui_weak, &fs, account, archived));
     wire!(ui, app, ui_weak, fs; NotebookCb.on_back_to_list() => app.borrow().on_back_to_list(&ui_weak, &fs));
 
     // ---- recovery seeds (screen 21 + wallet context) ----

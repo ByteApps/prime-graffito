@@ -196,7 +196,6 @@ impl App {
     /// never actually reachable from here.
     pub(crate) fn on_unlock_note(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, password: SharedString) {
         let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let id_str = ui.global::<View>().get_id().to_string();
         let mut st = state.borrow_mut();
@@ -229,12 +228,11 @@ impl App {
             let received = n.from.is_some();
             if received {
                 if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
-                    let ix = notebooks.borrow();
+                    let ix = &self.notebooks;
                     let net_s = self.net.clone();
                     let leaf = (self.active)
                         .and_then(|acc| ix.get(acc))
                         .and_then(|meta| derive_leaf_secret(app_seed_get(&self.app_seed), meta, &net_s));
-                    drop(ix);
                     let mut last = notes_core::Error::DecryptFailed;
                     let mut ok: Option<Vec<u8>> = None;
                     if let Some(leaf) = leaf {

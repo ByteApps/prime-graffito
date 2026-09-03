@@ -21,7 +21,6 @@ impl App {
     /// default. Public-key only: device backup is the 24 recovery words,
     /// which already reconstruct every notebook's key.
     pub(crate) fn refresh_quantum_keys(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let qk = ui.global::<QuantumKeys>();
         let alg = mlkem_alg_from_u8(self.mlkem_level);
@@ -33,7 +32,7 @@ impl App {
         qk.set_level(level_idx);
         qk.set_level_caption(mlkem_alg_describe(alg).into());
 
-        let ix = notebooks.borrow();
+        let ix = &self.notebooks;
         let net_s = self.net.clone();
         let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
         let ctx = (self.seed_idx, self.bip_account);
@@ -67,7 +66,6 @@ impl App {
             .quantum_nb
             .and_then(|i| ix.visible(ctx.0, ctx.1).find(|m| m.index == i).cloned())
             .or(default_meta);
-        drop(ix);
 
         let (nb_idx, nb_name) = meta
             .as_ref()

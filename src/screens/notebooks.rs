@@ -14,9 +14,8 @@ impl App {
     /// notebook's state file. Device has no live balance — the row meta is
     /// address-short · note count.
     pub(crate) fn refresh_notebooks(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
-        let ix = notebooks.borrow();
+        let ix = &self.notebooks;
         let active_acct = self.active;
         let dev_net = self.net.clone();
         let ctx = (self.seed_idx, self.bip_account);
@@ -76,14 +75,12 @@ impl App {
     /// target account, refresh every per-notebook view, and show its home.
     pub(crate) fn switch_notebook(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, account: u32) {
         let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         if self.active.is_some() {
             save_state(&fs, &state.borrow());
         }
         self.active = Some(account);
-        self.identity = notebooks
-            .borrow()
+        self.identity = self.notebooks
             .get(account)
             .and_then(|m| derive_identity(app_seed_get(&self.app_seed), m, &self.net));
         let mut loaded = load_state(&fs, &self.net, account);
@@ -94,7 +91,7 @@ impl App {
             .as_ref()
             .map(|id| short_addr(&id.address(state.borrow().network())))
             .unwrap_or_default();
-        let title = notebook_name(&notebooks.borrow(), account, &short);
+        let title = notebook_name(&self.notebooks, account, &short);
         ui.global::<NotebooksUi>().set_title(title.into());
         log::info!("cb: open-notebook account={account}");
         self.refresh_home(&ui_weak);
@@ -127,13 +124,11 @@ impl App {
     }
 
     pub(crate) fn on_rename(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, account: i32) {
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let nb = ui.global::<NotebooksUi>();
         // Prefill the RAW local name (the display name may be an addr
         // short form, which must not become a name by accident).
-        let raw = notebooks
-            .borrow()
+        let raw = self.notebooks
             .get(account.max(0) as u32)
             .map(|m| m.name.clone())
             .unwrap_or_default();
@@ -148,7 +143,6 @@ impl App {
     }
 
     pub(crate) fn on_name_save(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let nb = ui.global::<NotebooksUi>();
         let sel = nb.get_name_account();
@@ -169,12 +163,12 @@ impl App {
             }
             let (seed, bacct) = (self.seed_idx, self.bip_account);
             let account = {
-                let mut ix = notebooks.borrow_mut();
+                let ix = &mut self.notebooks;
                 let account = ix.create_bip86(seed, bacct, &name);
                 save_notebooks(&fs, &ix);
                 account
             };
-            let index = notebooks.borrow().get(account).map(|m| m.index).unwrap_or(0);
+            let index = self.notebooks.get(account).map(|m| m.index).unwrap_or(0);
             log::info!(
                 "cb: create-notebook account={account} scheme=bip86 seed={seed} bip-account={bacct} index={index}"
             );
@@ -183,7 +177,7 @@ impl App {
         } else {
             let account = sel as u32;
             {
-                let mut ix = notebooks.borrow_mut();
+                let ix = &mut self.notebooks;
                 ix.rename(account, &name);
                 save_notebooks(&fs, &ix);
             }
@@ -191,8 +185,7 @@ impl App {
             self.refresh_notebooks(&ui_weak, &fs);
             // If it's the open notebook, update its home title.
             if self.active == Some(account) {
-                let title = notebooks
-                    .borrow()
+                let title = self.notebooks
                     .get(account)
                     .map(|m| m.name.clone())
                     .filter(|n| !n.trim().is_empty());
@@ -203,8 +196,7 @@ impl App {
         }
     }
 
-    pub(crate) fn on_archive(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, account: i32, archived: bool) {
-        let notebooks = self.notebooks.clone();
+    pub(crate) fn on_archive(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, account: i32, archived: bool) {
         let Some(ui) = ui_weak.upgrade() else { return };
         let account = account.max(0) as u32;
         if archived {
@@ -218,7 +210,7 @@ impl App {
             }
         }
         {
-            let mut ix = notebooks.borrow_mut();
+            let ix = &mut self.notebooks;
             ix.set_archived(account, archived);
             save_notebooks(&fs, &ix);
         }

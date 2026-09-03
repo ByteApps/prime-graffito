@@ -29,22 +29,19 @@ impl App {
 
 
     /// Spending wallet: Settings toggle.
-    pub(crate) fn on_set_spending_enabled(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, on: bool) {
-        let notebooks = self.notebooks.clone();
-        let mut ix = notebooks.borrow_mut();
+    pub(crate) fn on_set_spending_enabled(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, on: bool) {
+        let ix = &mut self.notebooks;
         let ctx = notebook_ctx(&ix, self.active)
             .unwrap_or((self.seed_idx, self.bip_account));
         let net_s = self.net.clone();
         ix.spending_mut(&net_s, ctx.0, ctx.1).enabled = on;
         save_notebooks(&fs, &ix);
-        drop(ix);
         log::info!("cb: set-spending enabled={on}");
         self.refresh_funding(&ui_weak);
     }
 
     pub(crate) fn on_cycle_network(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
         let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
         // Network is device-level (wallet-wide): flush the active
         // notebook, cycle the shared network, persist it in config, and
         // reload the active notebook's ledger for the new chain (each
@@ -71,7 +68,7 @@ impl App {
             // address ENCODING changes), but bip86 notebooks use the
             // BIP-44 coin type — their keys differ per network, so
             // always re-derive from the meta.
-            if let Some(m) = notebooks.borrow().get(account) {
+            if let Some(m) = self.notebooks.get(account) {
                 self.identity = derive_identity(app_seed_get(&self.app_seed), m, &next);
             }
         }

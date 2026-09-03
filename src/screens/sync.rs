@@ -12,9 +12,8 @@ impl App {
     /// Shared by file import AND camera scan: parse + merge a bundle,
     /// logging `cb: import-bundle {src} … ok` (src keeps the file=/loc=
     /// shape the UI tests grep).
-    pub(crate) fn apply_bundle(&self, fs: &Fs, json: &str, src: &str) -> Result<String, String> {
+    pub(crate) fn apply_bundle(&mut self, fs: &Fs, json: &str, src: &str) -> Result<String, String> {
         let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
         let id_guard = &self.identity;
         let id = id_guard.as_ref().ok_or("identity unavailable")?;
         {
@@ -33,7 +32,7 @@ impl App {
             // (`SpendingSection.self_spks`) — extends OWN detection to
             // funded/mixed-source notes (extract_notes_multi_deduped ORs
             // with the producer's spends_from_self, never narrows).
-            let ix = notebooks.borrow();
+            let ix = &self.notebooks;
             let ctx = notebook_ctx(&ix, self.active)
                 .unwrap_or((self.seed_idx, self.bip_account));
             let net_s = self.net.clone();
@@ -61,7 +60,6 @@ impl App {
                 }).map(|leaf| {
                     derive_mlkem_keypairs(&leaf).into_iter().map(|kp| kp.secret()).collect()
                 }).unwrap_or_default();
-            drop(ix);
             let notebook_addr = id.address(st.network());
             let self_spks: Vec<Vec<u8>> = {
                 let mut v = vec![p2tr_script_pubkey(&id.output_x)];
@@ -290,7 +288,7 @@ impl App {
             }
             st.utxos = nb_utxos;
             if section.is_some() || !newly_used.is_empty() {
-                let mut ix = notebooks.borrow_mut();
+                let ix = &mut self.notebooks;
                 let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
                 for addr in newly_used {
                     sec.mark_used(addr);
@@ -333,7 +331,7 @@ impl App {
     /// Shared by file import AND camera scan: parse + merge a bundle,
     /// logging `cb: import-bundle {src} … ok` (src keeps the file=/loc=
     /// shape the UI tests grep).
-    pub(crate) fn on_import_bundle(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+    pub(crate) fn on_import_bundle(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
         let Some(ui) = ui_weak.upgrade() else { return };
         let result = (|| -> Result<String, String> {
             let (name, loc, loc_label) =
@@ -387,7 +385,7 @@ impl App {
         log::info!("cb: list-bundles n={}", found.len());
     }
 
-    pub(crate) fn on_pick_bundle(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, name: SharedString, loc_idx: i32) {
+    pub(crate) fn on_pick_bundle(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, name: SharedString, loc_idx: i32) {
         let Some(ui) = ui_weak.upgrade() else { return };
         let loc = if loc_idx == 1 { Location::Airlock } else { Location::User };
         let result = (|| -> Result<String, String> {
@@ -416,7 +414,7 @@ impl App {
         self.refresh_home(&ui_weak);
     }
 
-    pub(crate) fn on_scan_bundle(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
+    pub(crate) fn on_scan_bundle(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
         let Some(ui) = ui_weak.upgrade() else { return };
         let opts = ScanQrOptions {
             header_title: "Scan sync bundle".into(),

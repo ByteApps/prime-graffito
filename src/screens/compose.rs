@@ -21,7 +21,6 @@ impl App {
     /// notes-core crypt::SEAL_OVERHEAD), so per-keystroke recompute is free.
     pub(crate) fn compose_changed(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
         let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let compose = ui.global::<Compose>();
         let st = state.borrow();
@@ -169,12 +168,11 @@ impl App {
             self.compose_oversize = false; // clearing the draft re-arms the dialog
             return;
         }
-        let ix = notebooks.borrow();
+        let ix = &self.notebooks;
         let ctx = notebook_ctx(&ix, self.active)
             .unwrap_or((self.seed_idx, self.bip_account));
         let net_s = self.net.clone();
         let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
-        drop(ix);
         if st.utxos.is_empty() && section.as_ref().map(|s| s.balance()).unwrap_or(0) == 0 {
             compose
                 .set_cost_line("No funds — fund the address and import a sync bundle.".into());
@@ -570,7 +568,6 @@ impl App {
         let fs = fs.clone();
         Timer::single_shot(Duration::from_millis(150), move || {
             let state = app.borrow().state.clone();
-            let notebooks = app.borrow().notebooks.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let compose = ui.global::<Compose>();
             let text = compose.get_text().to_string();
@@ -596,12 +593,11 @@ impl App {
             let id_guard = &a.identity;
             let pick = a.funding_pick.clone();
             let change_choice = app.borrow().change_pick.clone();
-            let ix = notebooks.borrow();
+            let ix = &a.notebooks;
             let ctx = notebook_ctx(&ix, app.borrow().active)
                 .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
             let net_s = app.borrow().net.clone();
             let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
-            drop(ix);
 
             // (note, spending inputs spent, spending change addr to mark
             // used, change went to notebook?, mandatory notebook dust
@@ -1090,7 +1086,7 @@ impl App {
                     // decoding `note.raw_hex` itself; this only gathers
                     // the LOOKUPS (source labels, self/change spks).
                     let active_acct = app.borrow().active.unwrap_or(0);
-                    let ix = notebooks.borrow();
+                    let ix = &a.notebooks;
                     let active_name = {
                         let short = id_guard
                             .as_ref()
@@ -1100,7 +1096,6 @@ impl App {
                     };
                     let (mut self_spks, mut spending_spks) =
                         confirm_self_spks(&ix, app_seed_get(&app.borrow().app_seed), &net_s, ctx);
-                    drop(ix);
                     // A fresh spending-wallet change address this very
                     // tx pays isn't in `used` yet (marked only after a
                     // successful sign) — add it so the change output

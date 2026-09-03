@@ -215,7 +215,6 @@ impl App {
                 let app = app.clone();
                 Timer::single_shot(Duration::from_millis(150), move || {
                     let state = app.borrow().state.clone();
-                    let notebooks = app.borrow().notebooks.clone();
                     let Some(ui) = ui_weak.upgrade() else { return };
                     let mut st = state.borrow_mut();
 
@@ -272,11 +271,13 @@ impl App {
                     // went to a fresh spending address) in one pass — mirrors
                     // the notebook ledger's unconfirmed-chaining update above.
                     if !p.spending_spent.is_empty() || p.spending_change_addr.is_some() {
-                        let mut ix = notebooks.borrow_mut();
-                        let ctx = notebook_ctx(&ix, app.borrow().active)
-                            .unwrap_or((app.borrow().seed_idx, app.borrow().bip_account));
-                        let net_s = app.borrow().net.clone();
-                        let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
+                        // One RefMut for this block: every App read below goes
+                        // through `a`, never through a second `app.borrow()`.
+                        let mut a = app.borrow_mut();
+                        let ctx = notebook_ctx(&a.notebooks, a.active)
+                            .unwrap_or((a.seed_idx, a.bip_account));
+                        let net_s = a.net.clone();
+                        let sec = a.notebooks.spending_mut(&net_s, ctx.0, ctx.1);
                         let change_coin =
                             if p.note.change > 0 { p.spending_change_addr.as_ref() } else { None };
                         if let Some(addr) = change_coin {
@@ -292,7 +293,8 @@ impl App {
                                 index: addr.index,
                             }),
                         );
-                        save_notebooks(&fs, &ix);
+                        save_notebooks(&fs, &a.notebooks);
+                        drop(a);
                     }
 
                     // Self-pw note (PLAN-graffito-self-pw.md): a

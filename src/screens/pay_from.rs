@@ -14,15 +14,13 @@ impl App {
     /// `state` + the active notebook's spending section + `funding_pick`.
     pub(crate) fn refresh_funding(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
         let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let st = state.borrow();
         let active_net = self.net.clone();
-        let ix = notebooks.borrow();
+        let ix = &self.notebooks;
         let ctx = notebook_ctx(&ix, self.active)
             .unwrap_or((self.seed_idx, self.bip_account));
         let section = ix.spending(&active_net, ctx.0, ctx.1).cloned();
-        drop(ix);
         let pick = self.funding_pick.clone();
 
         let nb_rows: Vec<FundingCoinRow> = st

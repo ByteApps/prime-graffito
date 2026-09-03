@@ -16,7 +16,6 @@ impl App {
     /// confirm-sign dispatcher below — nothing about a scanned PSBT touches
     /// disk until the user taps Sign.
     pub(crate) fn on_sign_psbt(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let id_guard = &self.identity;
         let Some(id) = id_guard.as_ref() else {
@@ -66,9 +65,8 @@ impl App {
         let net_dev = self.net.clone();
         let mut network = Network::from_str_opt(&net_dev).unwrap_or(Network::Mainnet);
         let wallet_ctx = (self.seed_idx, self.bip_account);
-        let ix = notebooks.borrow();
+        let ix = &self.notebooks;
         let (self_spks, spending_spks) = confirm_self_spks(&ix, app_seed_get(&self.app_seed), &net_dev, wallet_ctx);
-        drop(ix);
 
         // Port B (network-display fix, 2026-07-19): a PSBT's
         // scriptPubKeys carry NO network/HRP information at all — HRP

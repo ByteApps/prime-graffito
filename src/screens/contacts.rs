@@ -39,7 +39,6 @@ impl App {
 
     pub(crate) fn pick_contact(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, addr_raw: &str) {
         let state = self.state.clone();
-        let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let addr = addr_raw.trim().to_string();
         let contacts_g = ui.global::<Contacts>();
@@ -139,11 +138,10 @@ impl App {
             // Fresh compose: reset the funding/change picks to their
             // default rule (spending only when enabled AND funded).
             let st = state.borrow();
-            let ix = notebooks.borrow();
+            let ix = &self.notebooks;
             let ctx = notebook_ctx(&ix, self.active)
                 .unwrap_or((self.seed_idx, self.bip_account));
             let section = ix.spending(&self.net, ctx.0, ctx.1).cloned();
-            drop(ix);
             self.funding_pick = default_funding_pick(&st, section.as_ref());
             drop(st);
             self.change_pick = ChangePickState::default();
