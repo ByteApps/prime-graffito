@@ -76,22 +76,21 @@ impl App {
     /// target account, refresh every per-notebook view, and show its home.
     pub(crate) fn switch_notebook(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, account: u32) {
         let state = self.state.clone();
-        let identity = self.identity.clone();
         let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         if self.active.is_some() {
             save_state(&fs, &state.borrow());
         }
         self.active = Some(account);
-        *identity.borrow_mut() = notebooks
+        self.identity = notebooks
             .borrow()
             .get(account)
             .and_then(|m| derive_identity(app_seed_get(&self.app_seed), m, &self.net));
         let mut loaded = load_state(&fs, &self.net, account);
         loaded.chunk_override = self.device_chunk; // chunk is device-level
         *state.borrow_mut() = loaded;
-        let short = identity
-            .borrow()
+        let short = self
+            .identity
             .as_ref()
             .map(|id| short_addr(&id.address(state.borrow().network())))
             .unwrap_or_default();

@@ -44,7 +44,6 @@ impl App {
 
     pub(crate) fn on_cycle_network(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
         let state = self.state.clone();
-        let identity = self.identity.clone();
         let notebooks = self.notebooks.clone();
         // Network is device-level (wallet-wide): flush the active
         // notebook, cycle the shared network, persist it in config, and
@@ -73,7 +72,7 @@ impl App {
             // BIP-44 coin type — their keys differ per network, so
             // always re-derive from the meta.
             if let Some(m) = notebooks.borrow().get(account) {
-                *identity.borrow_mut() = derive_identity(app_seed_get(&self.app_seed), m, &next);
+                self.identity = derive_identity(app_seed_get(&self.app_seed), m, &next);
             }
         }
         let _ = &ui_weak;

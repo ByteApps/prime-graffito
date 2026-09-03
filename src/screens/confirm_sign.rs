@@ -46,7 +46,6 @@ impl App {
     /// its `Rc` handle because the work runs in a deferred `Timer` body;
     /// every `app.borrow()` inside is byte-identical to the callback it was.
     pub(crate) fn on_confirm_sign(app: &Rc<RefCell<App>>, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let identity = app.borrow().identity.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let kind = ui.global::<ConfirmSign>().get_kind().to_string();
         let txid = ui.global::<ConfirmSign>().get_txid().to_string();
@@ -154,16 +153,17 @@ impl App {
             }
             "psbt" => {
                 let Some(psbt) = app.borrow_mut().psbt_pending.take() else { return };
-                let id_guard = identity.borrow();
+                let a = app.borrow();
+                let id_guard = &a.identity;
                 let Some(id) = id_guard.as_ref() else {
-                    drop(id_guard);
+                    drop(a);
                     ui.global::<Sync>().set_result("Device locked — no signing key.".into());
                     ui.global::<Ui>().set_screen(Screen::Sync);
                     return;
                 };
                 let output_x = id.output_x;
                 let tweaked_seckey = id.tweaked_seckey;
-                drop(id_guard);
+                drop(a);
                 ui.global::<Ui>().set_busy(true);
                 let ui_weak = ui_weak.clone();
                 let fs = fs.clone();

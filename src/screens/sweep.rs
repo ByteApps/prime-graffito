@@ -106,7 +106,6 @@ impl App {
         let fs = fs.clone();
         Timer::single_shot(Duration::from_millis(150), move || {
             let state = app.borrow().state.clone();
-            let identity = app.borrow().identity.clone();
             let notebooks = app.borrow().notebooks.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let sweep = ui.global::<Sweep>();
@@ -127,7 +126,8 @@ impl App {
                 (app.borrow().seed_idx, app.borrow().bip_account),
             );
             let dest_account = app.borrow().active.unwrap_or(0);
-            let id_guard = identity.borrow();
+            let a = app.borrow();
+            let id_guard = &a.identity;
             let result = id_guard
                 .as_ref()
                 .ok_or_else(|| "identity unavailable".to_string())
@@ -244,6 +244,7 @@ impl App {
                         "Sign & export",
                     ) {
                         Ok(()) => {
+                            drop(a);
                             app.borrow_mut().sweep_plan = Some(SweepPlan {
                                 tx,
                                 kind: if consolidate { "consolidate" } else { "sweep" },

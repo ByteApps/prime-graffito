@@ -570,7 +570,6 @@ impl App {
         let fs = fs.clone();
         Timer::single_shot(Duration::from_millis(150), move || {
             let state = app.borrow().state.clone();
-            let identity = app.borrow().identity.clone();
             let notebooks = app.borrow().notebooks.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let compose = ui.global::<Compose>();
@@ -591,8 +590,11 @@ impl App {
             let pq_mlkem_active = compose.get_pq_mlkem_active();
             let pq_passphrase_text = compose.get_pq_passphrase_text().to_string();
             let st = state.borrow();
-            let id_guard = identity.borrow();
-            let pick = app.borrow().funding_pick.clone();
+            // `a` is held for the whole identity span (Identity is not Clone):
+            // nothing below may `app.borrow_mut()` until `drop(a)`.
+            let a = app.borrow();
+            let id_guard = &a.identity;
+            let pick = a.funding_pick.clone();
             let change_choice = app.borrow().change_pick.clone();
             let ix = notebooks.borrow();
             let ctx = notebook_ctx(&ix, app.borrow().active)
@@ -690,7 +692,8 @@ impl App {
                                 .ok_or("recipient has no quantum key — add one in Contacts")?;
                             Some(pq::import_public(&armor).map_err(|e| e.to_string())?)
                         } else {
-                            let kp = app.borrow_mut().device_quantum_key(&fs).ok_or(
+                            // peek, not the caching lookup: `a` (a shared App borrow) is live here
+                            let kp = a.device_quantum_key_peek(&fs).ok_or(
                                 "no quantum key on this device — create one in Settings",
                             )?;
                             Some((kp.alg(), kp.ek().to_vec()))
@@ -1225,6 +1228,7 @@ impl App {
                                     log::info!("cb: confirm fold amount={fold_amount}");
                                 }
                             }
+                            drop(a);
                             app.borrow_mut().plan = Some(Plan {
                                 note,
                                 text,

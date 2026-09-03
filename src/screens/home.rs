@@ -12,12 +12,11 @@ impl App {
     /// truth — inline DeviceConfig constructions drift as fields grow).
     pub(crate) fn refresh_home(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
         let state = self.state.clone();
-        let identity = self.identity.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let st = state.borrow();
         let home = ui.global::<Home>();
         home.set_network(self.net.clone().into()); // device-level network
-        if let Some(id) = identity.borrow().as_ref() {
+        if let Some(id) = self.identity.as_ref() {
             let addr = id.address(st.network());
             home.set_qr(qr_image(&addr.to_uppercase()));
             home.set_address(addr.into());

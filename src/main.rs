@@ -1375,7 +1375,7 @@ struct App {
     state: Rc<RefCell<State>>,
     /// The ACTIVE notebook's derived identity (keys + address), swapped
     /// with `state`; `None` on the list.
-    identity: Rc<RefCell<Option<Identity>>>,
+    identity: Option<Identity>,
 
     // ---- wallet-level config (persisted in config.json) ----------------
     /// Device-level network (wallet-wide; `"mainnet" | "testnet4" |
@@ -1516,7 +1516,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         app_seed: OnceCell::new(),
         notebooks: Rc::new(RefCell::new(notebooks)),
         state: Rc::new(RefCell::new(State::default())),
-        identity: Rc::new(RefCell::new(None)),
+        identity: None,
         net: device_cfg.network.clone(),
         device_chunk: device_cfg.chunk_override,
         seed_idx: device_cfg.seed_index,

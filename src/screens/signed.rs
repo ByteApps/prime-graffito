@@ -16,10 +16,9 @@ impl App {
     /// confirm-sign dispatcher below — nothing about a scanned PSBT touches
     /// disk until the user taps Sign.
     pub(crate) fn on_sign_psbt(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
-        let identity = self.identity.clone();
         let notebooks = self.notebooks.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
-        let id_guard = identity.borrow();
+        let id_guard = &self.identity;
         let Some(id) = id_guard.as_ref() else {
             ui.global::<Sync>().set_result("Device locked — no signing key.".into());
             return;
@@ -152,7 +151,6 @@ impl App {
             note_preview,
         };
         let raw_hex = hex::encode(psbt.unsigned_tx.serialize_legacy());
-        drop(id_guard);
 
         match show_confirm_screen(&ui, "psbt", &raw_hex, &cctx, "External funding tx".to_string(), "Sign & export") {
             Ok(()) => {

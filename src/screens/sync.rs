@@ -14,9 +14,8 @@ impl App {
     /// shape the UI tests grep).
     pub(crate) fn apply_bundle(&self, fs: &Fs, json: &str, src: &str) -> Result<String, String> {
         let state = self.state.clone();
-        let identity = self.identity.clone();
         let notebooks = self.notebooks.clone();
-        let id_guard = identity.borrow();
+        let id_guard = &self.identity;
         let id = id_guard.as_ref().ok_or("identity unavailable")?;
         {
             let bundle =
