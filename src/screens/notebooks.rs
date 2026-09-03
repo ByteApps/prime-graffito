@@ -74,10 +74,9 @@ impl App {
     /// Open a notebook: save the current one, swap identity + state to the
     /// target account, refresh every per-notebook view, and show its home.
     pub(crate) fn switch_notebook(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, account: u32) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         if self.active.is_some() {
-            save_state(&fs, &state.borrow());
+            save_state(&fs, &self.state);
         }
         self.active = Some(account);
         self.identity = self.notebooks
@@ -85,11 +84,11 @@ impl App {
             .and_then(|m| derive_identity(app_seed_get(&self.app_seed), m, &self.net));
         let mut loaded = load_state(&fs, &self.net, account);
         loaded.chunk_override = self.device_chunk; // chunk is device-level
-        *state.borrow_mut() = loaded;
+        self.state = loaded;
         let short = self
             .identity
             .as_ref()
-            .map(|id| short_addr(&id.address(state.borrow().network())))
+            .map(|id| short_addr(&id.address(self.state.network())))
             .unwrap_or_default();
         let title = notebook_name(&self.notebooks, account, &short);
         ui.global::<NotebooksUi>().set_title(title.into());
@@ -219,10 +218,9 @@ impl App {
     }
 
     pub(crate) fn on_back_to_list(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         if self.active.is_some() {
-            save_state(&fs, &state.borrow());
+            save_state(&fs, &self.state);
         }
         self.refresh_notebooks(&ui_weak, &fs);
         ui.global::<Ui>().set_screen(Screen::Notebooks);

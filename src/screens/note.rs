@@ -9,9 +9,8 @@ use crate::*;
 
 impl App {
     pub(crate) fn on_open_note(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, id: SharedString) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
-        let st = state.borrow();
+        let st = &self.state;
         let Some(n) = st.notes.iter().find(|n| n.id == id.as_str()) else { return };
         let view = ui.global::<View>();
         view.set_id(n.id.clone().into());
@@ -79,7 +78,7 @@ impl App {
         if self_kem_locked {
             // Bound first: an `if let` scrutinee's RefMut would live
             // through the whole block.
-            let device_kp = self.device_quantum_key(fs);
+            let device_kp = device_quantum_key_in(&mut self.device_pq_key, fs);
             if let Some(kp) = device_kp {
                 kem_key_present = true;
                 if !self_kem_also_pw {
@@ -195,16 +194,15 @@ impl App {
     /// `needs_password` gate, so `unlock_sent`'s `SenderCannotReopen` is
     /// never actually reachable from here.
     pub(crate) fn on_unlock_note(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, password: SharedString) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let id_str = ui.global::<View>().get_id().to_string();
-        let mut st = state.borrow_mut();
+        let st = &mut self.state;
         let Some(n) = st.notes.iter_mut().find(|n| n.id == id_str) else { return };
         let Some(locked) = n.locked.clone() else { return };
         // The caching key lookup needs `&mut self`; take it BEFORE borrowing
         // the identity for the rest of the unlock.
         let device_kp = if locked.pq_flags & notes_core::envelope::FLAG_MLKEM != 0 {
-            self.device_quantum_key(fs)
+            device_quantum_key_in(&mut self.device_pq_key, fs)
         } else {
             None
         };
@@ -271,7 +269,6 @@ impl App {
                     save_state(&fs, &st);
                 }
                 log::info!("cb: unlock-note ok");
-                drop(st);
                 let view = ui.global::<View>();
                 view.set_text(text.into());
                 view.set_locked(false);
@@ -309,18 +306,16 @@ impl App {
     /// re-run through `pick_contact` (that would re-reset funding/change
     /// and re-navigate on every entry).
     pub(crate) fn on_reply_all_to_note(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let set: Vec<String> =
             ui.global::<View>().get_reply_set().iter().map(|s| s.to_string()).collect();
         let Some((first, rest)) = set.split_first() else { return };
         self.pick_contact(&ui_weak, &fs, first);
-        let st = state.borrow();
+        let st = &self.state;
         let extra: Vec<ToRow> = rest
             .iter()
             .map(|a| ToRow { address: a.as_str().into(), label: to_label_for(&st, a).into() })
             .collect();
-        drop(st);
         ui.global::<Compose>().set_to_extra(Rc::new(VecModel::from(extra)).into());
     }
 }

@@ -20,10 +20,9 @@ impl App {
     /// Keystroke cost estimator — pure arithmetic, no crypto runs (see
     /// notes-core crypt::SEAL_OVERHEAD), so per-keystroke recompute is free.
     pub(crate) fn compose_changed(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let compose = ui.global::<Compose>();
-        let st = state.borrow();
+        let st = &self.state;
         let to_address = compose.get_to_address().trim().to_string();
         let directed = !to_address.is_empty();
         let private = compose.get_private_note();
@@ -50,7 +49,7 @@ impl App {
         // to before this feature.
         let base_pq_eligible = private && compose.get_to_extra().row_count() == 0;
         let device_kp = if base_pq_eligible && !directed {
-            self.device_quantum_key(fs)
+            device_quantum_key_in(&mut self.device_pq_key, fs)
         } else {
             None
         };
@@ -539,10 +538,9 @@ impl App {
     /// Compose "too large" dialog → raise the chunk size to Standard (auto) and
     /// reprice the draft in place. Only offered when the note fits at Standard.
     pub(crate) fn on_oversize_bump(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         {
-            let mut st = state.borrow_mut();
+            let st = &mut self.state;
             st.chunk_override = None; // Standard / auto = DEFAULT_CHUNK
             save_state(&fs, &st);
         }
@@ -567,7 +565,6 @@ impl App {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         Timer::single_shot(Duration::from_millis(150), move || {
-            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let compose = ui.global::<Compose>();
             let text = compose.get_text().to_string();
@@ -586,10 +583,10 @@ impl App {
             let pq_passphrase_active = compose.get_pq_passphrase_active();
             let pq_mlkem_active = compose.get_pq_mlkem_active();
             let pq_passphrase_text = compose.get_pq_passphrase_text().to_string();
-            let st = state.borrow();
-            // `a` is held for the whole identity span (Identity is not Clone):
-            // nothing below may `app.borrow_mut()` until `drop(a)`.
+            // `a` is held for the whole identity + state span (Identity is not
+            // Clone): nothing below may `app.borrow_mut()` until `drop(a)`.
             let a = app.borrow();
+            let st = &a.state;
             let id_guard = &a.identity;
             let pick = a.funding_pick.clone();
             let change_choice = app.borrow().change_pick.clone();

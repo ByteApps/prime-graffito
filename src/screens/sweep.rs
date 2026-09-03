@@ -15,10 +15,9 @@ impl App {
     /// Sweep screen (10) repricing — every tier tap / rate keystroke. Pure
     /// arithmetic (estimate_sweep_vsize is byte-exact vs build_sweep_tx).
     pub(crate) fn update_sweep(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let sweep = ui.global::<Sweep>();
-        let st = state.borrow();
+        let st = &self.state;
         let tier = sweep.get_tier();
         if tier != 3 {
             sweep.set_rate_text(format!("{}", st.fee_rate(tier)).into());
@@ -104,7 +103,6 @@ impl App {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         Timer::single_shot(Duration::from_millis(150), move || {
-            let state = app.borrow().state.clone();
             let Some(ui) = ui_weak.upgrade() else { return };
             let sweep = ui.global::<Sweep>();
             let consolidate = sweep.get_kind() == "consolidate";
@@ -112,7 +110,8 @@ impl App {
             let dest = sweep.get_dest().trim().to_string();
             let tier = sweep.get_tier();
             let rate_text = sweep.get_rate_text().to_string();
-            let st = state.borrow();
+            let a = app.borrow();
+            let st = &a.state;
             // Flush the active notebook, then gather EVERY notebook's
             // coins — a wallet-level sweep/consolidate, one multi-key tx.
             save_state(&fs, &st);
@@ -124,7 +123,6 @@ impl App {
                 (app.borrow().seed_idx, app.borrow().bip_account),
             );
             let dest_account = app.borrow().active.unwrap_or(0);
-            let a = app.borrow();
             let id_guard = &a.identity;
             let result = id_guard
                 .as_ref()

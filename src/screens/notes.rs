@@ -12,9 +12,8 @@ impl App {
     /// Persist the device config from the current cells (single source of
     /// truth — inline DeviceConfig constructions drift as fields grow).
     pub(crate) fn refresh_notes(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
-        let st = state.borrow();
+        let st = &self.state;
         // Sender filter: build the checklist + filter the list. A note
         // is hidden iff its sender key is in the persisted exclusion set.
         let senders: Vec<SenderRow> = st
@@ -83,11 +82,10 @@ impl App {
         notes_g.set_rows(Rc::new(VecModel::from(rows)).into());
     }
 
-    pub(crate) fn on_toggle_sender(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, key: SharedString, excluded: bool) {
-        let state = self.state.clone();
+    pub(crate) fn on_toggle_sender(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, key: SharedString, excluded: bool) {
         let Some(_ui) = ui_weak.upgrade() else { return };
         {
-            let mut st = state.borrow_mut();
+            let st = &mut self.state;
             st.set_excluded(key.as_str(), excluded);
             save_state(&fs, &st);
             log::info!(

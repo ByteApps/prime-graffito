@@ -41,13 +41,12 @@ impl App {
     }
 
     pub(crate) fn on_cycle_network(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         // Network is device-level (wallet-wide): flush the active
         // notebook, cycle the shared network, persist it in config, and
         // reload the active notebook's ledger for the new chain (each
         // notebook keeps a per-network ledger in state-<net>-<account>).
         if self.active.is_some() {
-            save_state(&fs, &state.borrow());
+            save_state(&fs, &self.state);
         }
         let next = match self.net.as_str() {
             "mainnet" => "testnet4",
@@ -63,7 +62,7 @@ impl App {
         if let Some(account) = active {
             let mut fresh = load_state(&fs, &next, account);
             fresh.chunk_override = self.device_chunk;
-            *state.borrow_mut() = fresh;
+            self.state = fresh;
             // Legacy identities are network-independent (only the
             // address ENCODING changes), but bip86 notebooks use the
             // BIP-44 coin type — their keys differ per network, so
@@ -80,10 +79,9 @@ impl App {
     }
 
     pub(crate) fn on_chunk_changed(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let settings = ui.global::<Settings>();
-        let mut st = state.borrow_mut();
+        let st = &mut self.state;
         match settings.get_chunk_mode() {
             0 => st.chunk_override = None,
             1 => st.chunk_override = Some(80),
@@ -113,7 +111,6 @@ impl App {
         // Chunk is device-level (wallet-wide): persist it in config too.
         self.device_chunk = st.chunk_override;
         self.persist_config(&fs);
-        drop(st);
         // Reflect the effective size back into the field (auto/compat),
         // without touching a valid custom value.
         self.refresh_home(&ui_weak);
@@ -126,7 +123,6 @@ impl App {
     /// Transaction locktime (anti-fee-sniping). Wallet-level like the chunk
     /// size, so it lives in config.json rather than any notebook's state.
     pub(crate) fn on_locktime_changed(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let settings = ui.global::<Settings>();
         let policy = match settings.get_locktime_mode() {
@@ -150,7 +146,7 @@ impl App {
         self.lock_policy = policy;
         self.persist_config(&fs);
         settings.set_locktime_error("".into());
-        let tip = state.borrow().tip_height;
+        let tip = self.state.tip_height;
         let effective = resolve_locktime(policy, tip);
         settings.set_locktime_effective(locktime_caption(policy, tip).into());
         log::info!("cb: set-locktime {} effective={effective} ok", policy.as_str());

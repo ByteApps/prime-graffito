@@ -19,12 +19,7 @@ impl App {
     }
 
     pub(crate) fn device_quantum_key(&mut self, fs: &Fs) -> Option<pq::MlKemKeypair> {
-        if let Some(cached) = self.device_pq_key.as_ref() {
-            return cached.clone();
-        }
-        let kp = load_device_quantum_key(fs);
-        self.device_pq_key = Some(kp.clone());
-        kp
+        device_quantum_key_in(&mut self.device_pq_key, fs)
     }
 
 

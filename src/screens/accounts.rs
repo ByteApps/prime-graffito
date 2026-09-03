@@ -16,7 +16,6 @@ impl App {
     /// navigates back themselves, re-derive the revealed words/SeedQR for
     /// the new seed, and show an inline saved confirmation.
     pub(crate) fn on_set_context(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let recovery = ui.global::<Recovery>();
         let parse = |s: &str| -> Option<u32> {
@@ -35,7 +34,7 @@ impl App {
         let acct_changed = self.bip_account != new_acct;
         if seed_changed || acct_changed {
             if self.active.is_some() {
-                save_state(&fs, &state.borrow());
+                save_state(&fs, &self.state);
                 self.active = None;
             }
             self.seed_idx = new_seed;

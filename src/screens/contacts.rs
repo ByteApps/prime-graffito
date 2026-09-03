@@ -12,9 +12,8 @@ impl App {
     /// Persist the device config from the current cells (single source of
     /// truth — inline DeviceConfig constructions drift as fields grow).
     pub(crate) fn refresh_contacts(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
-        let st = state.borrow();
+        let st = &self.state;
         // State order IS recency (front = latest use) — no re-sort.
         let rows: Vec<ContactRow> = st
             .contacts
@@ -38,7 +37,6 @@ impl App {
     }
 
     pub(crate) fn pick_contact(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs, addr_raw: &str) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let addr = addr_raw.trim().to_string();
         let contacts_g = ui.global::<Contacts>();
@@ -59,7 +57,7 @@ impl App {
                 log::warn!("cb: pick-contact err=self extra=true");
                 return;
             }
-            let mut st = state.borrow_mut();
+            let st = &mut self.state;
             if Recipient::parse(st.network(), &addr).is_err() {
                 contacts_g
                     .set_input_error(format!("Not a valid {} address.", st.network).into());
@@ -78,10 +76,9 @@ impl App {
                 log::warn!("cb: pick-contact err=too-many extra=true");
                 return;
             }
-            upsert_contact(&mut st, &addr);
+            upsert_contact(st, &addr);
             save_state(&fs, &st);
             let label = to_label_for(&st, &addr);
-            drop(st);
             let mut new_extra = current_extra;
             new_extra.push(ToRow { address: addr.as_str().into(), label: label.into() });
             compose.set_to_extra(Rc::new(VecModel::from(new_extra)).into());
@@ -105,14 +102,14 @@ impl App {
             compose.set_to_extra(Rc::new(VecModel::from(Vec::<ToRow>::new())).into());
             log::info!("cb: pick-contact to=self");
         } else {
-            let mut st = state.borrow_mut();
+            let st = &mut self.state;
             if Recipient::parse(st.network(), &addr).is_err() {
                 contacts_g
                     .set_input_error(format!("Not a valid {} address.", st.network).into());
                 log::warn!("cb: pick-contact err=invalid address");
                 return;
             }
-            upsert_contact(&mut st, &addr);
+            upsert_contact(st, &addr);
             save_state(&fs, &st);
             if sweep_mode {
                 let sweep = ui.global::<Sweep>();
@@ -137,13 +134,12 @@ impl App {
         } else {
             // Fresh compose: reset the funding/change picks to their
             // default rule (spending only when enabled AND funded).
-            let st = state.borrow();
+            let st = &self.state;
             let ix = &self.notebooks;
             let ctx = notebook_ctx(&ix, self.active)
                 .unwrap_or((self.seed_idx, self.bip_account));
             let section = ix.spending(&self.net, ctx.0, ctx.1).cloned();
             self.funding_pick = default_funding_pick(&st, section.as_ref());
-            drop(st);
             self.change_pick = ChangePickState::default();
             self.refresh_funding(&ui_weak);
             self.refresh_change(&ui_weak);
@@ -155,7 +151,6 @@ impl App {
     }
 
     pub(crate) fn on_scan_contact(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
         let opts = ScanQrOptions {
             header_title: "Scan recipient address".into(),
@@ -184,10 +179,9 @@ impl App {
             addr = &addr[8..];
         }
         let addr = addr.split('?').next().unwrap_or("").trim().to_string();
-        let st = state.borrow();
+        let st = &self.state;
         let network = st.network();
         let network_name = st.network.clone();
-        drop(st);
         let resolved = if Recipient::parse(network, &addr).is_ok() {
             Some(addr.clone())
         } else {
@@ -214,8 +208,7 @@ impl App {
     /// with a clear message (a private-key armor, a note, an address QR).
     /// Scoped to `Contacts.naming-address` (set when the modal opened), so
     /// scanning does NOT require re-saving the name field.
-    pub(crate) fn on_scan_contact_pq(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
+    pub(crate) fn on_scan_contact_pq(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
         let Some(ui) = ui_weak.upgrade() else { return };
         let contacts_g = ui.global::<Contacts>();
         let addr = contacts_g.get_naming_address().to_string();
@@ -247,12 +240,11 @@ impl App {
         match pq::import_public(&armor) {
             Ok((alg, ek)) => {
                 let fp = pq::fingerprint(alg, &ek);
-                let mut st = state.borrow_mut();
+                let st = &mut self.state;
                 if let Some(c) = st.contacts.iter_mut().find(|c| c.address == addr) {
                     c.mlkem_ek = Some(armor);
                 }
                 save_state(&fs, &st);
-                drop(st);
                 log::info!("cb: contact-pq-key ok fp={fp}");
                 contacts_g
                     .set_naming_pq_caption(format!("{} · {fp}", mlkem_alg_name(alg)).into());
@@ -266,8 +258,7 @@ impl App {
         }
     }
 
-    pub(crate) fn on_save_contact_name(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
+    pub(crate) fn on_save_contact_name(&mut self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
         let Some(ui) = ui_weak.upgrade() else { return };
         let contacts_g = ui.global::<Contacts>();
         let addr = contacts_g.get_naming_address().to_string();
@@ -275,14 +266,13 @@ impl App {
             return;
         }
         let name = contacts_g.get_name_text().trim().to_string();
-        let mut st = state.borrow_mut();
+        let st = &mut self.state;
         // Naming does NOT bump recency — only use does, so the row
         // being edited never jumps mid-interaction.
         if let Some(c) = st.contacts.iter_mut().find(|c| c.address == addr) {
             c.name = name.clone();
         }
         save_state(&fs, &st);
-        drop(st);
         log::info!("cb: save-contact addr={addr} name-len={}", name.len());
         contacts_g.set_naming_address("".into());
         contacts_g.set_name_text("".into());

@@ -13,9 +13,8 @@ impl App {
     /// label, AND Settings' spending card (same underlying section) from
     /// `state` + the active notebook's spending section + `funding_pick`.
     pub(crate) fn refresh_funding(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
-        let st = state.borrow();
+        let st = &self.state;
         let active_net = self.net.clone();
         let ix = &self.notebooks;
         let ctx = notebook_ctx(&ix, self.active)

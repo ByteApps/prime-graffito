@@ -13,13 +13,12 @@ impl App {
     /// logging `cb: import-bundle {src} … ok` (src keeps the file=/loc=
     /// shape the UI tests grep).
     pub(crate) fn apply_bundle(&mut self, fs: &Fs, json: &str, src: &str) -> Result<String, String> {
-        let state = self.state.clone();
         let id_guard = &self.identity;
         let id = id_guard.as_ref().ok_or("identity unavailable")?;
         {
             let bundle =
                 SyncBundle::from_json(json).map_err(|e| format!("bad bundle: {e}"))?;
-            let mut st = state.borrow_mut();
+            let st = &mut self.state;
             if !bundle.network.is_empty() && bundle.network != st.network {
                 return Err(format!(
                     "bundle is for {}, app is on {} — switch network first",
@@ -458,9 +457,8 @@ impl App {
     }
 
     pub(crate) fn on_export_pending(&self, ui_weak: &slint_keyos_platform::slint::Weak<AppWindow>, fs: &Fs) {
-        let state = self.state.clone();
         let Some(ui) = ui_weak.upgrade() else { return };
-        let st = state.borrow();
+        let st = &self.state;
         let pending: Vec<&NoteRec> = st
             .notes
             .iter()

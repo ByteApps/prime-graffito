@@ -788,6 +788,22 @@ fn load_device_quantum_key(fs: &Fs) -> Option<pq::MlKemKeypair> {
     Some(pq::MlKemKeypair::from_seed(alg, &seed))
 }
 
+/// The cached lookup over the cache FIELD alone, for callers that hold
+/// another `App` field borrowed (state, identity) — field borrows are
+/// disjoint, a `&mut self` method call is not.
+pub(crate) fn device_quantum_key_in(
+    cache: &mut Option<Option<pq::MlKemKeypair>>,
+    fs: &Fs,
+) -> Option<pq::MlKemKeypair> {
+    if let Some(cached) = cache.as_ref() {
+        return cached.clone();
+    }
+    let kp = load_device_quantum_key(fs);
+    *cache = Some(kp.clone());
+    kp
+}
+
+
 fn save_device_quantum_key(fs: &Fs, alg: pq::MlKemAlg, seed: &[u8; 64]) -> Result<(), String> {
     let armor = pq::export_private(alg, seed);
     ensure_dir(fs, STATE_DIR, Location::User)
@@ -1372,7 +1388,7 @@ struct App {
     /// The ACTIVE notebook's persisted state (notes, UTXO ledger, fee
     /// tiers, contacts — `state-<net>-<account>.json`); an empty placeholder
     /// until a notebook is opened, swapped on notebook switch.
-    state: Rc<RefCell<State>>,
+    state: State,
     /// The ACTIVE notebook's derived identity (keys + address), swapped
     /// with `state`; `None` on the list.
     identity: Option<Identity>,
@@ -1515,7 +1531,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let app: Rc<RefCell<App>> = Rc::new(RefCell::new(App {
         app_seed: OnceCell::new(),
         notebooks,
-        state: Rc::new(RefCell::new(State::default())),
+        state: State::default(),
         identity: None,
         net: device_cfg.network.clone(),
         device_chunk: device_cfg.chunk_override,
@@ -1582,7 +1598,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // with a clear message (a private-key armor, a note, an address QR).
     // Scoped to `Contacts.naming-address` (set when the modal opened), so
     // scanning does NOT require re-saving the name field.
-    wire!(ui, app, ui_weak, fs; Callbacks.on_scan_contact_pq() => app.borrow().on_scan_contact_pq(&ui_weak, &fs));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_scan_contact_pq() => app.borrow_mut().on_scan_contact_pq(&ui_weak, &fs));
 
     // Quantum-keys screen (27): every visible notebook in the active
     // (seed, account) wallet context has its OWN ML-KEM receive identity
@@ -1646,7 +1662,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     wire!(ui, app, ui_weak, fs; Callbacks.on_device_quantum_key_qr_zoom(open) => app.borrow().on_device_quantum_key_qr_zoom(open));
 
-    wire!(ui, app, ui_weak, fs; Callbacks.on_save_contact_name() => app.borrow().on_save_contact_name(&ui_weak, &fs));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_save_contact_name() => app.borrow_mut().on_save_contact_name(&ui_weak, &fs));
 
     wire!(ui, app, ui_weak, fs; Callbacks.on_refresh_coins() => app.borrow().refresh_coins(&ui_weak, &fs));
 
@@ -1766,7 +1782,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     wire!(ui, app, ui_weak, fs; Callbacks.on_refresh_home() => app.borrow().refresh_home(&ui_weak));
     wire!(ui, app, ui_weak, fs; Callbacks.on_refresh_notes() => app.borrow().refresh_notes(&ui_weak));
-    wire!(ui, app, ui_weak, fs; Callbacks.on_toggle_sender(key, excluded) => app.borrow().on_toggle_sender(&ui_weak, &fs, key, excluded));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_toggle_sender(key, excluded) => app.borrow_mut().on_toggle_sender(&ui_weak, &fs, key, excluded));
     wire!(ui, app, ui_weak, fs; Callbacks.on_refresh_contacts() => app.borrow().refresh_contacts(&ui_weak));
 
     // ---- notebook callbacks (screen 20 list) ----
