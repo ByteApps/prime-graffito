@@ -1461,6 +1461,26 @@ fn notebook_name(ix: &notebooks::NotebookIndex, account: u32, addr_short: &str) 
     }
 }
 
+/// One line per slint callback: clones the three shell handles and
+/// forwards into an `App` method (or a money-path associated fn).
+///
+///   wire!(ui, app, ui_weak, fs; Callbacks.on_x(a, b) => app.borrow_mut().on_x(&ui_weak, &fs, a, b));
+///
+/// Every forwarder used to be a 4-6 line block of `let x = x.clone();`
+/// preludes around the same closure (phase 4b); the clones are the whole
+/// point, so they stay — just written once, here.
+macro_rules! wire {
+    ($ui:ident, $app:ident, $ui_weak:ident, $fs:ident; $global:ident . $cb:ident ( $($arg:ident),* ) => $($body:tt)*) => {{
+        #[allow(unused_variables)]
+        let $app = $app.clone();
+        #[allow(unused_variables)]
+        let $ui_weak = $ui_weak.clone();
+        #[allow(unused_variables)]
+        let $fs = $fs.clone();
+        $ui.global::<$global>().$cb(move |$($arg),*| $($body)*);
+    }};
+}
+
 fn app_main(cx: AppContext, ui: AppWindow) {
     log_server::init_wait(env!("CARGO_CRATE_NAME")).unwrap();
     log::set_max_level(log::LevelFilter::Info);
@@ -1545,47 +1565,24 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // validates, bumps recency, sets the compose recipient + label, and
     // navigates. Invalid manual input stays on the picker with an error.
 
-    {
-        let app = app.clone();
-        let fs = fs.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_pick_contact(move |addr| app.borrow_mut().pick_contact(&ui_weak, &fs, addr.as_str()));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_pick_contact(addr) => app.borrow_mut().pick_contact(&ui_weak, &fs, addr.as_str()));
 
     // Compose's "+ Add recipient" row — opens the contacts picker in
     // append mode (Contacts.picking-extra), modeled on how the home
     // screen's "Compose note" button opens it in replace mode.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_add_recipient_open(move || app.borrow().on_add_recipient_open(&ui_weak));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_add_recipient_open() => app.borrow().on_add_recipient_open(&ui_weak));
 
     // Drop an address from Compose.to-extra — no navigation.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_remove_recipient(move |addr| app.borrow().on_remove_recipient(&ui_weak, addr));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_remove_recipient(addr) => app.borrow().on_remove_recipient(&ui_weak, addr));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_scan_contact(move || app.borrow_mut().on_scan_contact(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_scan_contact() => app.borrow_mut().on_scan_contact(&ui_weak, &fs));
 
     // Quantum key scan (naming modal "Scan quantum key"): armored
     // ML-KEM public key only — `pq::import_public` rejects anything else
     // with a clear message (a private-key armor, a note, an address QR).
     // Scoped to `Contacts.naming-address` (set when the modal opened), so
     // scanning does NOT require re-saving the name field.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_scan_contact_pq(move || app.borrow().on_scan_contact_pq(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_scan_contact_pq() => app.borrow().on_scan_contact_pq(&ui_weak, &fs));
 
     // Quantum-keys screen (27): every visible notebook in the active
     // (seed, account) wallet context has its OWN ML-KEM receive identity
@@ -1599,24 +1596,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // default. Public-key only: device backup is the 24 recovery words,
     // which already reconstruct every notebook's key.
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_open_quantum_keys(move || app.borrow_mut().on_open_quantum_keys(&ui_weak));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_open_quantum_keys() => app.borrow_mut().on_open_quantum_keys(&ui_weak));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_quantum_key_level(move |level_idx| app.borrow_mut().on_quantum_key_level(&ui_weak, &fs, level_idx));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_quantum_key_level(level_idx) => app.borrow_mut().on_quantum_key_level(&ui_weak, &fs, level_idx));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_quantum_key_pick_notebook(move |index| app.borrow_mut().on_quantum_key_pick_notebook(&ui_weak, index));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_quantum_key_pick_notebook(index) => app.borrow_mut().on_quantum_key_pick_notebook(&ui_weak, index));
 
     {
         ui.global::<Callbacks>().on_quantum_keys_close(move || {});
@@ -1642,220 +1626,80 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // security theater, since that key shares the enc key's root).
     // ---------------------------------------------------------------------
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_open_device_quantum_key(move || app.borrow_mut().on_open_device_quantum_key(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_open_device_quantum_key() => app.borrow_mut().on_open_device_quantum_key(&ui_weak, &fs));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_close(move || app.borrow().on_device_quantum_key_close(&ui_weak));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_device_quantum_key_close() => app.borrow().on_device_quantum_key_close(&ui_weak));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_gen_level(move |level_idx| app.borrow().on_device_quantum_key_gen_level(&ui_weak, level_idx));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_device_quantum_key_gen_level(level_idx) => app.borrow().on_device_quantum_key_gen_level(&ui_weak, level_idx));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_generate(move || app.borrow_mut().on_device_quantum_key_generate(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_device_quantum_key_generate() => app.borrow_mut().on_device_quantum_key_generate(&ui_weak, &fs));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_import(move || app.borrow_mut().on_device_quantum_key_import(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_device_quantum_key_import() => app.borrow_mut().on_device_quantum_key_import(&ui_weak, &fs));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_reveal_private(move || app.borrow_mut().on_device_quantum_key_reveal_private(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_device_quantum_key_reveal_private() => app.borrow_mut().on_device_quantum_key_reveal_private(&ui_weak, &fs));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_hide_private(move || app.borrow().on_device_quantum_key_hide_private(&ui_weak));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_device_quantum_key_hide_private() => app.borrow().on_device_quantum_key_hide_private(&ui_weak));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_replace_confirm(move || app.borrow_mut().on_device_quantum_key_replace_confirm(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_device_quantum_key_replace_confirm() => app.borrow_mut().on_device_quantum_key_replace_confirm(&ui_weak, &fs));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_delete_confirm(move || app.borrow_mut().on_device_quantum_key_delete_confirm(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_device_quantum_key_delete_confirm() => app.borrow_mut().on_device_quantum_key_delete_confirm(&ui_weak, &fs));
 
-    {
-        let app = app.clone();
-        ui.global::<Callbacks>().on_device_quantum_key_qr_zoom(move |open| app.borrow().on_device_quantum_key_qr_zoom(open));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_device_quantum_key_qr_zoom(open) => app.borrow().on_device_quantum_key_qr_zoom(open));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_save_contact_name(move || app.borrow().on_save_contact_name(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_save_contact_name() => app.borrow().on_save_contact_name(&ui_weak, &fs));
 
-    {
-        let app = app.clone();
-        let fs = fs.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_refresh_coins(move || app.borrow().refresh_coins(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_refresh_coins() => app.borrow().refresh_coins(&ui_weak, &fs));
 
     // Coins → the shared sweep screen with kind=consolidate, dest=self.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_consolidate_open(move || app.borrow().on_consolidate_open(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_consolidate_open() => app.borrow().on_consolidate_open(&ui_weak, &fs));
 
-    {
-        let app = app.clone();
-        let fs = fs.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_sweep_changed(move || app.borrow().update_sweep(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_sweep_changed() => app.borrow().update_sweep(&ui_weak, &fs));
 
     // Build + sign the sweep (ALL coins, key-path), then the confirm dialog.
-    {
-        let ui_weak = ui_weak.clone();
-        let app = app.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_sweep_continue(move || App::on_sweep_continue(&app, &ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_sweep_continue() => App::on_sweep_continue(&app, &ui_weak, &fs));
 
     // Spending wallet: Settings toggle.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_set_spending_enabled(move |on| app.borrow().on_set_spending_enabled(&ui_weak, &fs, on));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_set_spending_enabled(on) => app.borrow().on_set_spending_enabled(&ui_weak, &fs, on));
 
     // Pay-from screen (25): notebook / spending-wallet per-coin selection.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_funding_open(move || app.borrow().on_funding_open(&ui_weak));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_funding_toggle_coin(move |key| app.borrow_mut().on_funding_toggle_coin(&ui_weak, &fs, key));
-    }
-    {
-        let app = app.clone();
-        ui.global::<Callbacks>().on_funding_done(move || app.borrow().on_funding_done());
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_funding_open() => app.borrow().on_funding_open(&ui_weak));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_funding_toggle_coin(key) => app.borrow_mut().on_funding_toggle_coin(&ui_weak, &fs, key));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_funding_done() => app.borrow().on_funding_done());
 
     // Change screen (26): compose destination for change.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_change_open(move || app.borrow().on_change_open(&ui_weak));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_change_pick(move |choice| app.borrow_mut().on_change_pick(&ui_weak, &fs, choice));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_change_address_changed(move || app.borrow_mut().on_change_address_changed(&ui_weak, &fs));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_change_done(move || app.borrow_mut().on_change_done(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_change_open() => app.borrow().on_change_open(&ui_weak));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_change_pick(choice) => app.borrow_mut().on_change_pick(&ui_weak, &fs, choice));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_change_address_changed() => app.borrow_mut().on_change_address_changed(&ui_weak, &fs));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_change_done() => app.borrow_mut().on_change_done(&ui_weak, &fs));
 
     // Keystroke cost estimator — pure arithmetic, no crypto runs (see
     // notes-core crypt::SEAL_OVERHEAD), so per-keystroke recompute is free.
-    {
-        let ui_weak = ui_weak.clone();
-        let app = app.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_compose_changed(move || app.borrow_mut().compose_changed(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_compose_changed() => app.borrow_mut().compose_changed(&ui_weak, &fs));
 
     // Post-quantum Security section: a typed edit un-certifies the
     // passphrase (compose-changed recomputes `pq-passphrase-verified`
     // from `pq_generated` vs. the current text) — this callback is just
     // the "recompute now" trigger `edited` fires, same shape as every
     // other compose field's `edited => { Callbacks.compose-changed(); }`.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_pq_passphrase_changed(move || app.borrow_mut().on_pq_passphrase_changed(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_pq_passphrase_changed() => app.borrow_mut().on_pq_passphrase_changed(&ui_weak, &fs));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_pq_generate_passphrase(move || app.borrow_mut().on_pq_generate_passphrase(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_pq_generate_passphrase() => app.borrow_mut().on_pq_generate_passphrase(&ui_weak, &fs));
 
-    {
-        let ui_weak = ui_weak.clone();
-        let app = app.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_compose_continue(move || App::on_compose_continue(&app, &ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_compose_continue() => App::on_compose_continue(&app, &ui_weak, &fs));
 
     // Universal Confirm & sign gate (screen 4) — dispatches on
     // ConfirmSign.kind to the three sign bodies (each was its own
     // dedicated callback before the confirm-gate refactor; merged here so
     // Sign always fires through one place, no callback-from-callback
     // re-entrancy). Ledger/outbox mutations happen ONLY past this point.
-    {
-        let ui_weak = ui_weak.clone();
-        let app = app.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_confirm_sign(move || App::on_confirm_sign(&app, &ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_confirm_sign() => App::on_confirm_sign(&app, &ui_weak, &fs));
 
     // Back from the universal Confirm & sign screen (4): discard whatever
     // was staged (Plan/SweepPlan/the stashed Psbt) and clear the shown
     // rows, then return to the kind's origin screen.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_confirm_cancel(move || app.borrow_mut().on_confirm_cancel(&ui_weak));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_confirm_cancel() => app.borrow_mut().on_confirm_cancel(&ui_weak));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_open_note(move |id| app.borrow_mut().on_open_note(&ui_weak, &fs, id));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_open_note(id) => app.borrow_mut().on_open_note(&ui_weak, &fs, id));
 
     // Manual unlock of a locked pq note (FLAG_PW) — the note view's
     // Unlock button. A self-locked body (`LockedBody::is_self`,
@@ -1869,76 +1713,36 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // already filtered to FLAG_PW-alone by `on_open_note`'s
     // `needs_password` gate, so `unlock_sent`'s `SenderCannotReopen` is
     // never actually reachable from here.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_unlock_note(move |password| app.borrow_mut().on_unlock_note(&ui_weak, &fs, password));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_unlock_note(password) => app.borrow_mut().on_unlock_note(&ui_weak, &fs, password));
 
     // Reply: fresh compose draft addressed to View.reply-address. Routed
     // through the SAME `pick_contact` funnel a manual pick uses (contact
     // name resolution, recency bump, funding/change reset, → screen 3) —
     // it already clears Compose.to-extra on its replace path, so a stale
     // extra-recipient list from a previous draft can't leak in.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_reply_to_note(move || app.borrow_mut().on_reply_to_note(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_reply_to_note() => app.borrow_mut().on_reply_to_note(&ui_weak, &fs));
 
     // Reply-all: primary = the first address in View.reply-set (via the
     // same `pick_contact` funnel, which also resets to-extra), every
     // remaining address pushed directly onto Compose.to-extra — NOT
     // re-run through `pick_contact` (that would re-reset funding/change
     // and re-navigate on every entry).
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_reply_all_to_note(move || app.borrow_mut().on_reply_all_to_note(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_reply_all_to_note() => app.borrow_mut().on_reply_all_to_note(&ui_weak, &fs));
 
     // Shared by file import AND camera scan: parse + merge a bundle,
     // logging `cb: import-bundle {src} … ok` (src keeps the file=/loc=
     // shape the UI tests grep).
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_import_bundle(move || app.borrow().on_import_bundle(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_import_bundle() => app.borrow().on_import_bundle(&ui_weak, &fs));
 
     // Import picker: list the bundle files actually present in the inboxes
     // so the user chooses one, instead of silently auto-picking the first.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_list_bundles(move || app.borrow().on_list_bundles(&ui_weak, &fs));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_pick_bundle(move |name, loc_idx| app.borrow().on_pick_bundle(&ui_weak, &fs, name, loc_idx));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_list_bundles() => app.borrow().on_list_bundles(&ui_weak, &fs));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_pick_bundle(name, loc_idx) => app.borrow().on_pick_bundle(&ui_weak, &fs, name, loc_idx));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_scan_bundle(move || app.borrow().on_scan_bundle(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_scan_bundle() => app.borrow().on_scan_bundle(&ui_weak, &fs));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_export_pending(move || app.borrow().on_export_pending(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_export_pending() => app.borrow().on_export_pending(&ui_weak, &fs));
 
     // Sign an external transaction (PSBT) — stage A: scan it, validate it
     // pays THIS device's taproot address, and show the universal confirm
@@ -1946,106 +1750,33 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // witness_utxo. The actual signing (+ outbox export) is stage B, in the
     // confirm-sign dispatcher below — nothing about a scanned PSBT touches
     // disk until the user taps Sign.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_sign_psbt(move || app.borrow_mut().on_sign_psbt(&ui_weak));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_sign_psbt() => app.borrow_mut().on_sign_psbt(&ui_weak));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_cycle_network(move || app.borrow_mut().on_cycle_network(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_cycle_network() => app.borrow_mut().on_cycle_network(&ui_weak, &fs));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_chunk_changed(move || app.borrow_mut().on_chunk_changed(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_chunk_changed() => app.borrow_mut().on_chunk_changed(&ui_weak, &fs));
 
     // Transaction locktime (anti-fee-sniping). Wallet-level like the chunk
     // size, so it lives in config.json rather than any notebook's state.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_locktime_changed(move || app.borrow_mut().on_locktime_changed(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_locktime_changed() => app.borrow_mut().on_locktime_changed(&ui_weak, &fs));
 
     // Compose "too large" dialog → raise the chunk size to Standard (auto) and
     // reprice the draft in place. Only offered when the note fits at Standard.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_oversize_bump(move || app.borrow_mut().on_oversize_bump(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_oversize_bump() => app.borrow_mut().on_oversize_bump(&ui_weak, &fs));
 
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_refresh_home(move || app.borrow().refresh_home(&ui_weak));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_refresh_notes(move || app.borrow().refresh_notes(&ui_weak));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_toggle_sender(move |key, excluded| app.borrow().on_toggle_sender(&ui_weak, &fs, key, excluded));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_refresh_contacts(move || app.borrow().refresh_contacts(&ui_weak));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_refresh_home() => app.borrow().refresh_home(&ui_weak));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_refresh_notes() => app.borrow().refresh_notes(&ui_weak));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_toggle_sender(key, excluded) => app.borrow().on_toggle_sender(&ui_weak, &fs, key, excluded));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_refresh_contacts() => app.borrow().refresh_contacts(&ui_weak));
 
     // ---- notebook callbacks (screen 20 list) ----
-    {
-        let app = app.clone();
-        let fs = fs.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<NotebookCb>().on_open(move |account| app.borrow_mut().switch_notebook(&ui_weak, &fs, account.max(0) as u32));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<NotebookCb>().on_create(move || app.borrow().on_create(&ui_weak));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<NotebookCb>().on_rename(move |account| app.borrow().on_rename(&ui_weak, account));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<NotebookCb>().on_name_cancel(move || app.borrow().on_name_cancel(&ui_weak));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<NotebookCb>().on_name_save(move || app.borrow_mut().on_name_save(&ui_weak, &fs));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<NotebookCb>().on_archive(move |account, archived| app.borrow().on_archive(&ui_weak, &fs, account, archived));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<NotebookCb>().on_back_to_list(move || app.borrow().on_back_to_list(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; NotebookCb.on_open(account) => app.borrow_mut().switch_notebook(&ui_weak, &fs, account.max(0) as u32));
+    wire!(ui, app, ui_weak, fs; NotebookCb.on_create() => app.borrow().on_create(&ui_weak));
+    wire!(ui, app, ui_weak, fs; NotebookCb.on_rename(account) => app.borrow().on_rename(&ui_weak, account));
+    wire!(ui, app, ui_weak, fs; NotebookCb.on_name_cancel() => app.borrow().on_name_cancel(&ui_weak));
+    wire!(ui, app, ui_weak, fs; NotebookCb.on_name_save() => app.borrow_mut().on_name_save(&ui_weak, &fs));
+    wire!(ui, app, ui_weak, fs; NotebookCb.on_archive(account, archived) => app.borrow().on_archive(&ui_weak, &fs, account, archived));
+    wire!(ui, app, ui_weak, fs; NotebookCb.on_back_to_list() => app.borrow().on_back_to_list(&ui_weak, &fs));
 
     // ---- recovery seeds (screen 21 + wallet context) ----
 
@@ -2054,16 +1785,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // until reveal-close wipes them; nothing is persisted or logged. Shared
     // by the reveal button AND the Switch action (which refreshes the words
     // to the new seed while they're shown). Keeps the SeedQR in sync.
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_reveal_seed(move || app.borrow().reveal_words(&ui_weak));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_reveal_close(move || app.borrow().on_reveal_close(&ui_weak));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_reveal_seed() => app.borrow().reveal_words(&ui_weak));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_reveal_close() => app.borrow().on_reveal_close(&ui_weak));
     // ---- export keys (screen 23) ----
     // Reveal the active (seed, account) context's importable formats:
     // account xpub + tr() descriptor cover the WHOLE account (all
@@ -2073,37 +1796,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // never logged.
     // The active account's notebooks as picker rows (index/name/short addr)
     // plus the default selection (first notebook, else a synthetic index 0).
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_reveal_public(move || app.borrow().on_reveal_public(&ui_weak));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_reveal_private(move || app.borrow().on_reveal_private(&ui_weak));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_export_select(move |which| app.borrow().apply_export(&ui_weak, which));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_export_pick_notebook(move |index| app.borrow().on_export_pick_notebook(&ui_weak, index));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        ui.global::<Callbacks>().on_export_close(move || app.borrow().on_export_close(&ui_weak));
-    }
-    {
-        let app = app.clone();
-        let ui_weak = ui_weak.clone();
-        let fs = fs.clone();
-        ui.global::<Callbacks>().on_set_context(move || app.borrow_mut().on_set_context(&ui_weak, &fs));
-    }
+    wire!(ui, app, ui_weak, fs; Callbacks.on_reveal_public() => app.borrow().on_reveal_public(&ui_weak));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_reveal_private() => app.borrow().on_reveal_private(&ui_weak));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_export_select(which) => app.borrow().apply_export(&ui_weak, which));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_export_pick_notebook(index) => app.borrow().on_export_pick_notebook(&ui_weak, index));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_export_close() => app.borrow().on_export_close(&ui_weak));
+    wire!(ui, app, ui_weak, fs; Callbacks.on_set_context() => app.borrow_mut().on_set_context(&ui_weak, &fs));
 
     // Boot: the notebook list is the main screen. Migrate/seed the index,
     // then land on the list (a fresh install starts empty). Seed/account
