@@ -1,6 +1,6 @@
 # <img src="resources/icon.svg" alt="" width="42" align="top" /> Graffito
 
-> **Status (2026-09-02): shelved.** Development of this Prime app is paused until Foundation opens **QuantumLink** — the Prime's post-quantum Bluetooth link — to third-party developers, so notes can move between the device and a phone without files and QR codes. The Graffito product lives on as the Mac, iOS and Android app at [byteapps.com](https://byteapps.com); this repo keeps hosting the shared `notes-core` and `graffito-core` crates it builds on, plus the companion pages.
+> **Status (2026-09-02): shelved.** Development of this Prime app is paused until Foundation opens **QuantumLink** — the Prime's post-quantum Bluetooth link — to third-party developers, so notes can move between the device and a phone without files and QR codes. The Graffito product lives on as the Mac, iOS and Android app at [byteapps.com](https://byteapps.com); the shared `notes-core`/`graffito-core` crates and the companion pages moved to that app's repo, and this app pins them from there.
 
 **Bitcoin · Notes** — personal notes on the bitcoin blockchain, written from a device that has no network on purpose.
 

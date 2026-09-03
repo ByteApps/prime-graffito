@@ -1,6 +1,6 @@
 # Third-party libraries
 
-Direct dependencies of this app and the companion web pages (`notes-core` and `graffito-core` are git dependencies on [ByteApps/graffito](https://github.com/ByteApps/graffito), where their own THIRD-PARTY.md lists theirs). The complete transitive list (with exact versions) is pinned in [`Cargo.lock`](Cargo.lock).
+Direct dependencies of this app. `notes-core`, `graffito-core` and the companion web pages live in [ByteApps/graffito](https://github.com/ByteApps/graffito) since 2026-09-02, whose THIRD-PARTY.md lists theirs. The complete transitive list (with exact versions) is pinned in [`Cargo.lock`](Cargo.lock).
 
 ## Rust crates
 
@@ -19,14 +19,6 @@ Direct dependencies of this app and the companion web pages (`notes-core` and `g
 |---|---|---|
 | `vendor/getrandom/` | KeyOS source (getrandom 0.2 fork) | Entropy override: hardware TRNG server on KeyOS builds, stock behavior on host |
 | `vendor/security-api/` | KeyOS v1.2.1 source, adapted to SDK 0.4.0 conventions | `os/security` API client (`GetAppSeed`) |
-
-## Companion (JavaScript, vendored in `companion/`)
-
-| Library | License | Used for |
-|---|---|---|
-| [jsQR](https://github.com/cozmo/jsQR) (`jsqr.js`) | Apache-2.0 | Camera QR decoding in the browser |
-| [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) (`qrcode-gen.js`) | MIT | QR rendering of sync bundles |
-| `ur.js` | project code (GPL-3.0-or-later) | Hand-rolled BC-UR encoder, byte-identical to foundation-ur |
 
 ## Foundation SDK / KeyOS platform
 
