@@ -1365,14 +1365,11 @@ fn show_confirm_screen(
 /// into anything that may borrow `app` again — `Timer::single_shot`
 /// bodies and nested closures are where that bites.
 struct App {
-    // ---- guard-held cells (kept as their own RefCell on purpose) --------
-    // These four are borrowed as `let mut st = state.borrow_mut();` guards
-    // held across other calls all over the callbacks. Keeping each behind
-    // its own cell — reached as `let state = app.borrow().state.clone();`
-    // at the top of a callback — preserves today's borrow granularity
-    // exactly; flattening one into a plain field means restructuring
-    // every callback that holds it, a per-field follow-up with the suite
-    // board as the net.
+    // ---- session state that used to be nested cells (flattened 2026-09-02):
+    // plain fields now; the borrow checker enforces what the RefCells used
+    // to check at runtime. Handle-context code (the money path's Timer
+    // bodies) reaches them through ONE Ref/RefMut span each — see the
+    // app's CLAUDE.md, "App state borrow discipline".
 
     /// The app seed (GetAppSeed, PIN-gated on hardware) — kept so each
     /// notebook's identity can be derived on demand (`Identity::from_bip86`
