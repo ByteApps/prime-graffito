@@ -1,5 +1,7 @@
 # <img src="resources/icon.svg" alt="" width="42" align="top" /> Graffito
 
+> **Status (2026-09-02): shelved.** Development of this Prime app is paused until Foundation opens **QuantumLink** — the Prime's post-quantum Bluetooth link — to third-party developers, so notes can move between the device and a phone without files and QR codes. The Graffito product lives on as the Mac, iOS and Android app at [byteapps.com](https://byteapps.com); this repo keeps hosting the shared `notes-core` and `graffito-core` crates it builds on, plus the companion pages.
+
 **Bitcoin · Notes** — personal notes on the bitcoin blockchain, written from a device that has no network on purpose.
 
 Compose a note on your Passport Prime, seal it with a key only your seed can re-derive — or leave it deliberately public — and the app builds and signs a real bitcoin transaction carrying the note. An online companion page broadcasts it and scans the chain; the device and the companion exchange nothing but files and QR codes. Your address history *is* the notebook: wipe the device, restore your seed, rescan the chain — every note comes back, private ones decrypted, with nothing stored anywhere else.
