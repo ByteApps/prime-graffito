@@ -2017,7 +2017,7 @@ dependencies = [
 [[package]]
 name = "graffito-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ByteApps/graffito.git?rev=44a0d5914b4aae5a69ef61e57887a0664a6ff4b7#44a0d5914b4aae5a69ef61e57887a0664a6ff4b7"
+source = "git+https://github.com/ByteApps/graffito.git?rev=44a0d5914b4aae5a69ef61e57887a0664a6ff4b7#44a0d5914b4aae5a69ef61e57887a0664a6ff4b7"
 dependencies = [
  "notes-core",
  "serde",
@@ -3922,7 +3922,7 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 [[package]]
 name = "notes-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ByteApps/graffito.git?rev=44a0d5914b4aae5a69ef61e57887a0664a6ff4b7#44a0d5914b4aae5a69ef61e57887a0664a6ff4b7"
+source = "git+https://github.com/ByteApps/graffito.git?rev=44a0d5914b4aae5a69ef61e57887a0664a6ff4b7#44a0d5914b4aae5a69ef61e57887a0664a6ff4b7"
 dependencies = [
  "argon2",
  "base64",

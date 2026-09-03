@@ -41,10 +41,12 @@ opt-level = 3
 # give cargo two notes-core sources and `pq::MlKemAlg` type clashes. The
 # rev is the graffito commit that absorbed the crates (byte-identical to
 # this repo's last in-tree copies, 7a08a94), so tx construction is unchanged.
-notes-core = { git = "ssh://git@github.com/ByteApps/graffito.git", rev = "44a0d5914b4aae5a69ef61e57887a0664a6ff4b7" }
+# https, not ssh: both repos are public, so a clone builds without any
+# GitHub credentials.
+notes-core = { git = "https://github.com/ByteApps/graffito.git", rev = "44a0d5914b4aae5a69ef61e57887a0664a6ff4b7" }
 # Shared policy (compose Security copy — graffito-core/src/seclabel.rs),
 # rendered identically by the graffito Mac/mobile app.
-graffito-core = { git = "ssh://git@github.com/ByteApps/graffito.git", rev = "44a0d5914b4aae5a69ef61e57887a0664a6ff4b7" }
+graffito-core = { git = "https://github.com/ByteApps/graffito.git", rev = "44a0d5914b4aae5a69ef61e57887a0664a6ff4b7" }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,6 +1,6 @@
 # <img src="resources/icon.svg" alt="" width="42" align="top" /> Graffito
 
-> **Status (2026-09-02): shelved.** Development of this Prime app is paused until Foundation opens **QuantumLink** — the Prime's post-quantum Bluetooth link — to third-party developers, so notes can move between the device and a phone without files and QR codes. The Graffito product lives on as the Mac, iOS and Android app at [byteapps.com](https://byteapps.com); the shared `notes-core`/`graffito-core` crates and the companion pages moved to that app's repo, and this app pins them from there.
+> **Status (2026-09-02): shelved.** Development of this Prime app is paused until Foundation opens **QuantumLink** — the Prime's post-quantum Bluetooth link — to third-party developers, so notes can move between the device and a phone without files and QR codes. The Graffito product lives on as the Mac, iOS and Android app at [byteapps.com](https://byteapps.com); the shared `notes-core`/`graffito-core` crates and the companion pages now live in [that app's repo](https://github.com/ByteApps/graffito), and this app pins the crates from there. What stays here is the Prime app itself: it still builds and runs, it just gets no new features until the platform gap closes.
 
 **Bitcoin · Notes** — personal notes on the bitcoin blockchain, written from a device that has no network on purpose.
 
@@ -42,11 +42,11 @@ Keep as many **notebooks** as you like — each is its own address, derived from
 
 ## The companion
 
-**Hosted at [byteapps.com/graffito/companion](https://byteapps.com/graffito/companion/)** — the online half, and no more than that: it builds sync bundles from public chain data and broadcasts what the device signed. It never sees a key.
+**Hosted at [byteapps.com/graffito/companion](https://byteapps.com/graffito/companion/)** — the online half, and no more than that: it builds sync bundles from public chain data and broadcasts what the device signed. It never sees a key. Its source lives in the [graffito repo](https://github.com/ByteApps/graffito/tree/main/docs/companion) alongside the Mac and mobile app.
 
-- **Sync & broadcast** (`index.html`) — builds bundles (shown as a file or a static/animated QR) and broadcasts the device's transactions, via mempool.space or your own local node.
-- **Read-only viewer** (`viewer.html`) — renders any address's on-chain notes in the browser: public notes as text, private ones as sealed placeholders. Decryption stays on the device by design.
-- **Note permalinks** (`note.html`) — share a link to a single note.
+- **Sync & broadcast** — builds bundles (shown as a file or a static/animated QR) and broadcasts the device's transactions, via mempool.space or your own local node.
+- **Read-only viewer** — renders any address's on-chain notes in the browser: public notes as text, private ones as sealed placeholders. Decryption stays on the device by design.
+- **Note permalinks** — share a link to a single note.
 
 ## Get it running
 
@@ -78,7 +78,7 @@ Donations help cover development costs and keep more open-source bitcoin tools c
 
 Licensed under the GNU General Public License v3.0 or later — see [COPYING](COPYING). Sections 15–17 of that license disclaim all warranty and limit liability; the notes below restate that in plain language.
 
-The **`notes-core/`** library inside this repository carries its own, more permissive terms: **MIT OR Apache-2.0**, see [`notes-core/LICENSE-MIT`](notes-core/LICENSE-MIT) and [`notes-core/LICENSE-APACHE`](notes-core/LICENSE-APACHE). It holds the PNTE protocol: envelope, sealing, ECDH, and taproot build/sign, and the split is deliberate — other projects, including non-GPL peers of this app, are meant to build on that crate. The GPL above covers the application around it.
+The **`notes-core`** library this app builds on carries its own, more permissive terms: **MIT OR Apache-2.0**. It lives in the [graffito repo](https://github.com/ByteApps/graffito/tree/main/notes-core) (with `graffito-core`, under the same terms) and holds the PNTE protocol: envelope, sealing, ECDH, and taproot build/sign. The split is deliberate — other projects, including non-GPL peers of this app, are meant to build on that crate. The GPL above covers the application in this repository.
 
 This is experimental software and it has **not been independently audited**.
 It is provided **"as is", without warranty of any kind**, express or implied,
