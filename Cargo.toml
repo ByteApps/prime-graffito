@@ -1,5 +1,6 @@
-# Workspace root: the KeyOS app binary plus the host-testable notes-core
-# (protocol) and graffito-core (shared policy) libraries
+# Workspace root: the KeyOS app binary. notes-core (protocol) and
+# graffito-core (shared policy) moved to ByteApps/graffito on 2026-09-02
+# when this app was shelved; they come in as git dependencies below.
 # (wallet-core/pgp-core/bip85-core pattern — see ../CLAUDE.md).
 [package]
 name = "prime-graffito"
@@ -9,7 +10,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [workspace]
-members = [".", "notes-core", "graffito-core"]
+members = ["."]
 
 # KeyOS's own getrandom override (vendored in vendor/getrandom): on
 # --cfg keyos (hardware) builds it sources entropy from the os TRNG server;
@@ -36,10 +37,14 @@ opt-level = 3
 opt-level = 3
 
 [dependencies]
-notes-core = { path = "notes-core" }
-# Shared policy (compose Security copy — graffito-core/src/seclabel.rs);
-# the graffito Mac/mobile app pins the same rev of this repo for it.
-graffito-core = { path = "graffito-core" }
+# BOTH graffito git deps MUST pin the SAME rev: two revs of one repo would
+# give cargo two notes-core sources and `pq::MlKemAlg` type clashes. The
+# rev is the graffito commit that absorbed the crates (byte-identical to
+# this repo's last in-tree copies, 7a08a94), so tx construction is unchanged.
+notes-core = { git = "ssh://git@github.com/ByteApps/graffito.git", rev = "44a0d5914b4aae5a69ef61e57887a0664a6ff4b7" }
+# Shared policy (compose Security copy — graffito-core/src/seclabel.rs),
+# rendered identically by the graffito Mac/mobile app.
+graffito-core = { git = "ssh://git@github.com/ByteApps/graffito.git", rev = "44a0d5914b4aae5a69ef61e57887a0664a6ff4b7" }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

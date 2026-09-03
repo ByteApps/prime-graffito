@@ -17,6 +17,14 @@
 //! `vendor/getrandom` and its four hardened files are DO-NOT-EDIT
 //! (workspace CLAUDE.md / this repo's CLAUDE.md); this file only reads
 //! them.
+//!
+//! Lives at the APP level (not in notes-core) since 2026-09-02, when
+//! notes-core moved to the `ByteApps/graffito` repo: everything here is
+//! about THIS workspace's `[patch.crates-io]` and vendored backend, and the
+//! graph guard now walks from the app root — a superset of notes-core's
+//! graph (graffito-core + the vendored security-api included). notes-core's
+//! portable half (getrandom 0.2-only, no `register_custom_getrandom!`)
+//! lives with it as `graffito/notes-core/tests/rng_backend.rs`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -50,7 +58,7 @@ fn patches_getrandom_to_vendor(cargo_toml: &str) -> bool {
 
 #[test]
 fn contract_cargo_toml_patches_getrandom_to_vendor() {
-    let cargo_toml = include_str!("../../Cargo.toml");
+    let cargo_toml = include_str!("../Cargo.toml");
     assert!(
         patches_getrandom_to_vendor(cargo_toml),
         "repo Cargo.toml must [patch.crates-io] getrandom to path \"vendor/getrandom\" — \
@@ -118,7 +126,7 @@ fn final_arm_is_compile_error(chain: &str) -> bool {
 
 #[test]
 fn contract_backend_cfg_order_and_fallback() {
-    let src = include_str!("../../vendor/getrandom/src/lib.rs");
+    let src = include_str!("../vendor/getrandom/src/lib.rs");
     let chain = extract_backend_chain(src).expect("backend cfg_if! chain not found in lib.rs");
     assert_eq!(
         keyos_arm_precedes_custom(chain),
@@ -194,7 +202,7 @@ fn calls_hardening_functions(src: &str) -> bool {
 
 #[test]
 fn contract_xous_backend_calls_hardening_functions() {
-    let src = include_str!("../../vendor/getrandom/src/xous.rs");
+    let src = include_str!("../vendor/getrandom/src/xous.rs");
     assert!(
         calls_hardening_functions(src),
         "xous.rs must still call write_sentinel/looks_unfilled/words_for — losing any of \
@@ -279,7 +287,7 @@ fn collect_rust_files(root: &Path, skip_dir_names: &[&str], vendor_getrandom: &P
 
 #[test]
 fn contract_register_custom_getrandom_only_in_vendor() {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let vendor_getrandom = repo_root.join("vendor").join("getrandom");
     let files = collect_rust_files(&repo_root, &[".git", "target", "node_modules"], &vendor_getrandom);
     assert!(
@@ -322,8 +330,8 @@ fn mutation_own_test_file_is_excluded_by_name_not_by_luck() {
 
 // =======================================================================
 // 5. Dependency-graph guard: no crate reachable through NORMAL/BUILD
-//    (non-dev) dependencies from the app root pulls a getrandom other
-//    than the vendored 0.2.x. getrandom 0.3.x/0.4.x sit in Cargo.lock
+//    (non-dev) dependencies from the app root, ON THE DEVICE TARGET,
+//    pulls a getrandom other than the vendored 0.2.x. getrandom 0.3.x/0.4.x sit in Cargo.lock
 //    today (jobserver/tempfile/rand_core 0.9) but must be dev-only-
 //    reachable — one dependency bump to a rand-0.9 consumer would
 //    otherwise silently bypass the TRNG patch.
@@ -379,19 +387,78 @@ fn assert_single_vendored(found: &BTreeSet<&str>, vendored_marker: &str) -> Resu
     Ok(())
 }
 
-fn run_cargo_metadata() -> serde_json::Value {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let output = std::process::Command::new(env!("CARGO"))
-        .args(["metadata", "--format-version", "1"])
-        .current_dir(manifest_dir)
-        .output()
-        .expect("failed to spawn `cargo metadata`");
-    assert!(
-        output.status.success(),
-        "cargo metadata failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+/// The KeyOS device target. Only reachable through the Foundation SDK's
+/// Nix-provided nightly rustc (see `cargo_metadata_json`).
+const DEVICE_TARGET: &str = "armv7a-unknown-xous-elf";
+
+fn nix_binary() -> String {
+    if std::process::Command::new("nix").arg("--version").output().is_ok_and(|o| o.status.success()) {
+        return "nix".to_string();
+    }
+    const FALLBACK: &str = "/nix/var/nix/profiles/default/bin/nix";
+    if Path::new(FALLBACK).exists() {
+        return FALLBACK.to_string();
+    }
+    panic!(
+        "no `nix` executable found on PATH or at {FALLBACK} — the device-target dependency \
+         graph check needs the Foundation SDK's Nix shell, which needs Nix itself"
     );
-    serde_json::from_slice(&output.stdout).expect("cargo metadata did not produce valid JSON")
+}
+
+/// `cargo metadata --filter-platform armv7a-unknown-xous-elf` for THIS
+/// app — the graph the device actually links. The filter is not optional:
+/// walked target-blind from the app root, `getrandom 0.3` (via `nix` →
+/// `cc` → `jobserver`, a host build-dep of the SDK's shared-memory crate)
+/// and `getrandom 0.4` (via the hosted-simulator winit backend → zbus →
+/// `uds_windows` → `tempfile`, `cfg(windows)`) both show up through
+/// normal/build edges and the guard fails for the wrong reason (verified
+/// 2026-09-02, the day this test moved up from notes-core). Same routine
+/// as pgp-core's/wallet-core's: the device target is a patched-in
+/// "custom" target only the SDK's nightly knows, gated behind
+/// `-Zunstable-options`, so the call goes through `nix develop <sdk root>
+/// --command cargo metadata` with that flag scoped to the one subprocess.
+fn cargo_metadata_json() -> String {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    // Trust FOUNDATION_SDK_ROOT only when it is the SDK checkout (has a
+    // flake.nix): inside `nix develop <sdk> --command cargo test` the SDK
+    // shell exports it pointing at the current PROJECT instead.
+    let sdk_root = std::env::var("FOUNDATION_SDK_ROOT")
+        .ok()
+        .filter(|p| Path::new(p).join("flake.nix").exists())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{home}/.foundation/sdk/current")
+        });
+    let nix = nix_binary();
+    let out = std::process::Command::new(&nix)
+        .args(["develop", &sdk_root, "--command", "cargo", "metadata", "--format-version", "1", "--filter-platform", DEVICE_TARGET, "--manifest-path"])
+        .arg(&manifest)
+        .env("RUSTFLAGS", "-Zunstable-options")
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to run `{nix} develop {sdk_root} --command cargo metadata` for the device \
+                 target: {e}\n\nThis check needs the Foundation SDK's Nix shell — run `foundation \
+                 doctor` and make sure `nix develop {sdk_root}` works on its own first."
+            )
+        });
+    assert!(
+        out.status.success(),
+        "`nix develop {sdk_root} --command cargo metadata --filter-platform {DEVICE_TARGET}` failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("cargo metadata output was not UTF-8");
+    // The SDK flake's shellHook prints a "Foundation SDK user shell ready."
+    // banner onto stdout ahead of the command's output; the JSON document
+    // starts at the first `{`.
+    match stdout.find('{') {
+        Some(idx) => stdout[idx..].to_string(),
+        None => panic!("no JSON object found in `nix develop` output:\n{stdout}"),
+    }
+}
+
+fn run_cargo_metadata() -> serde_json::Value {
+    serde_json::from_str(&cargo_metadata_json()).expect("cargo metadata did not produce valid JSON")
 }
 
 fn edge_is_linked(dep_kinds: &serde_json::Value) -> bool {
