@@ -10,7 +10,7 @@
 
 import { Theme, UISize } from "@ui/theme.slint";
 import { Screen, Callbacks, Ui, DeviceQuantumKey } from "../callbacks.slint";
-import { PrimaryAction, SecondaryAction, ScreenHeader, PillOption } from "../components.slint";
+import { PrimaryAction, SecondaryAction, ScreenHeader, PillOption, LevelPills, MonoCard } from "../components.slint";
 
 export component DeviceQuantumKeyScreen inherits VerticalLayout {
     padding-left: 24px;
@@ -50,26 +50,9 @@ export component DeviceQuantumKeyScreen inherits VerticalLayout {
                     font-size: 13px;
                     font-weight: 600;
                 }
-                HorizontalLayout {
-                    spacing: 6px;
-                    PillOption {
-                        label: "512";
-                        selected: DeviceQuantumKey.gen-level == 0;
-                        horizontal-stretch: 1;
-                        tapped => { Callbacks.device-quantum-key-gen-level(0); }
-                    }
-                    PillOption {
-                        label: "768";
-                        selected: DeviceQuantumKey.gen-level == 1;
-                        horizontal-stretch: 1;
-                        tapped => { Callbacks.device-quantum-key-gen-level(1); }
-                    }
-                    PillOption {
-                        label: "1024";
-                        selected: DeviceQuantumKey.gen-level == 2;
-                        horizontal-stretch: 1;
-                        tapped => { Callbacks.device-quantum-key-gen-level(2); }
-                    }
+                LevelPills {
+                    level: DeviceQuantumKey.gen-level;
+                    pick(i) => { Callbacks.device-quantum-key-gen-level(i); }
                 }
                 Text {
                     text: (DeviceQuantumKey.gen-level == 1 ? "Recommended. " : "") + DeviceQuantumKey.gen-level-caption;
@@ -313,21 +296,9 @@ export component DeviceQuantumKeyScreen inherits VerticalLayout {
                     font-size: 12px;
                     wrap: word-wrap;
                 }
-                Rectangle {
-                    background: Theme.palette-surface;
-                    border-radius: 12px;
-                    border-width: 1px;
-                    border-color: Theme.palette-border;
-                    VerticalLayout {
-                        padding: 12px;
-                        Text {
-                            text: DeviceQuantumKey.private-armor;
-                            color: Theme.palette-foreground;
-                            font-family: "SourceCodePro";
-                            font-size: 12px;
-                            wrap: char-wrap;
-                        }
-                    }
+                MonoCard {
+                    text: DeviceQuantumKey.private-armor;
+                    font-size: 12px;
                 }
                 SecondaryAction {
                     width: 100%;

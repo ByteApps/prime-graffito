@@ -12,7 +12,7 @@
 
 import { Theme, UISize } from "@ui/theme.slint";
 import { Screen, Callbacks, Ui, Settings, Recovery, ExportNbRow, QuantumKeys } from "../callbacks.slint";
-import { ScreenHeader, PillOption } from "../components.slint";
+import { ScreenHeader, PillOption, LevelPills, NotebookPickRow, MonoCard } from "../components.slint";
 
 export component QuantumKeysScreen inherits VerticalLayout {
     padding-left: 24px;
@@ -50,57 +50,17 @@ export component QuantumKeysScreen inherits VerticalLayout {
     }
     VerticalLayout {
         spacing: 6px;
-        for nb in QuantumKeys.notebooks: Rectangle {
-            height: 40px;
-            background: nb.index == QuantumKeys.nb-index ? Theme.palette-primary : Theme.palette-surface;
-            border-radius: 10px;
-            border-width: 1px;
-            border-color: nb.index == QuantumKeys.nb-index ? Theme.palette-primary : Theme.palette-border;
-            HorizontalLayout {
-                padding-left: 12px;
-                padding-right: 12px;
-                spacing: 8px;
-                Text {
-                    text: nb.name;
-                    color: nb.index == QuantumKeys.nb-index ? #ffffff : Theme.palette-foreground;
-                    font-family: "Montserrat";
-                    font-size: 14px;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                    overflow: elide;
-                }
-                Text {
-                    text: nb.addr;
-                    color: nb.index == QuantumKeys.nb-index ? #ffffff : Theme.palette-muted;
-                    font-family: "SourceCodePro";
-                    font-size: 12px;
-                    vertical-alignment: center;
-                }
-            }
-            TouchArea { clicked => { Callbacks.quantum-key-pick-notebook(nb.index); } }
+        for nb in QuantumKeys.notebooks: NotebookPickRow {
+            name: nb.name;
+            addr: nb.addr;
+            selected: nb.index == QuantumKeys.nb-index;
+            picked => { Callbacks.quantum-key-pick-notebook(nb.index); }
         }
     }
 
-    HorizontalLayout {
-        spacing: 6px;
-        PillOption {
-            label: "512";
-            selected: QuantumKeys.level == 0;
-            horizontal-stretch: 1;
-            tapped => { Callbacks.quantum-key-level(0); }
-        }
-        PillOption {
-            label: "768";
-            selected: QuantumKeys.level == 1;
-            horizontal-stretch: 1;
-            tapped => { Callbacks.quantum-key-level(1); }
-        }
-        PillOption {
-            label: "1024";
-            selected: QuantumKeys.level == 2;
-            horizontal-stretch: 1;
-            tapped => { Callbacks.quantum-key-level(2); }
-        }
+    LevelPills {
+        level: QuantumKeys.level;
+        pick(i) => { Callbacks.quantum-key-level(i); }
     }
     Text {
         text: QuantumKeys.level-caption;
@@ -117,21 +77,9 @@ export component QuantumKeysScreen inherits VerticalLayout {
         font-size: 13px;
         font-weight: 600;
     }
-    Rectangle {
-        background: Theme.palette-surface;
-        border-radius: 12px;
-        border-width: 1px;
-        border-color: Theme.palette-border;
-        VerticalLayout {
-            padding: 12px;
-            Text {
-                text: QuantumKeys.fingerprint;
-                color: Theme.palette-foreground;
-                font-family: "SourceCodePro";
-                font-size: 15px;
-                wrap: char-wrap;
-            }
-        }
+    MonoCard {
+        text: QuantumKeys.fingerprint;
+        font-size: 15px;
     }
 
     HorizontalLayout {

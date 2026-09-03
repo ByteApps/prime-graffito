@@ -8,7 +8,7 @@
 
 import { Theme, UISize } from "@ui/theme.slint";
 import { Screen, Callbacks, Ui, Recovery } from "../callbacks.slint";
-import { ScreenHeader, PillOption } from "../components.slint";
+import { ScreenHeader, PillOption, MonoCard } from "../components.slint";
 
 export component PublicKeysScreen inherits VerticalLayout {
     padding-left: 24px;
@@ -56,21 +56,8 @@ export component PublicKeysScreen inherits VerticalLayout {
         font-size: 13px;
         font-weight: 600;
     }
-    Rectangle {
-        background: Theme.palette-surface;
-        border-radius: 12px;
-        border-width: 1px;
-        border-color: Theme.palette-border;
-        VerticalLayout {
-            padding: 12px;
-            Text {
-                text: Recovery.export-value;
-                color: Theme.palette-foreground;
-                font-family: "SourceCodePro";
-                font-size: 13px;
-                wrap: char-wrap;
-            }
-        }
+    MonoCard {
+        text: Recovery.export-value;
     }
     HorizontalLayout {
         alignment: center;

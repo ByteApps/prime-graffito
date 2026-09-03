@@ -470,3 +470,87 @@ export component ConfirmRowEntry inherits Rectangle {
         }
     }
 }
+
+// ---- shared by several screens (extracted 2026-09-02, layout-identical:
+// each component's root is the exact element the screens used inline, with
+// the bound global and the tapped callback turned into properties).
+
+/// Fee-tier pills — Economy / Normal / Fast / Custom (compose + sweep).
+export component TierPills inherits HorizontalLayout {
+    in property <int> tier;
+    callback pick(int);
+    vertical-stretch: 0;
+    spacing: 6px;
+    PillOption { label: "Economy"; selected: root.tier == 0; horizontal-stretch: 1; tapped => { root.pick(0); } }
+    PillOption { label: "Normal"; selected: root.tier == 1; horizontal-stretch: 1; tapped => { root.pick(1); } }
+    PillOption { label: "Fast"; selected: root.tier == 2; horizontal-stretch: 1; tapped => { root.pick(2); } }
+    PillOption { label: "Custom"; selected: root.tier == 3; horizontal-stretch: 1; tapped => { root.pick(3); } }
+}
+
+/// ML-KEM level pills — 512 / 768 / 1024 (quantum-keys + device-quantum-key).
+export component LevelPills inherits HorizontalLayout {
+    in property <int> level;
+    callback pick(int);
+    spacing: 6px;
+    PillOption { label: "512"; selected: root.level == 0; horizontal-stretch: 1; tapped => { root.pick(0); } }
+    PillOption { label: "768"; selected: root.level == 1; horizontal-stretch: 1; tapped => { root.pick(1); } }
+    PillOption { label: "1024"; selected: root.level == 2; horizontal-stretch: 1; tapped => { root.pick(2); } }
+}
+
+/// One selectable notebook row of a picker: name left, short address right
+/// (private-keys export picker + quantum-keys picker).
+export component NotebookPickRow inherits Rectangle {
+    in property <string> name;
+    in property <string> addr;
+    in property <bool> selected;
+    callback picked();
+    height: 40px;
+    background: root.selected ? Theme.palette-primary : Theme.palette-surface;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: root.selected ? Theme.palette-primary : Theme.palette-border;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 8px;
+        Text {
+            text: root.name;
+            color: root.selected ? #ffffff : Theme.palette-foreground;
+            font-family: "Montserrat";
+            font-size: 14px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        Text {
+            text: root.addr;
+            color: root.selected ? #ffffff : Theme.palette-muted;
+            font-family: "SourceCodePro";
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+    }
+    TouchArea { clicked => { root.picked(); } }
+}
+
+/// A bordered surface card holding one monospace, char-wrapped value —
+/// exported keys, armored key material, fingerprints (public-keys,
+/// private-keys, quantum-keys, device-quantum-key).
+export component MonoCard inherits Rectangle {
+    in property <string> text;
+    in property <length> font-size: 13px;
+    background: Theme.palette-surface;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Theme.palette-border;
+    VerticalLayout {
+        padding: 12px;
+        Text {
+            text: root.text;
+            color: Theme.palette-foreground;
+            font-family: "SourceCodePro";
+            font-size: root.font-size;
+            wrap: char-wrap;
+        }
+    }
+}
